@@ -6,8 +6,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
+	"strconv"
+	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -49,6 +53,7 @@ func newForwarderCmd() *cobra.Command {
 				GuestIP:   ep.GuestIP,
 				Engine:    podmanEngine{connection: m.Name},
 				StatePath: forwarder.StatePath(m.Dir),
+				SSHLocal:  net.JoinHostPort(ep.SSHHost, strconv.Itoa(ep.SSHPort)),
 				Log:       logger,
 			})
 		},
@@ -61,13 +66,23 @@ type podmanEngine struct {
 	connection string
 }
 
+// psTimeout bounds one "podman ps" over SSH so a wedged connection cannot
+// stall the reconciliation loop.
+const psTimeout = 30 * time.Second
+
 func (e podmanEngine) PS(ctx context.Context) ([]byte, error) {
 	bin, err := exec.LookPath("podman")
 	if err != nil {
 		return nil, errors.New("podman not found on PATH")
 	}
+	ctx, cancel := context.WithTimeout(ctx, psTimeout)
+	defer cancel()
 	out, err := exec.CommandContext(ctx, bin, "--connection", e.connection, "ps", "--format", "json").Output()
 	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			// Run logs the error; "timed out" names the cause.
+			return nil, fmt.Errorf("podman ps: timed out after %s", psTimeout)
+		}
 		var ee *exec.ExitError
 		if errors.As(err, &ee) && len(ee.Stderr) > 0 {
 			return nil, fmt.Errorf("podman ps: %w: %s", err, ee.Stderr)
@@ -84,6 +99,10 @@ func (e podmanEngine) Events(ctx context.Context) (io.ReadCloser, error) {
 	}
 	cmd := exec.CommandContext(ctx, bin, "--connection", e.connection, "events", "--format", "json", "--filter", "type=container")
 	cmd.Stderr = stderr
+	// Own process group: podman forks ssh, and killing the group takes the
+	// whole tree down with it, on Close and on context cancellation alike.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return killGroup(cmd.Process) }
 	rc, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -94,7 +113,18 @@ func (e podmanEngine) Events(ctx context.Context) (io.ReadCloser, error) {
 	return &processReader{ReadCloser: rc, cmd: cmd}, nil
 }
 
-// processReader closes the pipe and reaps the process on Close.
+// killGroup SIGKILLs p's process group, falling back to the process alone.
+func killGroup(p *os.Process) error {
+	if p == nil {
+		return nil
+	}
+	if err := syscall.Kill(-p.Pid, syscall.SIGKILL); err == nil {
+		return nil
+	}
+	return p.Kill()
+}
+
+// processReader closes the pipe and reaps the process group on Close.
 type processReader struct {
 	io.ReadCloser
 	cmd *exec.Cmd
@@ -102,7 +132,7 @@ type processReader struct {
 
 func (r *processReader) Close() error {
 	_ = r.ReadCloser.Close()
-	_ = r.cmd.Process.Kill()
+	_ = killGroup(r.cmd.Process)
 	_ = r.cmd.Wait()
 	return nil
 }

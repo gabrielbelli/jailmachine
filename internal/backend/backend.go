@@ -102,6 +102,16 @@ type Cleaner interface {
 	Cleanup(m *machine.Machine) error
 }
 
+// Resizer is an optional interface for backends that can tell a running
+// hypervisor that the disk image has grown, so "jm set --disk" works on a
+// running machine. Without it the CLI requires the machine to be stopped
+// (the hypervisor reads the image size at boot).
+type Resizer interface {
+	// ResizeDisk announces the new size of disk.raw, in bytes, to the
+	// running VM.
+	ResizeDisk(ctx context.Context, m *machine.Machine, size int64) error
+}
+
 // Backend is implemented by each hypervisor package (e.g. backend/qemu).
 // Backends locate a machine's files through Machine.Dir, which the store
 // fills in; they must not know about the state root.

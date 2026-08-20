@@ -17,12 +17,26 @@ func newRmCmd() *cobra.Command {
 		Use:   "rm [name]",
 		Short: "Remove a machine and all its state",
 		Long:  "Stop the machine if needed, forget its podman connection and host key, and delete its directory. Always converges to \"gone\".",
-		Args:  cobra.MaximumNArgs(1),
+		Example: `  jm rm
+  jm rm --force dev`,
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			name, err := machine.ResolveName(args)
-			if err != nil {
-				return err
+			// rm takes the literal name when given and never guesses among
+			// several machines; a half-initialised directory without a
+			// record still resolves, so check the directory, not the store.
+			name := machine.DefaultName
+			var err error
+			if len(args) > 0 {
+				name, err = machine.ResolveName(args)
+				if err != nil {
+					return usage(err)
+				}
+			} else if !store().Exists(name) {
+				if name, err = resolveName(nil); err != nil {
+					return err
+				}
 			}
+			activeMachine = name
 			s := store()
 			if _, err := os.Stat(s.Dir(name)); err != nil {
 				fmt.Fprintf(stdout, "%s does not exist; nothing to remove\n", name)
@@ -58,9 +72,14 @@ func newRmCmd() *cobra.Command {
 			} else {
 				if err := stopMachine(ctx, m, !force); err != nil {
 					if !force {
-						return fmt.Errorf("%w (use --force to remove anyway)", err)
+						return withHint(err, "use 'jm rm --force"+nameHint(name)+"' to remove anyway")
 					}
 					fmt.Fprintf(stderr, "jm: %v; continuing\n", err)
+					// stopMachine may have failed before reaching the
+					// forwarder; never leave one behind.
+					if p, perr := providerFor(m); perr == nil {
+						stopForwarder(ctx, m, p)
+					}
 				}
 				podmanConnectionRemove(ctx, m)
 				forgetHostKey(m)
@@ -85,7 +104,7 @@ func newRmCmd() *cobra.Command {
 			if err := s.Delete(name); err != nil {
 				return err
 			}
-			logf(stdout, "removed %s", s.Dir(name))
+			logf(stdout, "done: removed %s", s.Dir(name))
 			return nil
 		},
 	}

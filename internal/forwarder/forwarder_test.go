@@ -496,3 +496,92 @@ func waitFor(t *testing.T, cond func() bool) {
 	}
 	t.Fatal("condition not met in time")
 }
+
+func TestReleaseSkipsMappingsTheProviderDoesNotList(t *testing.T) {
+	ctx := context.Background()
+	m := &machine.Machine{Name: "t"}
+	path := filepath.Join(t.TempDir(), StateFile)
+	web := mapping("tcp", "127.0.0.1:8080")
+	gone := mapping("tcp", "127.0.0.1:9090")
+	p := newFake(web)
+	st := &State{Owned: []Entry{
+		{Proto: web.Proto, Local: web.Local, Remote: web.Remote},
+		{Proto: gone.Proto, Local: gone.Local, Remote: gone.Remote, Error: "address already in use"},
+		{Proto: "tcp", Local: "0.0.0.0:5353", Error: "unpublishable"},
+	}}
+	if err := st.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := Release(ctx, p, m, path); err != nil {
+		t.Fatal(err)
+	}
+	if _, unexposed := p.calls(); !reflect.DeepEqual(unexposed, []netprov.Mapping{web}) {
+		t.Errorf("unexposed = %v, want only %v", unexposed, web)
+	}
+	if st, _ := Load(path); len(st.Owned) != 0 {
+		t.Errorf("owned after release = %+v", st.Owned)
+	}
+}
+
+func TestConvergeDropsStaleUnpublishableSilently(t *testing.T) {
+	ctx := context.Background()
+	m := &machine.Machine{Name: "t"}
+	path := filepath.Join(t.TempDir(), StateFile)
+	p := newFake()
+	st := &State{Owned: []Entry{{Proto: "tcp", Local: "0.0.0.0:5353", Error: "unpublishable"}}}
+	res, err := Converge(ctx, p, m, nil, st, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Unexposed) != 0 || len(res.Failed) != 0 || res.String() != "no change" {
+		t.Errorf("result = %q, want no change", res)
+	}
+	if _, unexposed := p.calls(); len(unexposed) != 0 {
+		t.Errorf("unexposed = %v, want none", unexposed)
+	}
+	if len(st.Owned) != 0 {
+		t.Errorf("owned = %+v, want empty", st.Owned)
+	}
+}
+
+func TestLeaked(t *testing.T) {
+	ssh := netprov.Mapping{Proto: "tcp", Local: "127.0.0.1:50022", Remote: guest + ":22"}
+	web := mapping("tcp", "127.0.0.1:8080")
+	other := netprov.Mapping{Proto: "tcp", Local: "127.0.0.1:1", Remote: "10.0.0.9:1"}
+	got := Leaked([]netprov.Mapping{ssh, web, other}, guest, "127.0.0.1:50022")
+	if !reflect.DeepEqual(got, []netprov.Mapping{web}) {
+		t.Errorf("Leaked = %v, want [%v]", got, web)
+	}
+	if got := Leaked([]netprov.Mapping{ssh}, guest, ""); len(got) != 0 {
+		t.Errorf("Leaked without sshLocal = %v, want none", got)
+	}
+}
+
+func TestRunLogsLeakedMappings(t *testing.T) {
+	r, w := io.Pipe()
+	defer w.Close()
+	eng := &fakeEngine{ps: []byte("[]"), events: r, w: w}
+	web := mapping("tcp", "127.0.0.1:8080")
+	p := newFake(web)
+	ctx, cancel := context.WithCancel(context.Background())
+	var logBuf bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Config{
+			Provider: p, Machine: &machine.Machine{Name: "t"}, GuestIP: guest, Engine: eng,
+			StatePath: filepath.Join(t.TempDir(), StateFile), Log: log.New(&logBuf, "", 0),
+			Resync: time.Hour, MinBackoff: 10 * time.Millisecond, MaxBackoff: 20 * time.Millisecond,
+		})
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logBuf.String(), "jm stop && jm start resets them") || !strings.Contains(logBuf.String(), web.String()) {
+		t.Errorf("log = %q, want a leaked-mapping hint naming %v", logBuf.String(), web)
+	}
+	if _, unexposed := p.calls(); len(unexposed) != 0 {
+		t.Errorf("adopted and unexposed %v", unexposed)
+	}
+}

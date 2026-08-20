@@ -97,14 +97,16 @@ func (p Process) Start(exe string) error {
 }
 
 // Stop terminates a live forwarder (SIGTERM, wait, SIGKILL) and removes the
-// pid file. A dead or absent one is just tidied away.
+// pid file. A dead or absent one is just tidied away. Signals go to the
+// forwarder's process group (it is a session leader, so pgid == pid) so
+// that children still in the group go with it.
 func (p Process) Stop(ctx context.Context) error {
 	if pid, ok := p.Alive(); ok {
-		if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && processAlive(pid) {
+		if err := signalGroup(pid, syscall.SIGTERM); err != nil && processAlive(pid) {
 			return fmt.Errorf("forwarder: SIGTERM pid %d: %w", pid, err)
 		}
 		if !waitExit(ctx, pid, termTimeout) {
-			_ = syscall.Kill(pid, syscall.SIGKILL)
+			_ = signalGroup(pid, syscall.SIGKILL)
 			if !waitExit(ctx, pid, termTimeout) {
 				return fmt.Errorf("forwarder: pid %d did not exit after SIGKILL", pid)
 			}
@@ -114,6 +116,15 @@ func (p Process) Stop(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// signalGroup sends sig to pid's process group, falling back to pid alone
+// when it is not a group leader.
+func signalGroup(pid int, sig syscall.Signal) error {
+	if err := syscall.Kill(-pid, sig); err == nil {
+		return nil
+	}
+	return syscall.Kill(pid, sig)
 }
 
 func readPID(path string) (int, error) {

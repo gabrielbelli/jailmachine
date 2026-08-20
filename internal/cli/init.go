@@ -33,6 +33,9 @@ func newInitCmd() *cobra.Command {
 		Long: "Create a machine: generate an SSH key, download and verify the FreeBSD image,\n" +
 			"grow it to --disk, and write the first-boot NoCloud seed. Safe to re-run after\n" +
 			"an interruption: finished steps are skipped.",
+		Example: `  jm init
+  jm init --cpus 2 --memory 2048 dev
+  jm init --image official:14.3-RELEASE --disk 32`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runInit(cmd.Context(), args, initOpts{
@@ -62,13 +65,13 @@ type initOpts struct {
 func (o initOpts) validate() error {
 	switch {
 	case o.cpus < 1:
-		return fmt.Errorf("--cpus must be at least 1")
+		return usagef("--cpus must be at least 1")
 	case o.memory < 256:
-		return fmt.Errorf("--memory must be at least 256 MiB")
+		return usagef("--memory must be at least 256 MiB")
 	case o.disk < 1:
-		return fmt.Errorf("--disk must be at least 1 GiB")
+		return usagef("--disk must be at least 1 GiB")
 	case o.sshPort < 1 || o.sshPort > 65535:
-		return fmt.Errorf("--ssh-port must be between 1 and 65535")
+		return usagef("--ssh-port must be between 1 and 65535")
 	}
 	return nil
 }
@@ -84,21 +87,24 @@ func imageSource(ref machine.ImageRef, diskGiB int) (image.Source, machine.Image
 		}
 		return &image.Official{Release: ref.Release, DiskGiB: diskGiB}, ref, nil
 	default:
-		return nil, ref, fmt.Errorf("unknown image source %q (known: official)", ref.Source)
+		return nil, ref, usagef("unknown image source %q (known: official)", ref.Source)
 	}
 }
 
 func runInit(ctx context.Context, args []string, o initOpts) error {
+	// init never falls back to "the only machine": no name means create
+	// the default one.
 	name, err := machine.ResolveName(args)
 	if err != nil {
-		return err
+		return usage(err)
 	}
+	activeMachine = name
 	if err := o.validate(); err != nil {
 		return err
 	}
 	ref, err := machine.ParseImageRef(o.image)
 	if err != nil {
-		return err
+		return usage(err)
 	}
 	src, ref, err := imageSource(ref, o.disk)
 	if err != nil {
@@ -130,7 +136,7 @@ func runInit(ctx context.Context, args []string, o initOpts) error {
 
 	s := store()
 	if s.Exists(name) {
-		return fmt.Errorf("machine %q already exists (run 'jm rm%s' first)", name, nameHint(name))
+		return withHint(fmt.Errorf("machine %q already exists", name), fmt.Sprintf("run 'jm rm%s' first, or pick another name", nameHint(name)))
 	}
 	unlock, err := lock(name)
 	if err != nil {
@@ -153,7 +159,7 @@ func runInit(ctx context.Context, args []string, o initOpts) error {
 	// stays valid).
 	key := s.Path(name, machine.SSHKeyFile)
 	if _, err := os.Stat(key); err != nil {
-		logf(stdout, "generating SSH key")
+		logf(stdout, "ssh-key: generating %s", key)
 		if err := sshx.GenerateKey(key); err != nil {
 			return err
 		}
@@ -166,16 +172,16 @@ func runInit(ctx context.Context, args []string, o initOpts) error {
 	// Stage: disk image. Fetch is atomic, so an existing disk.raw is done.
 	diskPath := s.Path(name, machine.DiskFile)
 	if _, err := os.Stat(diskPath); err != nil {
-		logf(stdout, "fetching image %s", m.Image)
-		if err := src.Fetch(ctx, diskPath, stdout); err != nil {
-			return fmt.Errorf("fetch image: %w", err)
+		logf(stdout, "image: fetching %s", m.Image)
+		if err := src.Fetch(ctx, diskPath, progressOut()); err != nil {
+			return withHint(fmt.Errorf("image: %w", err), fmt.Sprintf("re-run 'jm init%s'; a partial download resumes where it stopped", nameHint(name)))
 		}
 	} else {
-		logf(stdout, "reusing existing %s", diskPath)
+		logf(stdout, "image: reusing existing %s", diskPath)
 	}
 
 	// Stage: first-boot seed.
-	logf(stdout, "writing cloud-init seed")
+	logf(stdout, "seed: writing first-boot seed %s", s.Path(name, machine.SeedFile))
 	err = seed.Build(s.Path(name, machine.SeedFile), seed.Params{
 		InstanceID:      name,
 		Hostname:        name,
@@ -183,12 +189,12 @@ func runInit(ctx context.Context, args []string, o initOpts) error {
 		ProvisionScript: jailmachine.ProvisionScript,
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("seed: %w", err)
 	}
 
 	if err := s.Save(&m); err != nil {
 		return err
 	}
-	logf(stdout, "created %s. Next: jm start%s", name, nameHint(name))
+	logf(stdout, "done: created %s (%d cpus, %d MiB, %d GiB). Next: jm start%s", name, m.CPUs, m.MemoryMiB, m.DiskGiB, nameHint(name))
 	return nil
 }

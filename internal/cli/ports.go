@@ -18,6 +18,8 @@ func newPortsCmd() *cobra.Command {
 			"the outcome of the last attempt (a host port already in use shows as an\n" +
 			"error and is retried on the next resync). Reads the machine's forwards.json;\n" +
 			"it never blocks on the machine.",
+		Example: `  jm ports
+  jm ports --json dev`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			m, err := loadMachine(args)

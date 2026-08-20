@@ -101,7 +101,7 @@ func TestListAndInspectStopped(t *testing.T) {
 
 func TestInspectMissing(t *testing.T) {
 	_, err := run(t, t.TempDir(), "inspect")
-	if err == nil || !strings.Contains(err.Error(), "jm init") {
+	if err == nil || !strings.Contains(formatError("inspect", "", err), "hint: run 'jm init'") {
 		t.Errorf("err = %v", err)
 	}
 	_, err = run(t, t.TempDir(), "inspect", "Bad_Name")
@@ -227,7 +227,7 @@ func TestInitRefusesExisting(t *testing.T) {
 func TestSplitSSHArgs(t *testing.T) {
 	exists := func(n string) bool { return n == "dev" }
 	name, rest := splitSSHArgs(nil, exists)
-	if name != machine.DefaultName || len(rest) != 0 {
+	if name != "" || len(rest) != 0 {
 		t.Errorf("nil: %q %v", name, rest)
 	}
 	name, rest = splitSSHArgs([]string{"dev", "ls", "-la"}, exists)
@@ -235,7 +235,7 @@ func TestSplitSSHArgs(t *testing.T) {
 		t.Errorf("dev: %q %v", name, rest)
 	}
 	name, rest = splitSSHArgs([]string{"uname", "-a"}, exists)
-	if name != machine.DefaultName || strings.Join(rest, " ") != "uname -a" {
+	if name != "" || strings.Join(rest, " ") != "uname -a" {
 		t.Errorf("cmd: %q %v", name, rest)
 	}
 }
@@ -612,4 +612,52 @@ func TestStopTidiesStaleForwarderPID(t *testing.T) {
 	if _, err := os.Stat(pidFile); !os.IsNotExist(err) {
 		t.Error("stale forwarder pid file survived stop")
 	}
+}
+
+// doctor reports on every machine directory: a healthy record is ok, a
+// broken one warns with the repair hint, an unreadable one fails. The
+// command's exit status follows the failures.
+func TestDoctorMachineChecks(t *testing.T) {
+	root := t.TempDir()
+	seedFakeRecord(t, root, "good")
+	fakeBE.state, fakeNet.state = backend.Stopped, backend.Stopped
+	out, err := run(t, root, "--json", "doctor")
+	var rep struct {
+		Checks []struct {
+			Name   string `json:"name"`
+			Status string `json:"status"`
+			Fix    string `json:"fix"`
+		} `json:"checks"`
+	}
+	if jerr := json.Unmarshal([]byte(out), &rep); jerr != nil {
+		t.Fatalf("bad json: %v\n%s", jerr, out)
+	}
+	find := func(name string) (string, string) {
+		for _, c := range rep.Checks {
+			if c.Name == name {
+				return c.Status, c.Fix
+			}
+		}
+		return "", ""
+	}
+	if st, _ := find("machine good"); st != "ok" {
+		t.Errorf("good machine = %q (err %v)\n%s", st, err, out)
+	}
+
+	fakeBE.state, fakeNet.state = backend.Running, backend.Stopped
+	dir := filepath.Join(root, "machines", "bad")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, machine.RecordFile), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err = run(t, root, "doctor")
+	if err == nil || !strings.Contains(err.Error(), "failed") {
+		t.Errorf("doctor with a corrupt record must fail: %v", err)
+	}
+	if !strings.Contains(out, "[warn]  machine good") || !strings.Contains(out, "jm stop good") || !strings.Contains(out, "[FAIL]  machine bad") || !strings.Contains(out, "jm rm bad") {
+		t.Errorf("doctor table:\n%s", out)
+	}
+	fakeBE.state, fakeNet.state = backend.Stopped, backend.Stopped
 }

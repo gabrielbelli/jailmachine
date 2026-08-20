@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"time"
 
 	"github.com/schollz/progressbar/v3"
 	"github.com/ulikunitz/xz"
@@ -72,12 +73,18 @@ func download(ctx context.Context, client *http.Client, url, part string, progre
 
 	var w io.Writer = f
 	if progress != nil {
+		// Renders as "downloading  42% |████    | (312/740 MB, 9.1 MB/s) [34s:47s]":
+		// bytes done of total, rate, elapsed and ETA.
 		bar := progressbar.NewOptions64(total,
 			progressbar.OptionSetWriter(progress),
 			progressbar.OptionSetDescription("downloading"),
 			progressbar.OptionShowBytes(true),
 			progressbar.OptionShowCount(),
-			progressbar.OptionThrottle(250e6),
+			progressbar.OptionShowTotalBytes(true),
+			progressbar.OptionSetPredictTime(true),
+			progressbar.OptionSetElapsedTime(true),
+			progressbar.OptionShowElapsedTimeOnFinish(),
+			progressbar.OptionThrottle(250*time.Millisecond),
 			progressbar.OptionOnCompletion(func() { fmt.Fprintln(progress) }),
 		)
 		if have > 0 {
@@ -156,17 +163,35 @@ func verify(path, want string) error {
 
 // decompressXZ writes the decompressed contents of src to dst. When
 // xzBinary is non-empty it is executed as "xz -dc src" (several times
-// faster than the pure-Go decoder); otherwise ulikunitz/xz is used.
-func decompressXZ(ctx context.Context, xzBinary, src, dst string) error {
+// faster than the pure-Go decoder); otherwise ulikunitz/xz is used. When
+// progress is non-nil a spinner with the bytes written so far is drawn on
+// it (the decompressed size is not known up front, so there is no ETA).
+func decompressXZ(ctx context.Context, xzBinary, src, dst string, progress io.Writer) error {
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return fmt.Errorf("image: create %s: %w", dst, err)
 	}
 	defer out.Close()
 
+	var w io.Writer = out
+	if progress != nil {
+		spin := progressbar.NewOptions64(-1,
+			progressbar.OptionSetWriter(progress),
+			progressbar.OptionSetDescription("decompressing"),
+			progressbar.OptionShowBytes(true),
+			progressbar.OptionShowCount(),
+			progressbar.OptionSetElapsedTime(true),
+			progressbar.OptionSpinnerType(14),
+			progressbar.OptionThrottle(250*time.Millisecond),
+			progressbar.OptionOnCompletion(func() { fmt.Fprintln(progress) }),
+		)
+		defer func() { _ = spin.Finish() }()
+		w = io.MultiWriter(out, spin)
+	}
+
 	if xzBinary != "" {
 		cmd := exec.CommandContext(ctx, xzBinary, "-dc", src)
-		cmd.Stdout = out
+		cmd.Stdout = w
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("image: %s -dc %s: %w", xzBinary, src, err)
@@ -183,7 +208,7 @@ func decompressXZ(ctx context.Context, xzBinary, src, dst string) error {
 	if err != nil {
 		return fmt.Errorf("image: %s: %w", src, err)
 	}
-	if _, err := io.Copy(out, &ctxReader{ctx: ctx, r: r}); err != nil {
+	if _, err := io.Copy(w, &ctxReader{ctx: ctx, r: r}); err != nil {
 		return fmt.Errorf("image: decompressing %s: %w", src, err)
 	}
 	return out.Sync()

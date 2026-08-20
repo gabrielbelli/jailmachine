@@ -13,7 +13,8 @@ import (
 const qmpTimeout = 5 * time.Second
 
 type qmpCommand struct {
-	Execute string `json:"execute"`
+	Execute   string `json:"execute"`
+	Arguments any    `json:"arguments,omitempty"`
 }
 
 type qmpResponse struct {
@@ -35,8 +36,32 @@ func Powerdown(ctx context.Context, sock string) error {
 	return Execute(ctx, sock, "qmp_capabilities", "system_powerdown")
 }
 
-// Execute runs the given QMP commands in order over one connection.
+// DiskDevice is the QMP name QEMU gives the first "-drive if=virtio" (the
+// root disk in Args): auto-generated "virtio<index>".
+const DiskDevice = "virtio0"
+
+// BlockResize tells a running QEMU that the backing file of device has
+// grown to size bytes, so the guest sees the new capacity without a
+// reboot (QEMU reads the file size only at boot).
+func BlockResize(ctx context.Context, sock, device string, size int64) error {
+	return ExecuteCommands(ctx, sock,
+		qmpCommand{Execute: "qmp_capabilities"},
+		qmpCommand{Execute: "block_resize", Arguments: map[string]any{"device": device, "size": size}},
+	)
+}
+
+// Execute runs the given argument-less QMP commands in order over one
+// connection.
 func Execute(ctx context.Context, sock string, commands ...string) error {
+	cmds := make([]qmpCommand, 0, len(commands))
+	for _, c := range commands {
+		cmds = append(cmds, qmpCommand{Execute: c})
+	}
+	return ExecuteCommands(ctx, sock, cmds...)
+}
+
+// ExecuteCommands runs the given QMP commands in order over one connection.
+func ExecuteCommands(ctx context.Context, sock string, commands ...qmpCommand) error {
 	d := net.Dialer{Timeout: qmpTimeout}
 	conn, err := d.DialContext(ctx, "unix", sock)
 	if err != nil {
@@ -62,19 +87,19 @@ func Execute(ctx context.Context, sock string, commands ...string) error {
 	}
 
 	for _, c := range commands {
-		if err := enc.Encode(qmpCommand{Execute: c}); err != nil {
-			return fmt.Errorf("qmp: sending %s: %w", c, err)
+		if err := enc.Encode(c); err != nil {
+			return fmt.Errorf("qmp: sending %s: %w", c.Execute, err)
 		}
 		for {
 			var resp qmpResponse
 			if err := dec.Decode(&resp); err != nil {
-				return fmt.Errorf("qmp: reading reply to %s: %w", c, err)
+				return fmt.Errorf("qmp: reading reply to %s: %w", c.Execute, err)
 			}
 			if resp.Event != "" {
 				continue // asynchronous event interleaved with replies
 			}
 			if resp.Error != nil {
-				return fmt.Errorf("qmp: %s: %s: %s", c, resp.Error.Class, resp.Error.Desc)
+				return fmt.Errorf("qmp: %s: %s: %s", c.Execute, resp.Error.Class, resp.Error.Desc)
 			}
 			break
 		}

@@ -13,7 +13,13 @@ func newListCmd() *cobra.Command {
 		Use:     "list",
 		Aliases: []string{"ls"},
 		Short:   "List machines",
-		Args:    cobra.NoArgs,
+		Long: "List every machine with its runtime state. Columns, in this order:\n" +
+			"NAME STATE CPUS MEMORY DISK SSH PORTS (PORTS is the number of published\n" +
+			"container ports). --json prints the same records as 'jm inspect --json'\n" +
+			"in an array (keys: name, state, cpus, memory_mib, disk_gib, ssh, ports, ...).",
+		Example: `  jm list
+  jm ls --json | jq -r '.[] | select(.state == "running") | .name'`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ms, err := store().List()
 			if err != nil {

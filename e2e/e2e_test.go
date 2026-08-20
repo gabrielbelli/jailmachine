@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -137,6 +138,16 @@ func TestLifecycle(t *testing.T) {
 
 	podman(append([]string{"run", "-d", "--name", "web2", "-p", "8081:80"}, httpd...)...)
 	waitCurl("http://127.0.0.1:8081/", true, 90*time.Second)
+
+	// Live disk grow: the hypervisor is told (QMP block_resize) and the guest
+	// pool must actually be bigger afterwards, not just the record.
+	jm("set", name, "--disk", "80")
+	if out := jm("ssh", name, "--", "zpool", "list", "-Hp", "-o", "size", "zroot"); func() bool {
+		n, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+		return err != nil || n < 70<<30
+	}() {
+		t.Fatalf("zroot not grown after live set --disk 80: %q", out)
+	}
 
 	jm("stop", name)
 	if out := jm("inspect", name); !strings.Contains(out, "stopped") {

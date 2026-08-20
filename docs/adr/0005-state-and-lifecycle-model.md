@@ -49,3 +49,10 @@ the only file a machine keeps outside its directory. To keep `rm` converging
 to "gone", backends expose an optional `Cleaner` hook that `jm rm` calls
 before deleting the directory; `rm -rf` alone leaves at most one stale,
 harmless socket file in `$TMPDIR`.
+
+Likewise, `jm set --disk` on a running machine needs the hypervisor told
+that the image grew (it reads the size only at boot); backends that can do
+so implement the optional `Resizer` hook (QEMU: QMP `block_resize`), and
+the guest-side grow verifies the presented size before touching the
+partition, so `set` cannot report success while the pool is unchanged.
+Backends without `Resizer` require the machine stopped for `--disk`.

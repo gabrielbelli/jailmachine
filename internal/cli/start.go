@@ -33,7 +33,13 @@ func newStartCmd() *cobra.Command {
 		Long: "Boot a machine in stages: network provider, hypervisor, SSH, first-boot\n" +
 			"provisioning, podman connection, port forwarder. Starting a running machine\n" +
 			"re-checks the ssh, provision, connect and forwarder stages (so an interrupted start can be\n" +
-			"finished); a broken one (half of it running) is stopped and started again.",
+			"finished); a broken one (half of it running) is stopped and started again.\n\n" +
+			"On failure the error names the stage and the log to read: qemu.log and\n" +
+			"console.log (hypervisor), gvproxy.log and forward.log (networking),\n" +
+			"forwarder.log (port publishing), or /var/log/jm-provision.log in the guest.",
+		Example: `  jm start
+  jm start dev
+  jm -q start && podman run --rm --os=linux docker.io/alpine echo hi`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runStart(cmd.Context(), args)
@@ -91,7 +97,7 @@ func runStart(ctx context.Context, args []string) error {
 	// rather than needing jm stop && jm start (ADR 0005: start is
 	// resumable).
 	if st == backend.Running {
-		logf(stdout, "%s is already running (ssh %s:%d); checking the remaining stages", m.Name, ep.SSHHost, ep.SSHPort)
+		logf(stdout, "%s: %s is already running (ssh %s:%d); checking the remaining stages", machine.StageBackend, m.Name, ep.SSHHost, ep.SSHPort)
 	} else {
 		logf(stdout, "%s: booting %s (%d cpus, %d MiB, ssh on %s:%d)", machine.StageBackend, m.Name, m.CPUs, m.MemoryMiB, ep.SSHHost, ep.SSHPort)
 		if err := b.Start(ctx, m, att); err != nil {
@@ -109,6 +115,9 @@ func runStart(ctx context.Context, args []string) error {
 		return err
 	}
 	defer client.Close()
+	// A disk grown by "jm set --disk" while stopped is handed to the guest
+	// now that sshd answers.
+	finishPendingGrow(ctx, m, client)
 
 	// Stage: provision.
 	logf(stdout, "%s: waiting for %s", machine.StageProvision, machine.GuestProvisionMarker)
@@ -139,7 +148,7 @@ func runStart(ctx context.Context, args []string) error {
 	forgetHostKey(m)
 	podmanConnectionRemove(ctx, m)
 	if err := podmanConnectionAdd(ctx, m, ep); err != nil {
-		return machine.NewStageError(machine.StageConnect, "is podman installed? brew install podman", err)
+		return machine.NewStageError(machine.StageConnect, "is podman installed? brew install podman; then re-run 'jm start"+nameHint(m.Name)+"'", err)
 	}
 	if ep.APISocket != "" {
 		logf(stdout, "%s: podman connection %q -> %s", machine.StageConnect, m.SocketConnectionName(), machine.SocketURI(ep.APISocket))
@@ -157,7 +166,7 @@ func runStart(ctx context.Context, args []string) error {
 	if err := startForwarder(m, p, ep); err != nil {
 		return err
 	}
-	logf(stdout, "ready. Try: podman run --rm --os=linux docker.io/alpine echo hi")
+	logf(stdout, "ready: try 'podman run --rm --os=linux docker.io/alpine echo hi'")
 	return nil
 }
 
@@ -182,14 +191,14 @@ func waitSSH(ctx context.Context, m *machine.Machine, b backend.Backend, p netpr
 	defer cancel()
 	var dead error
 	client, err := sshx.WaitReady(ctx, ep.SSHHost, ep.SSHPort, m.SSHUser, sshKey(m), func(attempt int) {
-		fmt.Fprint(stdout, ".")
+		dot()
 		if dead == nil {
 			if dead = componentDied(m, b, p, machine.StageSSH, "while waiting for ssh"); dead != nil {
 				cancel()
 			}
 		}
 	})
-	fmt.Fprintln(stdout)
+	endDots()
 	if dead != nil {
 		return nil, dead
 	}
@@ -212,11 +221,11 @@ func waitProvisioned(ctx context.Context, m *machine.Machine, b backend.Backend,
 		return nil
 	case err == nil:
 		// Marker genuinely absent: the provisioning script is running.
-		logf(stdout, "first boot: installing packages (a few minutes; %s)", hint)
+		logf(stdout, "%s: first boot, installing packages (a few minutes; %s)", machine.StageProvision, hint)
 	default:
 		// Transport error: sshd may be restarting; say so rather than
 		// announcing a first boot that may not be happening.
-		logf(stdout, "ssh connection dropped (%v); waiting for the guest", err)
+		logf(stdout, "%s: ssh connection dropped (%v); waiting for the guest", machine.StageProvision, err)
 	}
 	for {
 		select {
@@ -224,13 +233,13 @@ func waitProvisioned(ctx context.Context, m *machine.Machine, b backend.Backend,
 			return machine.NewStageError(machine.StageProvision, hint, errors.New("timed out waiting for provisioning"))
 		case <-time.After(provisionPoll):
 		}
-		fmt.Fprint(stdout, ".")
+		dot()
 		if dead := componentDied(m, b, p, machine.StageProvision, "during provisioning"); dead != nil {
-			fmt.Fprintln(stdout)
+			endDots()
 			return dead
 		}
 		if failed, ferr := client.FileExists(ctx, machine.GuestProvisionFailed); ferr == nil && failed {
-			fmt.Fprintln(stdout)
+			endDots()
 			return machine.NewStageError(machine.StageProvision, hint, errors.New("provisioning script failed in the guest"))
 		}
 		ok, err = client.FileExists(ctx, machine.GuestProvisionMarker)
@@ -244,7 +253,7 @@ func waitProvisioned(ctx context.Context, m *machine.Machine, b backend.Backend,
 			continue
 		}
 		if ok {
-			fmt.Fprintln(stdout)
+			endDots()
 			return nil
 		}
 	}

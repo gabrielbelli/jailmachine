@@ -18,21 +18,30 @@ import (
 // store returns the machine store for --state-root.
 func store() *machine.Store { return machine.NewStore(StateRoot()) }
 
-// logf prints a "==> ..." stage line, like the PoC's log().
+// logf prints a "==> <stage>: <detail>" line, like the PoC's log(). It is
+// silenced by -q/--quiet and, under --json, moved to stderr so stdout stays
+// parseable; data output and errors never go through it.
 func logf(w io.Writer, format string, args ...any) {
+	if quiet {
+		return
+	}
+	if jsonOut && w == stdout {
+		w = stderr
+	}
 	fmt.Fprintf(w, "==> "+format+"\n", args...)
 }
 
-// loadMachine resolves the optional name argument and loads its record,
-// returning a friendlier error when it does not exist.
+// loadMachine resolves the optional name argument (see resolveDefault for
+// what a missing one means) and loads the record, returning a friendlier
+// error when it does not exist.
 func loadMachine(args []string) (*machine.Machine, error) {
-	name, err := machine.ResolveName(args)
+	name, err := resolveName(args)
 	if err != nil {
 		return nil, err
 	}
 	m, err := store().Load(name)
 	if errors.Is(err, machine.ErrNotFound) {
-		return nil, fmt.Errorf("machine %q does not exist (run 'jm init%s')", name, nameHint(name))
+		return nil, withHint(fmt.Errorf("machine %q does not exist", name), fmt.Sprintf("run 'jm init%s' to create it, or 'jm list'", nameHint(name)))
 	}
 	return m, err
 }
@@ -216,7 +225,7 @@ func forgetHostKey(m *machine.Machine) {
 // missing, like the PoC's need().
 func requireBinary(name, brew string) error {
 	if _, err := exec.LookPath(name); err != nil {
-		return fmt.Errorf("missing %s (brew install %s)", name, brew)
+		return withHint(fmt.Errorf("missing %s on PATH", name), "brew install "+brew)
 	}
 	return nil
 }

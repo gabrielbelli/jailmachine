@@ -76,11 +76,32 @@ func describe(m *machine.Machine) info {
 	return i
 }
 
+// inspectLong documents the --json keys; keep it in step with info and
+// machine.Machine.
+const inspectLong = `Show a machine's record plus its computed runtime state. Nothing is cached:
+state is read from the hypervisor and the network provider on every call.
+
+--json prints one object with snake_case keys:
+
+  name, state (running|stopped|broken), backend_state, network_state,
+  backend, network, image, cpus, memory_mib, disk_gib, mac, ssh_port,
+  ssh_user, guest_ip, ssh (host:port), ssh_key, podman_uri,
+  podman_sock_uri, api_socket, dns, console, network_logs, dir,
+  provisioned, created, version, backend_opts,
+  ports (array of {proto, local, remote, since, error}), forwarder_state,
+  forwarder_log.
+
+Keys whose value is empty are omitted.`
+
 func newInspectCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "inspect [name]",
 		Short: "Show a machine's configuration and state",
-		Args:  cobra.MaximumNArgs(1),
+		Long:  inspectLong,
+		Example: `  jm inspect
+  jm inspect --json dev | jq -r .ssh
+  jm inspect --json | jq -r .podman_sock_uri`,
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			m, err := loadMachine(args)
 			if err != nil {

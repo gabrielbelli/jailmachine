@@ -129,7 +129,7 @@ func (o *Official) Fetch(ctx context.Context, dest string, progress io.Writer) e
 	} else {
 		logf("decompressing (in-process; install xz for a faster path)")
 	}
-	if err := decompressXZ(ctx, o.xzBinary(), archive, tmp); err != nil {
+	if err := decompressXZ(ctx, o.xzBinary(), archive, tmp, barWriter(progress)); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
@@ -149,10 +149,21 @@ func (o *Official) Fetch(ctx context.Context, dest string, progress io.Writer) e
 	return nil
 }
 
-// barWriter returns nil for io.Discard so download skips the progress
-// bar entirely instead of rendering into the void.
+// Interactive is implemented by progress writers that know whether they
+// are a terminal. A writer reporting false (a pipe, --quiet, --json) gets
+// the plain log lines but no progress bars or spinners.
+type Interactive interface {
+	Interactive() bool
+}
+
+// barWriter returns nil when animated progress must not be drawn on w:
+// io.Discard (nothing wanted at all) or a writer that says it is not
+// interactive. Other writers get the bar as before.
 func barWriter(w io.Writer) io.Writer {
 	if w == io.Discard {
+		return nil
+	}
+	if i, ok := w.(Interactive); ok && !i.Interactive() {
 		return nil
 	}
 	return w

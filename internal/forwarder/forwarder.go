@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"path/filepath"
 	"time"
 
@@ -68,7 +69,10 @@ type Config struct {
 	Engine  Engine
 	// StatePath is where forwards.json lives (StatePath(m.Dir) normally).
 	StatePath string
-	Log       *log.Logger
+	// SSHLocal is the host side of the provider's own SSH forward
+	// ("host:port"), which is never ours; "" if unknown.
+	SSHLocal string
+	Log      *log.Logger
 
 	Resync     time.Duration
 	Debounce   time.Duration
@@ -120,6 +124,25 @@ func Relevant(line []byte) bool {
 	return relevant[e.Status]
 }
 
+// Leaked returns the mappings in live that point at guestIP apart from the
+// provider's own SSH forward (local sshLocal, or remote port 22): with an
+// empty owned set these can only be leftovers of a forwarder whose state
+// was lost.
+func Leaked(live []netprov.Mapping, guestIP, sshLocal string) []netprov.Mapping {
+	var out []netprov.Mapping
+	for _, mp := range live {
+		host, port, err := net.SplitHostPort(mp.Remote)
+		if err != nil || host != guestIP {
+			continue
+		}
+		if port == "22" || (sshLocal != "" && mp.Local == sshLocal) {
+			continue
+		}
+		out = append(out, mp)
+	}
+	return out
+}
+
 // Run executes the reconciliation loop until ctx is cancelled: a full
 // resync first, then one on each relevant event (debounced) and every
 // Resync. The event stream is reopened with exponential backoff when it
@@ -134,6 +157,16 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		cfg.Log.Printf("state: %v; starting with an empty owned set", err)
 		st = &State{}
+	}
+	if len(st.Owned) == 0 {
+		// Nothing on record, yet the provider may still hold mappings to
+		// the guest from a forwarder whose state was lost. They are not
+		// adopted (ADR 0004: only remove what we created); say so.
+		if live, err := cfg.Provider.List(ctx, cfg.Machine); err == nil {
+			if leaked := Leaked(live, cfg.GuestIP, cfg.SSHLocal); len(leaked) > 0 {
+				cfg.Log.Printf("state: %s has no record of %v, which point at the guest; not adopting them (jm stop && jm start resets them)", cfg.StatePath, leaked)
+			}
+		}
 	}
 
 	resync := func(why string) error {

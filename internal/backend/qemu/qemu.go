@@ -285,6 +285,12 @@ func (b Backend) Stop(ctx context.Context, m *machine.Machine, graceful bool) er
 	return removeAll(p.PID, p.QMP)
 }
 
+// ResizeDisk implements backend.Resizer via QMP block_resize on the root
+// virtio disk.
+func (b Backend) ResizeDisk(ctx context.Context, m *machine.Machine, size int64) error {
+	return BlockResize(ctx, QMPSocket(m.Dir), DiskDevice, size)
+}
+
 // shutdown drives pid to exit: optionally QMP powerdown, then SIGTERM, then
 // SIGKILL. The CLI may already have asked the guest to power off over SSH,
 // so the graceful wait runs even when QMP itself fails.

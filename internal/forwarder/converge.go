@@ -100,6 +100,9 @@ func ConvergeWith(ctx context.Context, p netprov.Provider, m *machine.Machine, d
 			continue
 		}
 		dirty = true
+		if e.Remote == "" { // unpublishable entry, never exposed
+			continue
+		}
 		if liveSet[k] {
 			if err := p.Unexpose(ctx, m, e.Mapping()); err != nil {
 				e.Error = "unexpose: " + err.Error()
@@ -184,8 +187,10 @@ func sortedKeys[V any](m map[string]V) []string {
 	return keys
 }
 
-// Release unexposes every owned mapping (best effort, continuing on error)
-// and clears the owned set. "jm stop" and "jm rm" call it after terminating
+// Release unexposes every owned mapping the provider still lists (best
+// effort, continuing on error) and clears the owned set. Owned entries the
+// provider does not list (unpublishable ones, conflicts that never made it
+// in) are just forgotten. "jm stop" and "jm rm" call it after terminating
 // the forwarder, while the provider is still up.
 func Release(ctx context.Context, p netprov.Provider, m *machine.Machine, statePath string) error {
 	st, err := Load(statePath)
@@ -195,10 +200,18 @@ func Release(ctx context.Context, p netprov.Provider, m *machine.Machine, stateP
 	if len(st.Owned) == 0 {
 		return nil
 	}
+	live, err := p.List(ctx, m)
+	if err != nil {
+		return fmt.Errorf("forwarder: listing provider mappings: %w", err)
+	}
+	liveSet := make(map[string]bool, len(live))
+	for _, mp := range live {
+		liveSet[key(mp)] = true
+	}
 	var errs []string
 	for _, e := range st.Owned {
-		if e.Remote == "" { // unpublishable entry, never exposed
-			continue
+		if e.Remote == "" || !liveSet[key(e.Mapping())] {
+			continue // never exposed, or already gone
 		}
 		if err := p.Unexpose(ctx, m, e.Mapping()); err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", e.Mapping(), err))

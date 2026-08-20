@@ -281,6 +281,21 @@ func TestQMPSocketLength(t *testing.T) {
 // fakeQMP serves one connection on a unix socket, speaking just enough QMP
 // to record the commands it receives.
 func fakeQMP(t *testing.T) (sock string, got <-chan []string) {
+	sock, frames := fakeQMPFrames(t)
+	ch := make(chan []string, 1)
+	go func() {
+		var names []string
+		for _, f := range <-frames {
+			names = append(names, f.Execute)
+		}
+		ch <- names
+	}()
+	return sock, ch
+}
+
+// fakeQMPFrames is fakeQMP returning the decoded command frames, arguments
+// included.
+func fakeQMPFrames(t *testing.T) (sock string, got <-chan []qmpCommand) {
 	t.Helper()
 	// Unix socket paths are limited to ~104 bytes on macOS; t.TempDir can
 	// exceed that, so use the system temp dir directly.
@@ -296,7 +311,7 @@ func fakeQMP(t *testing.T) (sock string, got <-chan []string) {
 	}
 	t.Cleanup(func() { ln.Close() })
 
-	ch := make(chan []string, 1)
+	ch := make(chan []qmpCommand, 1)
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -307,13 +322,13 @@ func fakeQMP(t *testing.T) (sock string, got <-chan []string) {
 		enc := json.NewEncoder(conn)
 		dec := json.NewDecoder(conn)
 		_ = enc.Encode(map[string]any{"QMP": map[string]any{"version": map[string]any{}, "capabilities": []string{}}})
-		var cmds []string
+		var cmds []qmpCommand
 		for {
 			var c qmpCommand
 			if err := dec.Decode(&c); err != nil {
 				break
 			}
-			cmds = append(cmds, c.Execute)
+			cmds = append(cmds, c)
 			// Interleave an event to make sure the client skips it.
 			_ = enc.Encode(map[string]any{"event": "POWERDOWN", "timestamp": map[string]int{"seconds": 0}})
 			_ = enc.Encode(map[string]any{"return": map[string]any{}})
@@ -331,6 +346,21 @@ func TestPowerdownQMP(t *testing.T) {
 	want := []string{"qmp_capabilities", "system_powerdown"}
 	if cmds := <-got; !reflect.DeepEqual(cmds, want) {
 		t.Fatalf("server saw %q, want %q", cmds, want)
+	}
+}
+
+func TestBlockResizeQMP(t *testing.T) {
+	sock, got := fakeQMPFrames(t)
+	if err := BlockResize(context.Background(), sock, DiskDevice, 80<<30); err != nil {
+		t.Fatal(err)
+	}
+	frames := <-got
+	if len(frames) != 2 || frames[0].Execute != "qmp_capabilities" || frames[1].Execute != "block_resize" {
+		t.Fatalf("server saw %+v", frames)
+	}
+	args, _ := frames[1].Arguments.(map[string]any)
+	if args["device"] != "virtio0" || args["size"] != float64(80<<30) {
+		t.Fatalf("block_resize arguments = %v", frames[1].Arguments)
 	}
 }
 
