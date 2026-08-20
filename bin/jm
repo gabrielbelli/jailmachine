@@ -1,0 +1,192 @@
+#!/bin/sh
+# jailmachine - PoC. FreeBSD VM on macOS (QEMU + HVF) for jails + OCI containers.
+# NB: Apple Virtualization.framework (vfkit) cannot boot FreeBSD/arm64 - kernel dies after the loader.
+set -eu
+
+JM_HOME="${JM_HOME:-$HOME/.jailmachine}"
+NAME=jailmachine
+CPUS="${JM_CPUS:-4}"
+MEM="${JM_MEM:-4096}"          # MiB
+DISK_SIZE="${JM_DISK:-64G}"
+REL="${JM_RELEASE:-15.1-RELEASE}"
+IMG="FreeBSD-${REL}-arm64-aarch64-BASIC-CLOUDINIT-zfs.raw.xz"
+URL="https://download.freebsd.org/releases/VM-IMAGES/${REL}/aarch64/Latest"
+
+DISK="$JM_HOME/disk.raw"
+SEED="$JM_HOME/seed.iso"
+EFIVARS="$JM_HOME/efivars.fd"
+SSH_PORT="${JM_SSH_PORT:-2222}"
+KEY="$JM_HOME/ssh/id_ed25519"
+PIDF="$JM_HOME/qemu.pid"
+QMP="$JM_HOME/qmp.sock"
+LOG="$JM_HOME/console.log"
+META="$JM_HOME/machine.json"
+MAC="5a:94:ef:e4:0c:ee"
+
+die() { printf 'jm: %s\n' "$*" >&2; exit 1; }
+log() { printf '==> %s\n' "$*"; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing $1 (brew install $2)"; }
+
+ssh_opts() {
+  printf '%s' "-i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=3"
+}
+
+running() { [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; }
+
+# ---------------------------------------------------------------- init
+write_seed() {
+  tmp=$(mktemp -d)
+  pub=$(cat "$KEY.pub")
+  printf 'instance-id: %s\nlocal-hostname: %s\n' "$NAME" "$NAME" > "$tmp/meta-data"
+  cat > "$tmp/user-data" <<USERDATA
+#!/bin/sh
+# first-boot provisioning, run by nuageinit as root
+exec > /var/log/jm-provision.log 2>&1
+set -x
+sysrc hostname=$NAME; hostname $NAME
+mkdir -p /root/.ssh; chmod 700 /root/.ssh
+echo '$pub' > /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys
+sysrc sshd_enable=YES
+sed -i '' -e 's/^#\{0,1\}PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+service sshd restart
+# nuageinit runs before DHCP has finished: wait for DNS
+i=0; until host -W 2 pkg.freebsd.org >/dev/null 2>&1 || [ \$i -ge 60 ]; do sleep 2; i=\$((i+1)); done
+# packages
+env ASSUME_ALWAYS_YES=yes pkg bootstrap -f
+pkg install -y podman-suite bastille
+# zfs / storage for containers
+sysrc zfs_enable=YES
+zfs create -o mountpoint=/var/db/containers zroot/containers || true
+# linuxulator
+sysrc linux_enable=YES; service linux start
+# pf (nat for containers), per podman pkg message
+ext_if=\$(route -n get default | awk '/interface:/{print \$2}')
+sed -E "s/^(v[46]egress_if) = \"[^\"]*\"/\\1 = \"\$ext_if\"/" /usr/local/etc/containers/pf.conf.sample > /etc/pf.conf
+sysrc pf_enable=YES; service pf start
+# podman REST API on a unix socket (the stock 'podman' rc script only restarts containers)
+cat > /usr/local/etc/rc.d/podman_service <<'RC'
+#!/bin/sh
+# PROVIDE: podman_service
+# REQUIRE: LOGIN pf
+# KEYWORD: shutdown
+. /etc/rc.subr
+name=podman_service
+rcvar=podman_service_enable
+: \${podman_service_enable:=NO}
+: \${podman_service_socket:="unix:///var/run/podman/podman.sock"}
+pidfile=/var/run/podman_service.pid
+command=/usr/sbin/daemon
+command_args="-f -P \${pidfile} -o /var/log/podman_service.log /usr/local/bin/podman system service --time=0 \${podman_service_socket}"
+start_precmd="mkdir -p /var/run/podman"
+load_rc_config \$name
+run_rc_command "\$1"
+RC
+chmod +x /usr/local/etc/rc.d/podman_service
+sysrc podman_service_enable=YES; service podman_service start
+# bastille
+sysrc bastille_enable=YES
+touch /var/db/jm-provisioned
+USERDATA
+  hdiutil makehybrid -quiet -iso -joliet -default-volume-name cidata -o "$SEED" "$tmp"
+  rm -rf "$tmp"
+}
+
+cmd_init() {
+  need qemu-system-aarch64 qemu; need xz xz; need podman podman
+  [ -f "$DISK" ] && die "already initialised ($DISK). Run 'jm rm' first."
+  mkdir -p "$JM_HOME/ssh"; chmod 700 "$JM_HOME/ssh"
+  [ -f "$KEY" ] || ssh-keygen -q -t ed25519 -N '' -C jailmachine -f "$KEY"
+
+  log "downloading $IMG"
+  curl -fL --progress-bar -o "$JM_HOME/$IMG" -C - "$URL/$IMG" || curl -fL --progress-bar -o "$JM_HOME/$IMG" "$URL/$IMG"
+  want=$(curl -fsL "$URL/CHECKSUM.SHA256" | awk -v f="($IMG)" '$2==f{print $4}')
+  got=$(shasum -a 256 "$JM_HOME/$IMG" | awk '{print $1}')
+  [ "$want" = "$got" ] || die "checksum mismatch for $IMG"
+
+  log "decompressing to disk.raw and growing to $DISK_SIZE"
+  xz -dc "$JM_HOME/$IMG" > "$DISK"
+  truncate -s "$DISK_SIZE" "$DISK" 2>/dev/null || dd if=/dev/null of="$DISK" bs=1 count=0 seek="$DISK_SIZE" 2>/dev/null
+  rm -f "$JM_HOME/$IMG"
+
+  log "writing cloud-init seed"
+  write_seed
+  cp "$(qemu_share)/edk2-arm-vars.fd" "$EFIVARS"
+  printf '{"name":"%s","release":"%s","cpus":%s,"memory":%s,"mac":"%s","created":"%s"}\n' \
+    "$NAME" "$REL" "$CPUS" "$MEM" "$MAC" "$(date -u +%FT%TZ)" > "$META"
+  log "done. Next: jm start"
+}
+
+# ---------------------------------------------------------------- start
+qemu_share() { d=$(dirname "$(dirname "$(command -v qemu-system-aarch64)")")/share/qemu; [ -d "$d" ] || d=/opt/homebrew/share/qemu; echo "$d"; }
+ssh_target() { printf -- '-p %s root@127.0.0.1' "$SSH_PORT"; }
+
+cmd_start() {
+  [ -f "$DISK" ] || die "not initialised. Run 'jm init'."
+  running && die "already running (pid $(cat "$PIDF"))"
+  log "booting $NAME ($CPUS cpus, ${MEM}MiB, ssh on 127.0.0.1:$SSH_PORT)"
+  rm -f "$QMP"
+  qemu-system-aarch64 -M virt,accel=hvf -cpu host -smp "$CPUS" -m "$MEM" \
+    -drive "if=pflash,format=raw,readonly=on,file=$(qemu_share)/edk2-aarch64-code.fd" \
+    -drive "if=pflash,format=raw,file=$EFIVARS" \
+    -drive "file=$DISK,format=raw,if=virtio,cache=writeback,discard=unmap" \
+    -drive "file=$SEED,format=raw,if=virtio,readonly=on" \
+    -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22" -device virtio-net-pci,netdev=n0,mac="$MAC" \
+    -device virtio-rng-pci \
+    -display none -serial "file:$LOG" -qmp "unix:$QMP,server,nowait" \
+    -daemonize -pidfile "$PIDF" >"$JM_HOME/qemu.log" 2>&1 || die "qemu failed, see $JM_HOME/qemu.log"
+
+  printf 'waiting for ssh'
+  i=0
+  until ssh $(ssh_opts) $(ssh_target) true 2>/dev/null; do
+    running || die "qemu exited, see $JM_HOME/qemu.log and $LOG"
+    i=$((i+1)); [ $i -gt 90 ] && die "ssh not reachable after 180s (see $LOG)"
+    printf '.'; sleep 2
+  done
+  echo
+  if ! ssh $(ssh_opts) $(ssh_target) test -f /var/db/jm-provisioned; then
+    log "first boot: installing packages (a few minutes, log: jm ssh tail -f /var/log/jm-provision.log)"
+    until ssh $(ssh_opts) $(ssh_target) test -f /var/db/jm-provisioned; do printf '.'; sleep 5; done
+    echo
+  fi
+  log "configuring podman connection"
+  ssh-keygen -R "[127.0.0.1]:$SSH_PORT" >/dev/null 2>&1 || true   # podman-remote trusts ~/.ssh/known_hosts
+  podman system connection remove "$NAME" 2>/dev/null || true
+  podman system connection add --identity "$KEY" --default "$NAME" "ssh://root@127.0.0.1:$SSH_PORT/var/run/podman/podman.sock"
+  log "ready. Try: podman run --rm --os=linux docker.io/alpine echo hi"
+}
+
+# ---------------------------------------------------------------- others
+cmd_stop() {
+  running || { echo "not running"; return 0; }
+  ssh $(ssh_opts) $(ssh_target) poweroff 2>/dev/null || \
+    printf '{"execute":"qmp_capabilities"}\n{"execute":"system_powerdown"}\n' | nc -U "$QMP" >/dev/null 2>&1 || true
+  i=0; while running && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done
+  running && kill "$(cat "$PIDF")"
+  rm -f "$PIDF"; log "stopped"
+}
+
+cmd_ssh() {
+  running || die "not running"
+  exec ssh $(ssh_opts) $(ssh_target) "$@"
+}
+
+cmd_inspect() {
+  [ -f "$META" ] || die "not initialised"
+  state=stopped; running && state=running
+  printf '{"state":"%s","ssh":"127.0.0.1:%s","machine":%s}\n' "$state" "$SSH_PORT" "$(cat "$META")"
+}
+
+cmd_rm() {
+  running && cmd_stop
+  podman system connection remove "$NAME" 2>/dev/null || true
+  ssh-keygen -R "[127.0.0.1]:$SSH_PORT" >/dev/null 2>&1 || true
+  rm -rf "$JM_HOME"; log "removed $JM_HOME"
+}
+
+usage() { echo "usage: jm init|start|stop|ssh [cmd]|inspect|rm"; exit 64; }
+
+cmd="${1:-}"; [ $# -gt 0 ] && shift
+case "$cmd" in
+  init|start|stop|ssh|inspect|rm) "cmd_$cmd" "$@" ;;
+  *) usage ;;
+esac
