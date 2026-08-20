@@ -13,6 +13,7 @@ import (
 	"github.com/gabrielbelli/jailmachine/internal/backend"
 	"github.com/gabrielbelli/jailmachine/internal/image"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
+	"github.com/gabrielbelli/jailmachine/internal/netprov"
 	"github.com/gabrielbelli/jailmachine/internal/seed"
 	"github.com/gabrielbelli/jailmachine/internal/sshx"
 )
@@ -45,6 +46,8 @@ func newInitCmd() *cobra.Command {
 	f.IntVar(&memory, "memory", d.MemoryMiB, "memory in MiB")
 	f.IntVar(&disk, "disk", d.DiskGiB, "disk size in GiB")
 	f.IntVar(&sshPort, "ssh-port", d.SSHPort, "host port forwarded to the guest's sshd")
+	cmd.Long += "\nThe network provider is chosen per host ($JM_NETWORK overrides; known: " +
+		strings.Join(netprov.Names(), ", ") + ")."
 	return cmd
 }
 
@@ -70,13 +73,18 @@ func (o initOpts) validate() error {
 	return nil
 }
 
-// imageSource maps a parsed --image reference to a provider.
-func imageSource(ref machine.ImageRef, diskGiB int) (image.Source, error) {
+// imageSource maps a parsed --image reference to a provider and returns the
+// reference with the release resolved, so the record says exactly which
+// image was fetched ("official:15.1-RELEASE", never a floating "official").
+func imageSource(ref machine.ImageRef, diskGiB int) (image.Source, machine.ImageRef, error) {
 	switch ref.Source {
 	case "official":
-		return &image.Official{Release: ref.Release, DiskGiB: diskGiB}, nil
+		if ref.Release == "" {
+			ref.Release = image.DefaultRelease
+		}
+		return &image.Official{Release: ref.Release, DiskGiB: diskGiB}, ref, nil
 	default:
-		return nil, fmt.Errorf("unknown image source %q (known: official)", ref.Source)
+		return nil, ref, fmt.Errorf("unknown image source %q (known: official)", ref.Source)
 	}
 }
 
@@ -92,7 +100,7 @@ func runInit(ctx context.Context, args []string, o initOpts) error {
 	if err != nil {
 		return err
 	}
-	src, err := imageSource(ref, o.disk)
+	src, ref, err := imageSource(ref, o.disk)
 	if err != nil {
 		return err
 	}
@@ -104,6 +112,16 @@ func runInit(ctx context.Context, args []string, o initOpts) error {
 		return err
 	}
 	if err := b.Preflight(); err != nil {
+		return err
+	}
+	// Likewise the network provider (override: $JM_NETWORK), fixed at init
+	// so a machine keeps the networking it was created with (ADR 0004).
+	networkName := netprov.DefaultForHost()
+	p, err := netprov.Get(networkName)
+	if err != nil {
+		return err
+	}
+	if err := p.Preflight(); err != nil {
 		return err
 	}
 	if err := requireBinary("podman", "podman"); err != nil {
@@ -123,6 +141,7 @@ func runInit(ctx context.Context, args []string, o initOpts) error {
 	m := machine.Defaults()
 	m.Name = name
 	m.Backend = backendName
+	m.Network = networkName
 	m.Image = ref.String()
 	m.CPUs = o.cpus
 	m.MemoryMiB = o.memory

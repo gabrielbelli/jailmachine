@@ -8,34 +8,71 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/gabrielbelli/jailmachine/internal/backend"
+	"github.com/gabrielbelli/jailmachine/internal/forwarder"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
 )
 
 // info is the inspect/list view: the record plus computed runtime facts.
 type info struct {
 	*machine.Machine
-	State   backend.State `json:"state"`
-	SSH     string        `json:"ssh"`
-	SSHKey  string        `json:"ssh_key"`
-	Console string        `json:"console,omitempty"`
-	Dir     string        `json:"dir"`
-	Podman  string        `json:"podman_uri"`
+	State        backend.State `json:"state"`
+	BackendState backend.State `json:"backend_state"`
+	NetworkState backend.State `json:"network_state"`
+	SSH          string        `json:"ssh"`
+	SSHKey       string        `json:"ssh_key"`
+	Console      string        `json:"console,omitempty"`
+	Dir          string        `json:"dir"`
+	Podman       string        `json:"podman_uri"`
+	PodmanSock   string        `json:"podman_sock_uri,omitempty"`
+	APISocket    string        `json:"api_socket,omitempty"`
+	DNS          string        `json:"dns,omitempty"`
+	NetworkLogs  []string      `json:"network_logs,omitempty"`
+	// Ports is the forwarder's owned mapping table with per-mapping errors
+	// (ADR 0004); Forwarder is whether the loop is running.
+	Ports         []forwarder.Entry `json:"ports"`
+	Forwarder     backend.State     `json:"forwarder_state"`
+	ForwarderLog  string            `json:"forwarder_log,omitempty"`
+	networkString string
 }
 
 // describe computes the runtime view of m; read-only, never blocks.
 func describe(m *machine.Machine) info {
-	i := info{Machine: m, SSH: m.SSHEndpoint(), SSHKey: sshKey(m), Dir: store().Dir(m.Name), Podman: m.PodmanURI()}
-	b, err := backendFor(m)
+	i := info{
+		Machine: m, State: backend.Broken, BackendState: backend.Broken, NetworkState: backend.Broken,
+		SSH: m.SSHEndpoint(), SSHKey: sshKey(m), Dir: store().Dir(m.Name), Podman: m.PodmanURI(),
+		networkString: m.NetworkName(),
+		Ports:         []forwarder.Entry{},
+		Forwarder:     backend.Stopped,
+	}
+	if fw := forwards(m); fw != nil {
+		i.Ports = fw
+	}
+	if m.Dir != "" {
+		pr := forwarderProcess(m)
+		i.ForwarderLog = pr.LogPath()
+		if _, ok := pr.Alive(); ok {
+			i.Forwarder = backend.Running
+		}
+	}
+	b, p, err := components(m)
 	if err != nil {
-		i.State = backend.Broken
 		return i
 	}
 	if st, err := b.State(m); err == nil {
-		i.State = st
-	} else {
-		i.State = backend.Broken
+		i.BackendState = st
 	}
+	if st, err := p.State(m); err == nil {
+		i.NetworkState = st
+	}
+	i.State = combineState(i.BackendState, i.NetworkState, p.Capabilities().Supervised)
 	i.Console = b.ConsolePath(m)
+	i.NetworkLogs = p.Logs(m)
+	if ep, err := p.Endpoint(m); err == nil {
+		i.SSH = fmt.Sprintf("%s:%d", ep.SSHHost, ep.SSHPort)
+		i.APISocket = ep.APISocket
+		i.PodmanSock = machine.SocketURI(ep.APISocket)
+		i.DNS = ep.DNS
+	}
 	return i
 }
 
@@ -59,17 +96,41 @@ func newInspectCmd() *cobra.Command {
 			row := func(k string, v any) { fmt.Fprintf(tw, "%s:\t%v\n", k, v) }
 			row("Name", i.Name)
 			row("State", i.State)
+			if i.State == backend.Broken {
+				row("  Hypervisor", i.BackendState)
+				row("  Network", i.NetworkState)
+			}
 			row("Backend", i.Backend)
+			row("Network", i.networkString)
 			row("Image", i.Image)
 			row("CPUs", i.CPUs)
 			row("Memory", fmt.Sprintf("%d MiB", i.MemoryMiB))
 			row("Disk", fmt.Sprintf("%d GiB", i.DiskGiB))
 			row("MAC", i.MAC)
+			if i.GuestIP != "" {
+				row("Guest IP", i.GuestIP)
+			}
+			if i.DNS != "" {
+				row("DNS", i.DNS)
+			}
 			row("SSH", fmt.Sprintf("%s@%s", i.SSHUser, i.SSH))
 			row("SSH key", i.SSHKey)
-			row("Podman", i.Podman)
+			row("Podman", fmt.Sprintf("%s (%s)", i.Podman, i.Name))
+			if i.PodmanSock != "" {
+				row("Podman socket", fmt.Sprintf("%s (%s)", i.PodmanSock, i.SocketConnectionName()))
+			}
 			if i.Console != "" {
 				row("Console", i.Console)
+			}
+			for _, l := range i.NetworkLogs {
+				row("Network log", l)
+			}
+			row("Forwarder", i.Forwarder)
+			if i.ForwarderLog != "" {
+				row("Forwarder log", i.ForwarderLog)
+			}
+			for _, e := range i.Ports {
+				row("Port", fmt.Sprintf("%s -> %s %s (%s)", e.Local, remoteOrDash(e.Remote), e.Proto, e.Status()))
 			}
 			row("Dir", i.Dir)
 			row("Provisioned", i.Provisioned)

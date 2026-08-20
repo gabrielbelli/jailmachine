@@ -14,6 +14,10 @@ import (
 	// Backends register themselves with internal/backend on import; this is
 	// the only place the CLI names one (ADR 0002).
 	_ "github.com/gabrielbelli/jailmachine/internal/backend/qemu"
+
+	// Network providers likewise register themselves (ADR 0004).
+	_ "github.com/gabrielbelli/jailmachine/internal/netprov/gvproxy"
+	_ "github.com/gabrielbelli/jailmachine/internal/netprov/user"
 )
 
 // Global flag values, shared by every subcommand.
@@ -47,6 +51,16 @@ func NewRootCmd() *cobra.Command {
 		Long:          "jailmachine (jm) provisions and manages a FreeBSD virtual machine for running\njails (bastille) and OCI containers (podman), and connects the host's podman client to it.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		// Backends and podman receive paths from the state root; make it
+		// absolute once so they do not depend on the working directory.
+		PersistentPreRunE: func(*cobra.Command, []string) error {
+			abs, err := filepath.Abs(stateRoot)
+			if err != nil {
+				return fmt.Errorf("resolving --state-root %q: %w", stateRoot, err)
+			}
+			stateRoot = abs
+			return nil
+		},
 	}
 	root.PersistentFlags().StringVar(&stateRoot, "state-root", defaultStateRoot(), "directory holding machine state")
 	root.PersistentFlags().BoolVar(&jsonOut, "json", false, "print machine-readable JSON output")
@@ -59,6 +73,9 @@ func NewRootCmd() *cobra.Command {
 		newInspectCmd(),
 		newRmCmd(),
 		newListCmd(),
+		newEnvCmd(),
+		newPortsCmd(),
+		newForwarderCmd(),
 	)
 	return root
 }

@@ -204,19 +204,43 @@ func (b Backend) Start(ctx context.Context, m *machine.Machine, net backend.NetA
 }
 
 // ensureEFIVars copies the pristine EDK2 variable store into the machine
-// directory the first time the machine boots.
+// directory the first time the machine boots. The copy is written to a
+// temporary sibling and renamed into place, so an interrupted copy never
+// leaves a truncated store behind; a store whose size differs from the
+// template (a truncated copy, or a template from a different QEMU build) is
+// treated as absent and replaced.
 func ensureEFIVars(src, dst string) error {
-	if _, err := os.Stat(dst); err == nil {
-		return nil
-	}
 	data, err := os.ReadFile(src)
 	if err != nil {
 		return fmt.Errorf("qemu: reading firmware vars template: %w", err)
 	}
+	if st, err := os.Stat(dst); err == nil && st.Size() == int64(len(data)) {
+		return nil
+	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return err
 	}
-	if err := os.WriteFile(dst, data, 0o600); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("qemu: writing %s: %w", dst, err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after a successful rename
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("qemu: writing %s: %w", dst, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("qemu: writing %s: %w", dst, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("qemu: writing %s: %w", dst, err)
+	}
+	if err := os.Chmod(tmpName, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, dst); err != nil {
 		return fmt.Errorf("qemu: writing %s: %w", dst, err)
 	}
 	return nil
@@ -238,8 +262,9 @@ func tailOf(path string) string {
 
 // Stop implements backend.Backend. graceful asks the guest to power down
 // over QMP and waits up to 30 s before escalating to SIGTERM then SIGKILL;
-// graceful=false sends SIGTERM straight away. Stale pid/QMP files are always
-// removed.
+// graceful=false sends SIGTERM straight away. The pid and QMP files are
+// removed only once the process is confirmed gone, so a Stop that fails
+// leaves State() reporting Running rather than Stopped.
 func (b Backend) Stop(ctx context.Context, m *machine.Machine, graceful bool) error {
 	p := b.paths(m)
 	st, err := b.State(m)
@@ -254,13 +279,20 @@ func (b Backend) Stop(ctx context.Context, m *machine.Machine, graceful bool) er
 	if err != nil {
 		return err
 	}
-	defer func() { _ = removeAll(p.PID, p.QMP) }()
+	if err := b.shutdown(ctx, pid, p.QMP, graceful); err != nil {
+		return err
+	}
+	return removeAll(p.PID, p.QMP)
+}
 
+// shutdown drives pid to exit: optionally QMP powerdown, then SIGTERM, then
+// SIGKILL. The CLI may already have asked the guest to power off over SSH,
+// so the graceful wait runs even when QMP itself fails.
+func (b Backend) shutdown(ctx context.Context, pid int, qmp string, graceful bool) error {
 	if graceful {
-		if err := Powerdown(ctx, p.QMP); err == nil {
-			if waitExit(ctx, pid, gracefulTimeout) {
-				return nil
-			}
+		_ = Powerdown(ctx, qmp)
+		if waitExit(ctx, pid, gracefulTimeout) {
+			return nil
 		}
 	}
 	if err := terminate(pid); err != nil && !processAlive(pid) {
@@ -276,6 +308,21 @@ func (b Backend) Stop(ctx context.Context, m *machine.Machine, graceful bool) er
 		return nil
 	}
 	return fmt.Errorf("qemu: pid %d did not exit after SIGKILL", pid)
+}
+
+// Cleanup implements backend.Cleaner: it removes the QMP socket when
+// QMPSocket placed it outside the machine directory (see QMPSocket), which
+// deleting the directory would otherwise leave behind. In-tree files are
+// left to the directory removal.
+func (b Backend) Cleanup(m *machine.Machine) error {
+	if m.Dir == "" {
+		return ErrNoDir
+	}
+	qmp := QMPSocket(m.Dir)
+	if backend.InTree(m.Dir, qmp) {
+		return nil
+	}
+	return removeAll(qmp)
 }
 
 // waitExit polls until the process is gone, the timeout lapses or ctx is

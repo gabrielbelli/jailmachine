@@ -106,7 +106,16 @@ func (c *Client) Run(ctx context.Context, cmd string) (stdout, stderr string, er
 // "test -f". Only a transport failure is an error; a missing file is
 // (false, nil).
 func (c *Client) FileExists(ctx context.Context, path string) (bool, error) {
-	_, _, err := c.Run(ctx, "test -f "+shellQuote(path))
+	return c.test(ctx, "-f", path)
+}
+
+// SocketExists is FileExists for unix sockets ("test -S").
+func (c *Client) SocketExists(ctx context.Context, path string) (bool, error) {
+	return c.test(ctx, "-S", path)
+}
+
+func (c *Client) test(ctx context.Context, flag, path string) (bool, error) {
+	_, _, err := c.Run(ctx, "test "+flag+" "+shellQuote(path))
 	if err == nil {
 		return true, nil
 	}
@@ -156,10 +165,32 @@ func Args(host string, port int, user, keyPath string, args []string) []string {
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "LogLevel=ERROR",
+		"-o", "ConnectTimeout=" + strconv.Itoa(int(ConnectTimeout/time.Second)),
 		"-p", strconv.Itoa(port),
 		user + "@" + host,
 	}
 	return append(a, args...)
+}
+
+// ForwardArgs returns the argument vector (excluding argv[0]) for a
+// detached "ssh -N" that serves localSock on the host and forwards every
+// connection to remoteSock in the guest. The stale local socket is
+// unlinked first and the process exits if the forward cannot be set up, so
+// a supervisor can tell success from failure by the socket appearing.
+func ForwardArgs(host string, port int, user, keyPath, localSock, remoteSock string) []string {
+	base := Args(host, port, user, keyPath, nil)
+	dest := base[len(base)-1]
+	opts := []string{
+		"-N", "-n", "-T",
+		"-o", "ExitOnForwardFailure=yes",
+		"-o", "StreamLocalBindUnlink=yes",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=4",
+		"-L", localSock + ":" + remoteSock,
+	}
+	// Options must precede the destination; anything after it is a
+	// remote command.
+	return append(append(base[:len(base)-1:len(base)-1], opts...), dest)
 }
 
 // Interactive replaces the current process with the system ssh binary,
@@ -218,10 +249,19 @@ func ForgetKnownHost(host string, port int) error {
 	if err != nil {
 		return nil
 	}
-	cmd := exec.Command(bin, "-R", fmt.Sprintf("[%s]:%d", host, port))
+	cmd := exec.Command(bin, "-R", KnownHostName(host, port))
 	cmd.Stdout, cmd.Stderr = nil, nil
 	_ = cmd.Run()
 	return nil
+}
+
+// KnownHostName is the known_hosts key for host:port as OpenSSH writes it:
+// "[host]:port" for non-standard ports, the bare host on port 22.
+func KnownHostName(host string, port int) string {
+	if port == 22 {
+		return host
+	}
+	return fmt.Sprintf("[%s]:%d", host, port)
 }
 
 func loadSigner(keyPath string) (ssh.Signer, error) {

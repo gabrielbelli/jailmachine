@@ -1,8 +1,10 @@
 # jailmachine MVP plan
 
 Goal: `brew install gabrielbelli/tap/jailmachine && jm init && jm start &&
-podman run -p 8080:80 docker.io/nginx` works on an Apple Silicon Mac, with
-both Linux and native FreeBSD images, in under 3 minutes from a cold start.
+podman run -p 8080:80 docker.io/busybox httpd -f -p 80` works on an Apple
+Silicon Mac, with both Linux and native FreeBSD images, in under 3 minutes
+from a cold start. (Not `docker.io/nginx`: its workers need Linux AIO, which
+the Linuxulator lacks; see `guest/README.md`.)
 
 Architecture: `docs/adr/`. Tools: `docs/tech-choices.md`. Proof of concept: `bin/jm` (shell, works today).
 
@@ -31,8 +33,8 @@ docs/adr/               decisions
 |---|---|---|---|
 | M0 | Commit PoC | `bin/jm` + docs on `main` | 10 min |
 | M1 | Go skeleton | `go build ./cmd/jm`; `jm init/start/stop/ssh/rm` reach PoC parity using QEMU slirp; `machine.json` v1; unit tests for state/image/seed | 2–3 days |
-| M2 | gvproxy networking | VM gets 192.168.127.2; SSH via gvproxy `-ssh-port`; host `podman.sock` via `-forward-sock`; `jm env` | 1–2 days |
-| M3 | Port publishing | `podman run -p 8080:80 nginx` reachable on host; forwarder survives restarts; `jm inspect` lists forwards | 1–2 days |
+| M2 | gvproxy networking | VM gets 192.168.127.2; SSH via gvproxy `-ssh-port`; host `podman.sock` via a detached `ssh -N -L` forward started after provisioning (gvproxy’s `-forward-sock` exits when guest sshd is slow); `jm env` | 1–2 days |
+| M3 | Port publishing | `podman run -p 8080:80 busybox httpd` reachable on host; forwarder survives restarts; `jm inspect` lists forwards. Done as `internal/forwarder`: detached `jm _forwarder` reconciles `podman ps` against gvproxy’s expose API on events/30 s/reconnect; owned set in `forwards.json`; `jm ports`, `PORTS` column in `list`, `forwarder` stage in `start` | 1–2 days |
 | M4 | Named machines + UX | `jm list`, `jm set`, `jm console`, progress bars, error messages with fixes | 1–2 days |
 | M5 | Prebaked image pipeline | GitHub Actions builds+signs image; `jm init` defaults to it; `--image official` and BYO paths tested | 2–3 days |
 | M6 | Release | goreleaser, Homebrew tap, README quickstart, `jm doctor` (checks qemu/gvproxy/podman versions) | 1 day |

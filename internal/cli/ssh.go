@@ -31,7 +31,11 @@ func newSSHCmd() *cobra.Command {
 			if st != backend.Running {
 				return fmt.Errorf("%s is not running (run 'jm start%s')", m.Name, nameHint(m.Name))
 			}
-			return sshx.Interactive(machine.SSHHost, m.SSHPort, m.SSHUser, sshKey(m), rest)
+			ep, err := endpointOf(m)
+			if err != nil {
+				return err
+			}
+			return sshx.Interactive(ep.SSHHost, ep.SSHPort, m.SSHUser, sshKey(m), rest)
 		},
 	}
 	// Flags after the machine name belong to the remote command.

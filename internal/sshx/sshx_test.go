@@ -60,7 +60,7 @@ func TestGenerateKey(t *testing.T) {
 
 func TestArgs(t *testing.T) {
 	got := strings.Join(Args("127.0.0.1", 2222, "root", "/k", []string{"uname", "-a"}), " ")
-	want := "-i /k -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p 2222 root@127.0.0.1 uname -a"
+	want := "-i /k -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=3 -p 2222 root@127.0.0.1 uname -a"
 	if got != want {
 		t.Errorf("Args = %q\nwant %q", got, want)
 	}
@@ -154,9 +154,12 @@ func fakeShell(w io.ReadWriter, cmd string) uint32 {
 	case len(f) > 0 && f[0] == "echo":
 		fmt.Fprintln(w, strings.Join(f[1:], " "))
 		return 0
-	case len(f) == 3 && f[0] == "test" && f[1] == "-f":
+	case len(f) == 3 && f[0] == "test" && (f[1] == "-f" || f[1] == "-S"):
 		st, err := os.Stat(strings.Trim(f[2], "'"))
-		if err == nil && st.Mode().IsRegular() {
+		if err != nil {
+			return 1
+		}
+		if (f[1] == "-f" && st.Mode().IsRegular()) || (f[1] == "-S" && st.Mode()&os.ModeSocket != 0) {
 			return 0
 		}
 		return 1
@@ -229,6 +232,44 @@ func TestFileExists(t *testing.T) {
 	}
 }
 
+func TestSocketExists(t *testing.T) {
+	c := newTestClient(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "s.sock")
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	ok, err := c.SocketExists(ctx, sock)
+	if err != nil || !ok {
+		t.Errorf("SocketExists(sock) = %v, %v", ok, err)
+	}
+	plain := filepath.Join(dir, "plain")
+	if err := os.WriteFile(plain, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ok, err = c.SocketExists(ctx, plain)
+	if err != nil || ok {
+		t.Errorf("SocketExists(regular file) = %v, %v", ok, err)
+	}
+}
+
+func TestForwardArgs(t *testing.T) {
+	got := strings.Join(ForwardArgs("127.0.0.1", 2222, "root", "/k", "/h/podman.sock", "/var/run/podman/podman.sock"), " ")
+	for _, want := range []string{"-i /k", "-p 2222", " root@127.0.0.1", " -N ", "-o ExitOnForwardFailure=yes", "-o StreamLocalBindUnlink=yes", "-L /h/podman.sock:/var/run/podman/podman.sock"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("ForwardArgs missing %q: %s", want, got)
+		}
+	}
+	// Options must precede the destination, or ssh treats them as a
+	// remote command.
+	if strings.Index(got, "root@127.0.0.1") < strings.Index(got, "-L ") {
+		t.Errorf("options after destination: %s", got)
+	}
+}
+
 func TestWaitReadyTimesOut(t *testing.T) {
 	key := filepath.Join(t.TempDir(), "k")
 	if err := GenerateKey(key); err != nil {
@@ -248,6 +289,15 @@ func TestWaitReadyTimesOut(t *testing.T) {
 	}
 	if attempts < 1 {
 		t.Error("onAttempt never called")
+	}
+}
+
+func TestKnownHostName(t *testing.T) {
+	if got := KnownHostName("127.0.0.1", 22); got != "127.0.0.1" {
+		t.Errorf("port 22: %q", got)
+	}
+	if got := KnownHostName("127.0.0.1", 2222); got != "[127.0.0.1]:2222" {
+		t.Errorf("port 2222: %q", got)
 	}
 }
 

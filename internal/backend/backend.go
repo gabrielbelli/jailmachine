@@ -7,8 +7,11 @@ package backend
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"sync"
@@ -36,12 +39,67 @@ type Capabilities struct {
 }
 
 // NetAttachment describes how the hypervisor should attach the VM's NIC.
-// Kind "user" means slirp/user-mode networking with an SSH hostfwd (M1);
-// later providers (gvproxy, vmnet) add their own kinds.
+// It is produced by a network provider (ADR 0004) and consumed by a backend.
+//
+//   - Kind "user": slirp/user-mode networking with an SSH hostfwd (M1).
+//   - Kind "stream": a unix stream socket served by a userspace network
+//     stack (gvproxy); the hypervisor connects to SocketPath.
+//
+// Later providers (vmnet) add their own kinds.
 type NetAttachment struct {
-	Kind       string
-	HostFwdSSH int
+	Kind string
+	// HostFwdAddr is the host address the SSH hostfwd binds to (Kind
+	// "user"); the CLI fills it in (default 127.0.0.1). Empty means
+	// DefaultHostFwdAddr.
+	HostFwdAddr string
+	HostFwdSSH  int
+	// SocketPath is the unix socket the hypervisor connects to (Kind
+	// "stream").
+	SocketPath string
 	MAC        string
+}
+
+// Attachment kinds.
+const (
+	KindUser   = "user"
+	KindStream = "stream"
+)
+
+// DefaultHostFwdAddr is the loopback address used when HostFwdAddr is empty.
+const DefaultHostFwdAddr = "127.0.0.1"
+
+// MaxSocketPath is the longest unix socket path we allow: sun_path is 104
+// bytes including the NUL on macOS and the BSDs (108 on Linux).
+const MaxSocketPath = 103
+
+// SocketPath returns the path for the unix socket name inside a machine
+// directory. It lives in the directory when that fits in sun_path;
+// otherwise (deep --state-root, long machine name) it falls back to a
+// short, deterministic path under the system temp dir, so every component
+// that looks for the socket agrees on where it is (ADR 0005, addendum).
+// Backends and providers that use it must implement Cleaner so that "jm rm"
+// removes the out-of-tree file.
+func SocketPath(dir, name string) string {
+	if p := filepath.Join(dir, name); len(p) <= MaxSocketPath {
+		return p
+	}
+	sum := sha256.Sum256([]byte(filepath.Join(dir, name)))
+	return filepath.Join(os.TempDir(), "jm-"+hex.EncodeToString(sum[:6])+".sock")
+}
+
+// InTree reports whether a SocketPath result lives inside dir (and so is
+// removed together with the directory).
+func InTree(dir, sock string) bool {
+	return filepath.Dir(sock) == filepath.Clean(dir)
+}
+
+// Cleaner is an optional interface for backends that keep runtime files
+// outside the machine directory (e.g. a unix socket moved to the system
+// temp dir because the machine dir exceeds sun_path). "jm rm" calls it
+// before deleting the directory so that rm still converges to "gone"
+// (ADR 0005, addendum).
+type Cleaner interface {
+	Cleanup(m *machine.Machine) error
 }
 
 // Backend is implemented by each hypervisor package (e.g. backend/qemu).

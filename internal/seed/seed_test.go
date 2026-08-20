@@ -126,6 +126,15 @@ func TestBuildOverwritesExisting(t *testing.T) {
 	}
 }
 
+func TestMetaDataUsesHostname(t *testing.T) {
+	p := params()
+	p.InstanceID = "e2e"
+	p.Hostname = "box"
+	if got := MetaData(p); got != "instance-id: e2e\nlocal-hostname: box\n" {
+		t.Errorf("meta-data = %q", got)
+	}
+}
+
 func TestUserDataScriptWithoutShebang(t *testing.T) {
 	p := params()
 	p.ProvisionScript = "echo hi\n"

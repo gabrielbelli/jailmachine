@@ -29,9 +29,9 @@ func newListCmd() *cobra.Command {
 				return enc.Encode(infos)
 			}
 			tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
-			fmt.Fprintln(tw, "NAME\tSTATE\tCPUS\tMEMORY\tDISK\tSSH")
+			fmt.Fprintln(tw, "NAME\tSTATE\tCPUS\tMEMORY\tDISK\tSSH\tPORTS")
 			for _, i := range infos {
-				fmt.Fprintf(tw, "%s\t%s\t%d\t%d MiB\t%d GiB\t%s\n", i.Name, i.State, i.CPUs, i.MemoryMiB, i.DiskGiB, i.SSH)
+				fmt.Fprintf(tw, "%s\t%s\t%d\t%d MiB\t%d GiB\t%s\t%d\n", i.Name, i.State, i.CPUs, i.MemoryMiB, i.DiskGiB, i.SSH, len(i.Ports))
 			}
 			return tw.Flush()
 		},

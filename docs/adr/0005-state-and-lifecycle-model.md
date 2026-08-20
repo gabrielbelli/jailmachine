@@ -19,13 +19,17 @@ host, and run two `jm` commands at once.
   `State()` is always computed, never cached.
 - Lifecycle states: `defined → stopped ⇄ running`, with `broken` as a
   diagnosed, recoverable condition (e.g. pid file without process). Every
-  command is idempotent: `start` on running is a no-op with a message,
-  `stop` on stopped likewise, `rm` always converges to "gone".
+  command is idempotent: `start` on running skips the boot and re-checks
+  the remaining (idempotent) stages with a message, `stop` on stopped is a
+  no-op, `rm` always converges to "gone".
 - One advisory lock per machine serialises mutating commands; read commands
   (`list`, `inspect`) never block.
 - `start` is a staged, resumable sequence — provider up, backend up, SSH
   reachable, ready marker, API connected — each stage reporting progress and
-  each failure naming the stage and the log to read.
+  each failure naming the stage and the log to read. The ready-marker stage
+  also reboots the guest once when the kernel on disk differs from the
+  running one (the pkgbase image's first-boot base upgrade), so the kernel
+  modules podman needs are loaded before the API is connected.
 
 ## Consequences
 
@@ -34,3 +38,14 @@ host, and run two `jm` commands at once.
   in the state root, not special-cased logic.
 - Logs and sockets have fixed, documented paths; `jm doctor`/`inspect` can
   always explain what is running and why something is not.
+
+## Addendum (2026-08-20): one socket may live outside the directory
+
+macOS and the BSDs cap a unix socket path at 104 bytes. When
+`<state-root>/machines/<name>/qmp.sock` would exceed that (deep state
+roots, long names), the QEMU backend places the socket at a short,
+deterministic path under the system temp dir instead (`QMPSocket`). This is
+the only file a machine keeps outside its directory. To keep `rm` converging
+to "gone", backends expose an optional `Cleaner` hook that `jm rm` calls
+before deleting the directory; `rm -rf` alone leaves at most one stale,
+harmless socket file in `$TMPDIR`.

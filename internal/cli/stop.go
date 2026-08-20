@@ -17,7 +17,7 @@ func newStopCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "stop [name]",
 		Short: "Shut a machine down",
-		Long:  "Ask the guest to power off, then stop the hypervisor. Stopping a stopped machine is a no-op.",
+		Long:  "Ask the guest to power off, stop the hypervisor, then the network provider. Stopping a stopped machine is a no-op.",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			m, err := loadMachine(args)
@@ -36,13 +36,14 @@ func newStopCmd() *cobra.Command {
 	return cmd
 }
 
-// stopMachine converges a machine to stopped. The caller holds the lock.
+// stopMachine converges a machine to stopped: guest poweroff, hypervisor,
+// then network provider (the reverse of start). The caller holds the lock.
 func stopMachine(ctx context.Context, m *machine.Machine, graceful bool) error {
-	b, err := backendFor(m)
+	b, p, err := components(m)
 	if err != nil {
 		return err
 	}
-	st, err := b.State(m)
+	st, err := stateOf(m, b, p)
 	if err != nil {
 		return err
 	}
@@ -51,9 +52,11 @@ func stopMachine(ctx context.Context, m *machine.Machine, graceful bool) error {
 		fmt.Fprintf(stdout, "%s is not running\n", m.Name)
 		return nil
 	case backend.Broken:
-		logf(stdout, "repairing stale state for %s", m.Name)
-		return b.Stop(ctx, m, false)
+		return repairBroken(ctx, m, b, p, graceful)
 	}
+	// The forwarder goes first, while the provider can still unexpose
+	// the mappings it owns.
+	stopForwarder(ctx, m, p)
 	if graceful {
 		logf(stdout, "stopping %s", m.Name)
 		guestPoweroff(ctx, m)
@@ -61,6 +64,9 @@ func stopMachine(ctx context.Context, m *machine.Machine, graceful bool) error {
 		logf(stdout, "killing %s", m.Name)
 	}
 	if err := b.Stop(ctx, m, graceful); err != nil {
+		return err
+	}
+	if err := p.Stop(ctx, m); err != nil {
 		return err
 	}
 	logf(stdout, "stopped")
@@ -72,7 +78,11 @@ func stopMachine(ctx context.Context, m *machine.Machine, graceful bool) error {
 func guestPoweroff(ctx context.Context, m *machine.Machine) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	c, err := sshx.Dial(ctx, machine.SSHHost, m.SSHPort, m.SSHUser, sshKey(m))
+	ep, err := endpointOf(m)
+	if err != nil {
+		return
+	}
+	c, err := sshx.Dial(ctx, ep.SSHHost, ep.SSHPort, m.SSHUser, sshKey(m))
 	if err != nil {
 		return
 	}

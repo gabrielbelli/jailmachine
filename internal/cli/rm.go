@@ -6,7 +6,9 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/gabrielbelli/jailmachine/internal/backend"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
+	"github.com/gabrielbelli/jailmachine/internal/netprov"
 )
 
 func newRmCmd() *cobra.Command {
@@ -35,8 +37,24 @@ func newRmCmd() *cobra.Command {
 			ctx := cmd.Context()
 			m, err := s.Load(name)
 			if err != nil {
-				// A half-initialised directory: nothing is running, just delete.
+				// A corrupt or missing record: a hypervisor may still be
+				// running from this directory, so let the host's default
+				// backend converge it before deleting.
 				fmt.Fprintf(stderr, "jm: %v; removing directory anyway\n", err)
+				m = &machine.Machine{Name: name, Backend: backend.DefaultForHost(), Network: netprov.DefaultForHost(), Dir: s.Dir(name)}
+				if p, perr := providerFor(m); perr == nil {
+					stopForwarder(ctx, m, p)
+				}
+				if b, berr := backendFor(m); berr == nil {
+					if serr := b.Stop(ctx, m, false); serr != nil {
+						fmt.Fprintf(stderr, "jm: %v; continuing\n", serr)
+					}
+				}
+				if p, perr := providerFor(m); perr == nil {
+					if serr := p.Stop(ctx, m); serr != nil {
+						fmt.Fprintf(stderr, "jm: %v; continuing\n", serr)
+					}
+				}
 			} else {
 				if err := stopMachine(ctx, m, !force); err != nil {
 					if !force {
@@ -46,6 +64,23 @@ func newRmCmd() *cobra.Command {
 				}
 				podmanConnectionRemove(ctx, m)
 				forgetHostKey(m)
+			}
+			// Backends and providers may keep sockets outside the directory
+			// (ADR 0005 addendum); remove them so rm really converges to
+			// "gone".
+			var cleaners []any
+			if b, berr := backendFor(m); berr == nil {
+				cleaners = append(cleaners, b)
+			}
+			if p, perr := providerFor(m); perr == nil {
+				cleaners = append(cleaners, p)
+			}
+			for _, c := range cleaners {
+				if c, ok := c.(backend.Cleaner); ok {
+					if cerr := c.Cleanup(m); cerr != nil {
+						fmt.Fprintf(stderr, "jm: %v; continuing\n", cerr)
+					}
+				}
 			}
 			if err := s.Delete(name); err != nil {
 				return err

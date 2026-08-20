@@ -12,6 +12,9 @@ import (
 type Stage string
 
 const (
+	// StageNetwork brings the network provider up (before the hypervisor,
+	// which may connect to it).
+	StageNetwork Stage = "network"
 	// StageBackend boots the hypervisor.
 	StageBackend Stage = "backend"
 	// StageSSH waits until sshd in the guest answers.
@@ -20,6 +23,8 @@ const (
 	StageProvision Stage = "provision"
 	// StageConnect registers the podman connection on the host.
 	StageConnect Stage = "connect"
+	// StageForwarder launches the detached port forwarder (ADR 0004).
+	StageForwarder Stage = "forwarder"
 )
 
 // StageError wraps an error with the stage it happened in and a hint about
@@ -54,10 +59,36 @@ func (m *Machine) SSHEndpoint() string {
 	return fmt.Sprintf("%s:%d", SSHHost, m.SSHPort)
 }
 
-// PodmanURI is the connection URI registered with
-// "podman system connection add".
+// LegacyNetwork is the provider name assumed for records that predate the
+// Network field: slirp inside the hypervisor.
+const LegacyNetwork = "user"
+
+// NetworkName returns the machine's network provider name, mapping records
+// written before ADR 0004 to LegacyNetwork.
+func (m *Machine) NetworkName() string {
+	if m.Network == "" {
+		return LegacyNetwork
+	}
+	return m.Network
+}
+
+// PodmanURI is the SSH connection URI registered with
+// "podman system connection add" under the machine's name.
 func (m *Machine) PodmanURI() string {
 	return fmt.Sprintf("ssh://%s@%s:%d%s", m.SSHUser, SSHHost, m.SSHPort, GuestPodmanSocket)
+}
+
+// SocketConnectionName is the name of the second podman connection, the
+// one that talks to the provider's proxied unix socket.
+func (m *Machine) SocketConnectionName() string { return m.Name + "-sock" }
+
+// SocketURI is the podman connection URI for a host-side unix socket
+// proxied to the guest engine ("" when there is none).
+func SocketURI(apiSocket string) string {
+	if apiSocket == "" {
+		return ""
+	}
+	return "unix://" + apiSocket
 }
 
 // cliName is the stricter name grammar accepted on the command line:

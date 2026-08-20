@@ -58,6 +58,9 @@ one-command equivalent. This is that.
 - No virtiofs driver → no host bind-mounts; volumes live in the VM (NFS/sshfs
   for host files).
 - No vsock driver → the podman socket is forwarded over SSH.
+- Linuxulator gaps hit some Linux images: nginx workers die with
+  `epoll_ctl … Invalid argument`; busybox httpd, alpine, most CLI tools are
+  fine. Native FreeBSD images have no such limits.
 - Networking is QEMU user-mode (slirp): fine for pulls and `podman run -p`
   via SSH forwarding later; not a routable VM IP. vmnet is a later step.
 

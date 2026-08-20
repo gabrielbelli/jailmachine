@@ -1,14 +1,13 @@
 package qemu
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/gabrielbelli/jailmachine/internal/backend"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
@@ -35,21 +34,13 @@ const (
 	QMPSockFile = "qmp.sock" // QMP unix socket (see QMPSocket)
 )
 
-// MaxSocketPath is the longest unix socket path we allow: sun_path is 104
-// bytes including the NUL on macOS and the BSDs (108 on Linux).
-const MaxSocketPath = 103
+// MaxSocketPath is backend.MaxSocketPath, kept for callers of this package.
+const MaxSocketPath = backend.MaxSocketPath
 
-// QMPSocket returns the QMP socket path for a machine directory. It lives in
-// the directory when that fits in sun_path; otherwise (deep --state-root,
-// long machine name) it falls back to a short, deterministic path under the
-// system temp dir, so State/Stop/Repair always agree on where to look.
-func QMPSocket(dir string) string {
-	if p := filepath.Join(dir, QMPSockFile); len(p) <= MaxSocketPath {
-		return p
-	}
-	sum := sha256.Sum256([]byte(dir))
-	return filepath.Join(os.TempDir(), "jm-"+hex.EncodeToString(sum[:6])+".sock")
-}
+// QMPSocket returns the QMP socket path for a machine directory, using the
+// shared sun_path fallback rule (backend.SocketPath) so State/Stop/Repair
+// always agree on where to look.
+func QMPSocket(dir string) string { return backend.SocketPath(dir, QMPSockFile) }
 
 // Paths are the host files an invocation needs. Args is a pure function of
 // a Machine, a NetAttachment and Paths so it can be unit-tested.
@@ -88,33 +79,48 @@ func Args(m *machine.Machine, net backend.NetAttachment, p Paths) []string {
 		"-cpu", "host",
 		"-smp", fmt.Sprint(m.CPUs),
 		"-m", fmt.Sprint(m.MemoryMiB),
-		"-drive", "if=pflash,format=raw,readonly=on,file=" + p.Code,
-		"-drive", "if=pflash,format=raw,file=" + p.Vars,
-		"-drive", "file=" + p.Disk + ",format=raw,if=virtio,cache=writeback,discard=unmap",
-		"-drive", "file=" + p.Seed + ",format=raw,if=virtio,readonly=on",
+		"-drive", "if=pflash,format=raw,readonly=on,file=" + escapeComma(p.Code),
+		"-drive", "if=pflash,format=raw,file=" + escapeComma(p.Vars),
+		"-drive", "file=" + escapeComma(p.Disk) + ",format=raw,if=virtio,cache=writeback,discard=unmap",
+		"-drive", "file=" + escapeComma(p.Seed) + ",format=raw,if=virtio,readonly=on",
 	}
 	args = append(args, netdevArgs(net, mac)...)
 	args = append(args,
 		"-device", "virtio-rng-pci",
 		"-display", "none",
-		"-serial", "file:"+p.Console,
-		"-qmp", "unix:"+p.QMP+",server,nowait",
+		"-serial", "file:"+escapeComma(p.Console),
+		"-qmp", "unix:"+escapeComma(p.QMP)+",server,nowait",
 		"-daemonize",
 		"-pidfile", p.PID,
 	)
 	return args
 }
 
+// escapeComma doubles commas in a path so QEMU's option parser does not
+// split on them (QEMU's convention: ",," is a literal comma).
+func escapeComma(path string) string { return strings.ReplaceAll(path, ",", ",,") }
+
 func netdevArgs(net backend.NetAttachment, mac string) []string {
 	switch net.Kind {
-	case "", "user":
+	case "", backend.KindUser:
+		addr := net.HostFwdAddr
+		if addr == "" {
+			addr = backend.DefaultHostFwdAddr
+		}
 		return []string{
-			"-netdev", fmt.Sprintf("user,id=n0,hostfwd=tcp:127.0.0.1:%d-:22", net.HostFwdSSH),
+			"-netdev", fmt.Sprintf("user,id=n0,hostfwd=tcp:%s:%d-:22", addr, net.HostFwdSSH),
+			"-device", "virtio-net-pci,netdev=n0,mac=" + mac,
+		}
+	case backend.KindStream:
+		// gvproxy (or any userspace stack) listens on a unix socket; QEMU
+		// connects to it, so the provider must be up before Start.
+		return []string{
+			"-netdev", "stream,id=n0,addr.type=unix,addr.path=" + escapeComma(net.SocketPath),
 			"-device", "virtio-net-pci,netdev=n0,mac=" + mac,
 		}
 	default:
-		// Unknown kinds (gvproxy, vmnet) arrive with later providers; boot
-		// without a NIC rather than guess, so the failure is visible.
+		// Unknown kinds (vmnet) arrive with later providers; boot without a
+		// NIC rather than guess, so the failure is visible.
 		return []string{"-nic", "none"}
 	}
 }

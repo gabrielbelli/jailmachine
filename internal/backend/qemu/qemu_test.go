@@ -94,10 +94,42 @@ func TestArgsFallsBackToMachineMAC(t *testing.T) {
 	}
 }
 
+func TestArgsEscapesCommasAndHostFwdAddr(t *testing.T) {
+	p := samplePaths("/state/ma,chines/test")
+	args := Args(sampleMachine(), backend.NetAttachment{Kind: "user", HostFwdAddr: "0.0.0.0", HostFwdSSH: 2222}, p)
+	if !slices.Contains(args, "file=/state/ma,,chines/test/disk.raw,format=raw,if=virtio,cache=writeback,discard=unmap") {
+		t.Fatalf("comma in disk path not escaped: %q", args)
+	}
+	if !slices.Contains(args, "file:/state/ma,,chines/test/console.log") {
+		t.Fatalf("comma in serial path not escaped: %q", args)
+	}
+	if !slices.Contains(args, "unix:/state/ma,,chines/test/qmp.sock,server,nowait") {
+		t.Fatalf("comma in qmp path not escaped: %q", args)
+	}
+	if !slices.Contains(args, "user,id=n0,hostfwd=tcp:0.0.0.0:2222-:22") {
+		t.Fatalf("HostFwdAddr ignored: %q", args)
+	}
+}
+
 func TestArgsUnknownNetKind(t *testing.T) {
 	args := Args(sampleMachine(), backend.NetAttachment{Kind: "vmnet"}, samplePaths("/x"))
 	if !slices.Contains(args, "-nic") || slices.Contains(args, "-netdev") {
 		t.Fatalf("unknown kind should yield -nic none: %q", args)
+	}
+}
+
+func TestArgsStreamNetdev(t *testing.T) {
+	m := sampleMachine()
+	args := Args(m, backend.NetAttachment{Kind: backend.KindStream, SocketPath: "/state/ma,chines/test/net.sock", MAC: m.MAC}, samplePaths("/x"))
+	i := slices.Index(args, "-netdev")
+	if i < 0 || args[i+1] != "stream,id=n0,addr.type=unix,addr.path=/state/ma,,chines/test/net.sock" {
+		t.Fatalf("stream netdev missing or wrong: %q", args)
+	}
+	if args[i+2] != "-device" || args[i+3] != "virtio-net-pci,netdev=n0,mac="+m.MAC {
+		t.Fatalf("virtio-net device not attached to n0: %q", args)
+	}
+	if slices.Contains(args, "-nic") {
+		t.Fatalf("stream kind must not disable the NIC: %q", args)
 	}
 }
 
@@ -343,13 +375,68 @@ func TestEnsureEFIVars(t *testing.T) {
 	if err := ensureEFIVars(src, dst); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(dst, []byte("modified"), 0o600); err != nil {
+	// The guest writes variables in place; a same-sized store is kept.
+	if err := os.WriteFile(dst, []byte("VARS"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := ensureEFIVars(src, dst); err != nil {
 		t.Fatal(err)
 	}
-	if data, _ := os.ReadFile(dst); string(data) != "modified" {
+	if data, _ := os.ReadFile(dst); string(data) != "VARS" {
 		t.Fatal("existing efivars.fd must not be overwritten")
+	}
+	// A size-mismatched store (truncated copy) is treated as absent.
+	if err := os.WriteFile(dst, []byte("va"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureEFIVars(src, dst); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(dst); string(data) != "vars" {
+		t.Fatalf("truncated efivars.fd not replaced: %q", data)
+	}
+	entries, _ := os.ReadDir(filepath.Dir(dst))
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".tmp" {
+			t.Fatalf("temp file left behind: %s", e.Name())
+		}
+	}
+}
+
+// Cleanup removes only an out-of-tree QMP socket; in-tree files are left to
+// the directory removal.
+func TestCleanupOutOfTreeSocket(t *testing.T) {
+	var b Backend
+	m := sampleMachine()
+	if err := b.Cleanup(m); err != ErrNoDir {
+		t.Fatalf("no dir: %v", err)
+	}
+	m.Dir = t.TempDir()
+	inTree := filepath.Join(m.Dir, QMPSockFile)
+	if err := os.WriteFile(inTree, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Cleanup(m); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(inTree); err != nil {
+		t.Fatal("in-tree socket must be left alone")
+	}
+	m.Dir = "/private/tmp/claude-501/-Users-belli-Projects-jailmachine/ec17a1da-d007-4581-940f-e4b6a0fa70e6/scratchpad/state/machines/e2e"
+	out := QMPSocket(m.Dir)
+	if err := os.WriteFile(out, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Cleanup(m); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(out); !os.IsNotExist(err) {
+		t.Fatalf("out-of-tree socket %s not removed", out)
+	}
+	if err := b.Cleanup(m); err != nil {
+		t.Fatalf("second cleanup must be a no-op: %v", err)
+	}
+	if _, ok := backend.Backend(b).(backend.Cleaner); !ok {
+		t.Fatal("qemu backend must implement backend.Cleaner")
 	}
 }

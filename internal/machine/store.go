@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"syscall"
 
 	"github.com/gofrs/flock"
 )
@@ -111,7 +112,24 @@ func (s *Store) Save(m *Machine) error {
 	if err := os.Chmod(tmpName, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, filepath.Join(dir, RecordFile))
+	if err := os.Rename(tmpName, filepath.Join(dir, RecordFile)); err != nil {
+		return err
+	}
+	return syncDir(dir)
+}
+
+// syncDir fsyncs a directory so that a rename into it survives a crash.
+// Platforms that refuse to fsync directories are not an error.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil && !errors.Is(err, syscall.EINVAL) && !errors.Is(err, syscall.EBADF) {
+		return err
+	}
+	return nil
 }
 
 // List returns every machine with a readable record, sorted by name.

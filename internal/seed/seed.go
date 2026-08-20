@@ -64,7 +64,7 @@ func (p Params) Validate() error {
 
 // MetaData renders the NoCloud meta-data file.
 func MetaData(p Params) string {
-	return fmt.Sprintf("instance-id: %s\nlocal-hostname: %s\n", p.InstanceID, p.InstanceID)
+	return fmt.Sprintf("instance-id: %s\nlocal-hostname: %s\n", p.InstanceID, p.Hostname)
 }
 
 // UserData renders the NoCloud user-data file: a #!/bin/sh script that

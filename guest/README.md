@@ -4,7 +4,7 @@ What a guest must satisfy for `jm` to manage it, regardless of image source:
 
 1. **Boots** from a raw disk with an EFI system partition; root filesystem grows to the disk on first boot (official `BASIC-CLOUDINIT-zfs` does this).
 2. **Consumes a NoCloud seed** (ISO, label `cidata`) holding `meta-data` (`instance-id`, `local-hostname`) and a `#!/bin/sh` `user-data`, run once by `nuageinit` as root.
-3. **After provisioning exposes**: `sshd` for the configured user (root, key-only), the podman API on `/var/run/podman/podman.sock` (our `podman_service` rc script), and the ready marker `/var/db/jm-provisioned`.
+3. **After provisioning exposes**: `sshd` for the configured user (root, key-only), the podman API on `/var/run/podman/podman.sock` (our `podman_service` rc script), and the ready marker `/var/db/jm-provisioned`. The script runs under `set -e`: on failure it writes `/var/db/jm-provision-failed` instead, which `jm start` reports straight away. The official image's `firstboot_pkg_upgrade` is disabled and its reboot request cancelled (it must not fire mid-script); when it installed a new kernel (`freebsd-version -k` differs from `-r`) `jm start` reboots the guest once after the ready marker appears, so the Linuxulator modules (`linux64`, `linprocfs`) load before podman is connected. The script asserts those modules are loaded whenever the running kernel is current.
 4. **Provisioning is idempotent** and logs to `/var/log/jm-provision.log`.
 
 `provision.sh` is the single source of truth. The seed builder prepends
@@ -12,3 +12,15 @@ What a guest must satisfy for `jm` to manage it, regardless of image source:
 prebaked release images are produced by running the very same script.
 
 Known kernel limits: no virtiofs (no host bind-mounts), no vsock (API over SSH).
+
+Known Linuxulator limits: Linux AIO (`io_setup`) returns `ENOSYS`, so Linux
+images whose servers rely on it do not work. `docker.io/nginx` (all current
+`alpine` tags tested: 1.27, 1.29, 1.31) is the notable case: its workers die
+with `io_setup() failed (38: Function not implemented)` while the master keeps
+the listening socket open, so connections are accepted but never answered
+(`curl` hangs, even from inside the guest). There is no `--os=linux`
+workaround; it needs an AIO implementation in `compat.linux`. Use `busybox
+httpd`, a native FreeBSD image, or another server (e.g. Caddy, Python `http.server`)
+instead. Ports published with a loopback `host_ip` (`-p 127.0.0.1:8080:80`)
+bind the guest's loopback, not the host's; `jm ports` reports them with a
+reason instead of forwarding them.
