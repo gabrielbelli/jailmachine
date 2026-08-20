@@ -1,0 +1,5 @@
+.DS_Store
+*.raw
+*.qcow2
+*.iso
+efistore
