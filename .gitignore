@@ -3,3 +3,5 @@
 *.qcow2
 *.iso
 efistore
+/jm
+/dist
