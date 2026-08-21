@@ -46,6 +46,8 @@ type Result struct {
 
 // Report is the full set of results plus host facts worth seeing at a glance.
 type Report struct {
+	// Version is the jm build that produced the report (filled by the CLI).
+	Version   string   `json:"version,omitempty"`
 	OS        string   `json:"os"`
 	Arch      string   `json:"arch"`
 	StateRoot string   `json:"state_root"`

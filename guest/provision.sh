@@ -18,6 +18,23 @@ sed -i '' -e 's/^#\{0,1\}PermitRootLogin.*/PermitRootLogin prohibit-password/' /
 # keys first, and fall back to start if restart still fails.
 service sshd keygen
 service sshd restart || service sshd start
+# Fast path (ADR 0003, docs/guest-contract.md): a prebaked image built by
+# "jm image build" already ran everything below and carries the ready
+# marker; its seal.sh put /firstboot back so this script runs once more on
+# the new machine. Only the per-machine bits above are needed, plus making
+# sure the services are up. Nothing else may run here: the slow path is
+# the single source of truth and the image is built by running it.
+if [ -f /var/db/jm-provisioned ]; then
+  echo "jm-provision: prebaked image, fast path"
+  sysrc zfs_enable=YES linux_enable=YES pf_enable=YES podman_service_enable=YES podman_enable=YES bastille_enable=YES
+  service zfs start || true
+  service linux start || true
+  service pf status >/dev/null 2>&1 || service pf start
+  service podman_service status >/dev/null 2>&1 || service podman_service start
+  i=0; until [ -S /var/run/podman/podman.sock ] || [ $i -ge 30 ]; do sleep 1; i=$((i+1)); done
+  [ -S /var/run/podman/podman.sock ]
+  exit 0
+fi
 # The official (pkgbase) cloud image upgrades base on first boot via
 # firstboot_pkg_upgrade, which runs before this script (rcorder 115 vs 158)
 # and may install a new kernel and request a reboot (/firstboot-reboot). That
@@ -81,7 +98,8 @@ sysrc podman_enable=YES
 # wait for the API socket; jm start checks for it before declaring ready
 i=0; until [ -S /var/run/podman/podman.sock ] || [ $i -ge 30 ]; do sleep 1; i=$((i+1)); done
 [ -S /var/run/podman/podman.sock ]
-# bastille
+# bastille; its rc script complains until the jails directory exists
 sysrc bastille_enable=YES
+mkdir -p /usr/local/bastille/jails
 rm -f /var/db/jm-provision-failed
 touch /var/db/jm-provisioned

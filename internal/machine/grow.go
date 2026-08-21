@@ -29,21 +29,35 @@ func (m *Machine) SetPendingGrow(pending bool) {
 const GuestGrowDisk = "vtbd0"
 
 // GuestGrowCmd is the shell run over SSH after disk.raw has been grown: it
-// re-reads the GPT backup header (gpart recover), extends the freebsd-zfs
-// partition, found by type rather than by a fixed index, to the end of the
-// disk, and lets zroot claim the new space ("zpool online -e"; FreeBSD does
-// not autoexpand a running pool). It first checks that the hypervisor
-// really presents at least size bytes (diskinfo), so a grow the VM has not
-// picked up fails loudly instead of no-op'ing. A resize that has nothing to
-// do is not a failure.
+// re-reads the GPT backup header (gpart recover), extends the partition
+// zroot lives on (the vdev is read from "zpool list -vHP", not assumed to
+// be a fixed vtbd0pN) to the end of the disk, and lets zroot claim the new
+// space ("zpool online -e"; FreeBSD does not autoexpand a running pool).
+// It first checks that the hypervisor really presents at least size bytes
+// (diskinfo), so a grow the VM has not picked up fails loudly instead of
+// no-op'ing, and it fails unless the pool really grew; only a resize with
+// nothing to do (gpart "Nothing to do", or a pool with no expandable
+// space, i.e. an earlier grow that was already applied) is tolerated.
 func GuestGrowCmd(size int64) string {
 	d := GuestGrowDisk
 	return fmt.Sprintf(`set -e
 have=$(diskinfo %[1]s | awk '{print $3}')
 [ "${have:-0}" -ge %[2]d ] || { echo "%[1]s is ${have:-?} bytes, expected at least %[2]d: the hypervisor still presents the old size" >&2; exit 1; }
-idx=$(gpart show -p %[1]s | awk '$4 == "freebsd-zfs" { sub("^%[1]sp", "", $3); print $3; exit }')
-[ -n "$idx" ] || { echo "no freebsd-zfs partition on %[1]s" >&2; exit 1; }
+vdev=$(zpool list -vHP zroot | awk 'NR > 1 && $1 ~ "^/dev/%[1]sp[0-9]+$" { print $1; exit }')
+[ -n "$vdev" ] || { echo "zroot has no vdev on %[1]s" >&2; exit 1; }
+part=${vdev#/dev/}
+idx=${part#%[1]sp}
+gpart show -p %[1]s | awk -v p="$part" '$3 == p && $4 == "freebsd-zfs" { found = 1 } END { exit !found }' || { echo "$part is not a freebsd-zfs partition on %[1]s" >&2; exit 1; }
 gpart recover %[1]s >/dev/null 2>&1 || true
-gpart resize -i "$idx" %[1]s || true
-zpool online -e zroot %[1]sp"$idx"`, d, size)
+if ! out=$(gpart resize -i "$idx" %[1]s 2>&1); then
+	case "$out" in
+	*[Nn]othing\ to\ do*) ;;
+	*) echo "gpart resize: $out" >&2; exit 1 ;;
+	esac
+fi
+before=$(zpool list -Hp -o size zroot)
+zpool online -e zroot "$vdev"
+after=$(zpool list -Hp -o size zroot)
+expand=$(zpool get -Hp -o value expandsize zroot)
+[ "$after" -gt "$before" ] || [ "$expand" = "-" ] || [ "$expand" = "0" ] || { echo "zroot is still $after bytes after zpool online -e ($expand bytes expandable)" >&2; exit 1; }`, d, size)
 }

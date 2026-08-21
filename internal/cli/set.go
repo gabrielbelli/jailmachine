@@ -148,7 +148,7 @@ func runSet(ctx context.Context, args []string, o setOpts) error {
 	}
 	c, err := o.validate(m)
 	if err != nil {
-		return err
+		return usage(err)
 	}
 	unlock, err := lock(m.Name)
 	if err != nil {
@@ -160,8 +160,9 @@ func runSet(ctx context.Context, args []string, o setOpts) error {
 	if err != nil {
 		return err
 	}
+	stopHint := "stop the machine first: jm stop" + nameHint(m.Name)
 	if st != backend.Stopped && c.needsStopped() {
-		return fmt.Errorf("%s is %s; stop the machine first (jm stop%s) to change cpus, memory or the ssh port", m.Name, st, nameHint(m.Name))
+		return withHint(fmt.Errorf("%s is %s; cpus, memory and the ssh port change only on a stopped machine", m.Name, st), stopHint)
 	}
 
 	if c.cpusSet && c.cpus != m.CPUs {
@@ -179,15 +180,21 @@ func runSet(ctx context.Context, args []string, o setOpts) error {
 	}
 	if c.diskSet && c.diskGiB != m.DiskGiB {
 		var resizer backend.Resizer
-		if st == backend.Running {
+		switch st {
+		case backend.Stopped:
+		case backend.Running:
 			b, err := backendFor(m)
 			if err != nil {
 				return err
 			}
 			var ok bool
 			if resizer, ok = b.(backend.Resizer); !ok {
-				return fmt.Errorf("%s is %s and backend %q cannot grow a live disk; stop the machine first (jm stop%s)", m.Name, st, b.Name(), nameHint(m.Name))
+				return withHint(fmt.Errorf("%s is %s and backend %q cannot grow a live disk", m.Name, st, b.Name()), stopHint)
 			}
+		default:
+			// Broken (stale pid, half-up components): a live grow could
+			// not reach the hypervisor or the guest; stop repairs it.
+			return withHint(fmt.Errorf("%s is %s; the disk grows only on a stopped or running machine", m.Name, st), stopHint)
 		}
 		logf(stdout, "disk: %d GiB -> %d GiB", m.DiskGiB, c.diskGiB)
 		if err := image.Grow(store().Path(m.Name, machine.DiskFile), int64(c.diskGiB)<<30); err != nil {
@@ -259,12 +266,14 @@ func finishPendingGrow(ctx context.Context, m *machine.Machine, c *sshx.Client) 
 	if !m.PendingGrow() {
 		return
 	}
+	// Warnings go to stderr regardless of --quiet: the start succeeds but
+	// the disk is not what the record says.
 	if err := growGuestWith(ctx, m, c); err != nil {
-		logf(stdout, "warning: guest disk grow failed, will retry on the next start: %v", err)
+		fmt.Fprintf(stderr, "jm: warning: guest disk grow failed, will retry on the next start: %v\n", err)
 		return
 	}
 	m.SetPendingGrow(false)
 	if err := store().Save(m); err != nil {
-		logf(stdout, "warning: %v", err)
+		fmt.Fprintf(stderr, "jm: warning: %v\n", err)
 	}
 }

@@ -16,10 +16,12 @@ import (
 )
 
 // Source is an image provider: something that can place a raw disk image
-// satisfying the guest contract at dest. Implementations: Official (M1);
-// prebaked release artefacts and bring-your-own paths come later.
+// satisfying the guest contract at dest. Implementations: Prebaked (the
+// default: a provisioned release artefact), Official (stock FreeBSD image,
+// provisioned on first boot) and BYO (a path or URL the user supplies).
 type Source interface {
-	// Name is the short identifier recorded in machine.json ("official").
+	// Name is the short identifier recorded in machine.json ("official",
+	// "prebaked", "byo").
 	Name() string
 	// Fetch writes a ready-to-boot raw disk to dest. progress, when non-nil,
 	// receives human-readable progress output (a progress bar or log lines).

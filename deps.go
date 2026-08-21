@@ -9,6 +9,7 @@ package main
 import (
 	_ "github.com/gofrs/flock"
 	_ "github.com/kdomanski/iso9660"
+	_ "github.com/klauspost/compress/zstd"
 	_ "github.com/schollz/progressbar/v3"
 	_ "github.com/spf13/cobra"
 	_ "github.com/ulikunitz/xz"

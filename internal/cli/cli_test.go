@@ -38,7 +38,12 @@ func seedRecord(t *testing.T, root, name string) *machine.Machine {
 	t.Helper()
 	m := machine.Defaults()
 	m.Name = name
-	m.Backend = backend.DefaultForHost()
+	// Records need a registered backend; hosts without a default (anything
+	// but darwin/arm64) get the QEMU one, as the guest-image CI job does.
+	m.Backend, _ = backend.DefaultForHost()
+	if m.Backend == "" {
+		m.Backend = "qemu"
+	}
 	m.Created = time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
 	if err := machine.NewStore(root).Save(&m); err != nil {
 		t.Fatal(err)
@@ -191,6 +196,24 @@ func TestImageSourceResolvesRelease(t *testing.T) {
 	}
 	if _, _, err := imageSource(machine.ImageRef{Source: "nope"}, 64); err == nil {
 		t.Error("unknown source accepted")
+	}
+	_, ref, err = imageSource(machine.ImageRef{Source: "prebaked"}, 64)
+	if err != nil || ref.String() != "prebaked:"+image.GuestVersion {
+		t.Errorf("ref = %q, %v", ref, err)
+	}
+	ref, err = parseImage("")
+	if err != nil || ref.Source != "prebaked" {
+		t.Errorf("default image: %q, %v", ref, err)
+	}
+	for _, byo := range []string{"/tmp/x.raw", "https://example.invalid/x.raw.zst", "./x.raw.xz"} {
+		ref, err := parseImage(byo)
+		if err != nil || ref.Source != "byo" || ref.Release != byo {
+			t.Errorf("parseImage(%q) = %q, %v", byo, ref, err)
+		}
+		src, _, err := imageSource(ref, 64)
+		if err != nil || src.Name() != "byo" {
+			t.Errorf("imageSource(%q) = %v, %v", byo, src, err)
+		}
 	}
 }
 

@@ -2,6 +2,9 @@ package backend
 
 import (
 	"context"
+	"errors"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/gabrielbelli/jailmachine/internal/machine"
@@ -36,11 +39,16 @@ func TestRegistry(t *testing.T) {
 
 func TestDefaultForHost(t *testing.T) {
 	t.Setenv(BackendEnv, "")
-	if got := DefaultForHost(); got != "qemu" {
-		t.Fatalf("DefaultForHost = %q, want qemu", got)
+	got, err := DefaultForHost()
+	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
+		if err != nil || got != "qemu" {
+			t.Fatalf("DefaultForHost = %q, %v; want qemu", got, err)
+		}
+	} else if !errors.Is(err, ErrNoBackend) || !strings.Contains(err.Error(), BackendEnv) {
+		t.Fatalf("DefaultForHost = %q, %v; want ErrNoBackend naming %s", got, err, BackendEnv)
 	}
 	t.Setenv(BackendEnv, "fake")
-	if got := DefaultForHost(); got != "fake" {
-		t.Fatalf("override ignored: %q", got)
+	if got, err := DefaultForHost(); err != nil || got != "fake" {
+		t.Fatalf("override ignored: %q, %v", got, err)
 	}
 }

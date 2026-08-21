@@ -133,6 +133,9 @@ func fetchChecksum(ctx context.Context, client *http.Client, url, file string) (
 	return want, nil
 }
 
+// SHA256File returns the lower-case hex SHA256 of the file at path.
+func SHA256File(path string) (string, error) { return sha256File(path) }
+
 // sha256File returns the lower-case hex SHA256 of the file at path.
 func sha256File(path string) (string, error) {
 	f, err := os.Open(path)
@@ -172,8 +175,11 @@ func decompressXZ(ctx context.Context, xzBinary, src, dst string, progress io.Wr
 		return fmt.Errorf("image: create %s: %w", dst, err)
 	}
 	defer out.Close()
+	// Zero blocks become holes, so a decompressed image is only as large
+	// on disk as the data it holds.
+	sw := newSparseWriter(out)
 
-	var w io.Writer = out
+	var w io.Writer = sw
 	if progress != nil {
 		spin := progressbar.NewOptions64(-1,
 			progressbar.OptionSetWriter(progress),
@@ -186,7 +192,7 @@ func decompressXZ(ctx context.Context, xzBinary, src, dst string, progress io.Wr
 			progressbar.OptionOnCompletion(func() { fmt.Fprintln(progress) }),
 		)
 		defer func() { _ = spin.Finish() }()
-		w = io.MultiWriter(out, spin)
+		w = io.MultiWriter(sw, spin)
 	}
 
 	if xzBinary != "" {
@@ -196,7 +202,7 @@ func decompressXZ(ctx context.Context, xzBinary, src, dst string, progress io.Wr
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("image: %s -dc %s: %w", xzBinary, src, err)
 		}
-		return out.Sync()
+		return sw.Close()
 	}
 
 	in, err := os.Open(src)
@@ -211,7 +217,7 @@ func decompressXZ(ctx context.Context, xzBinary, src, dst string, progress io.Wr
 	if _, err := io.Copy(w, &ctxReader{ctx: ctx, r: r}); err != nil {
 		return fmt.Errorf("image: decompressing %s: %w", src, err)
 	}
-	return out.Sync()
+	return sw.Close()
 }
 
 // ctxReader aborts a long copy when ctx is cancelled.

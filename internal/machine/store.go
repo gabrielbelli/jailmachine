@@ -59,7 +59,9 @@ func (s *Store) Load(name string) (*Machine, error) {
 		}
 		return nil, err
 	}
-	var m Machine
+	// Fields added after v1 records were first written get their
+	// pre-existence default when the key is absent.
+	m := Machine{ImageTrusted: true}
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", s.Path(name, RecordFile), err)
 	}

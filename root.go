@@ -11,3 +11,10 @@ import _ "embed"
 //
 //go:embed guest/provision.sh
 var ProvisionScript string
+
+// SealScript is the contents of guest/seal.sh, run over ssh by "jm image
+// build" to strip per-machine state from a provisioned guest before its
+// disk is published as a prebaked image.
+//
+//go:embed guest/seal.sh
+var SealScript string

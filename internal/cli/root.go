@@ -11,6 +11,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/gabrielbelli/jailmachine/internal/version"
+
 	// Backends register themselves with internal/backend on import; this is
 	// the only place the CLI names one (ADR 0002).
 	_ "github.com/gabrielbelli/jailmachine/internal/backend/qemu"
@@ -46,10 +48,13 @@ func defaultStateRoot() string {
 // NewRootCmd builds the root command with all subcommands registered.
 func NewRootCmd() *cobra.Command {
 	root := &cobra.Command{
-		Use:           "jm",
-		Short:         "Manage a FreeBSD VM for jails and OCI containers",
-		Long:          rootLong,
-		Example:       rootExample,
+		Use:     "jm",
+		Short:   "Manage a FreeBSD VM for jails and OCI containers",
+		Long:    rootLong,
+		Example: rootExample,
+		// "jm --version" prints the short version (cobra's built-in flag);
+		// "jm version" prints the full report.
+		Version:       version.Short(),
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		// Unknown subcommands are usage errors (exit 2), not failures: a
@@ -88,6 +93,8 @@ func NewRootCmd() *cobra.Command {
 		newDoctorCmd(),
 		newSetCmd(),
 		newConsoleCmd(),
+		newImageCmd(),
+		newVersionCmd(),
 	)
 	markUsageErrors(root)
 	return root

@@ -12,6 +12,7 @@ import (
 	"github.com/gabrielbelli/jailmachine/internal/backend"
 	"github.com/gabrielbelli/jailmachine/internal/doctor"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
+	"github.com/gabrielbelli/jailmachine/internal/version"
 )
 
 func newDoctorCmd() *cobra.Command {
@@ -25,17 +26,22 @@ func newDoctorCmd() *cobra.Command {
 				StateRoot: StateRoot(),
 				Machines:  machineChecks,
 			})
+			rep.Version = version.Version
 			var err error
 			if JSON() {
 				err = doctor.WriteJSON(stdout, rep)
 			} else {
+				// The version comes first so a pasted report says which
+				// jm produced it.
+				fmt.Fprintln(stdout, version.Full())
+				fmt.Fprintln(stdout)
 				err = doctor.WriteTable(stdout, rep)
 			}
 			if err != nil {
 				return err
 			}
 			if _, _, fail := rep.Counts(); fail > 0 {
-				return fmt.Errorf("doctor: %d check(s) failed", fail)
+				return fmt.Errorf("%d check(s) failed", fail)
 			}
 			return nil
 		},

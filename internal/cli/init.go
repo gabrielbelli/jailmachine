@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -32,10 +33,17 @@ func newInitCmd() *cobra.Command {
 		Short: "Create a new machine (download image, write seed)",
 		Long: "Create a machine: generate an SSH key, download and verify the FreeBSD image,\n" +
 			"grow it to --disk, and write the first-boot NoCloud seed. Safe to re-run after\n" +
-			"an interruption: finished steps are skipped.",
+			"an interruption: finished steps are skipped.\n\n" +
+			"Image sources: \"prebaked\" (default) is a provisioned guest published on the\n" +
+			"project's GitHub releases (first boot in seconds); \"official\" is the stock\n" +
+			"FreeBSD BASIC-CLOUDINIT image, provisioned on first boot (minutes); a path or\n" +
+			"https URL to a .raw, .raw.xz or .raw.zst is used as is, verified against a\n" +
+			"sibling .sha256 when one exists and marked untrusted otherwise.",
 		Example: `  jm init
   jm init --cpus 2 --memory 2048 dev
-  jm init --image official:14.3-RELEASE --disk 32`,
+  jm init --image official:` + image.DefaultRelease + ` --disk 32
+  jm init --image prebaked:` + image.GuestVersion + `
+  jm init --image ~/Downloads/custom.raw.zst   # verified if custom.raw.zst.sha256 sits next to it`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runInit(cmd.Context(), args, initOpts{
@@ -44,7 +52,7 @@ func newInitCmd() *cobra.Command {
 		},
 	}
 	f := cmd.Flags()
-	f.StringVar(&imageRef, "image", machine.DefaultImage, "image source, e.g. official or official:"+image.DefaultRelease)
+	f.StringVar(&imageRef, "image", machine.DefaultImage, "image source: prebaked[:<guest version>], official[:<release>], or a path/URL to a .raw[.xz|.zst]")
 	f.IntVar(&cpus, "cpus", d.CPUs, "number of virtual CPUs")
 	f.IntVar(&memory, "memory", d.MemoryMiB, "memory in MiB")
 	f.IntVar(&disk, "disk", d.DiskGiB, "disk size in GiB")
@@ -77,18 +85,50 @@ func (o initOpts) validate() error {
 }
 
 // imageSource maps a parsed --image reference to a provider and returns the
-// reference with the release resolved, so the record says exactly which
-// image was fetched ("official:15.1-RELEASE", never a floating "official").
+// reference with the version resolved, so the record says exactly which
+// image was fetched ("prebaked:15.1.0", "official:15.1-RELEASE", never a
+// floating name). A path or URL is a bring-your-own image recorded as is.
 func imageSource(ref machine.ImageRef, diskGiB int) (image.Source, machine.ImageRef, error) {
 	switch ref.Source {
+	case "prebaked":
+		if ref.Release == "" {
+			ref.Release = image.GuestVersion
+		}
+		return &image.Prebaked{Version: ref.Release, DiskGiB: diskGiB}, ref, nil
 	case "official":
 		if ref.Release == "" {
 			ref.Release = image.DefaultRelease
 		}
 		return &image.Official{Release: ref.Release, DiskGiB: diskGiB}, ref, nil
+	case "byo":
+		return &image.BYO{Ref: ref.Release, DiskGiB: diskGiB}, ref, nil
 	default:
-		return nil, ref, usagef("unknown image source %q (known: official)", ref.Source)
+		return nil, ref, usagef("unknown image source %q (known: prebaked, official, or a path/URL to a .raw, .raw.xz or .raw.zst)", ref.Source)
 	}
+}
+
+// parseImage turns the --image flag into a reference: named sources go
+// through machine.ParseImageRef; paths and URLs become a "byo" reference
+// whose Release field carries the path or URL verbatim.
+func parseImage(flag string) (machine.ImageRef, error) {
+	if image.IsBYORef(flag) {
+		return machine.ImageRef{Source: "byo", Release: flag}, nil
+	}
+	ref, err := machine.ParseImageRef(flag)
+	if err != nil {
+		return ref, usage(err)
+	}
+	return ref, nil
+}
+
+// fetchHint picks the hint for a failed image fetch. A prebaked image whose
+// release is not published (no .sha256 sidecar at the release URL) cannot be
+// fixed by re-running, so point at the official image instead.
+func fetchHint(name string, ref machine.ImageRef, err error) string {
+	if ref.Source == "prebaked" && errors.Is(err, image.ErrNoChecksum) {
+		return fmt.Sprintf("guest release guest-%s is not published (or has no .sha256 sidecar); try 'jm init%s --image official' to provision the stock FreeBSD image on first boot", ref.Release, nameHint(name))
+	}
+	return fmt.Sprintf("re-run 'jm init%s'; a partial download resumes where it stopped", nameHint(name))
 }
 
 func runInit(ctx context.Context, args []string, o initOpts) error {
@@ -102,17 +142,26 @@ func runInit(ctx context.Context, args []string, o initOpts) error {
 	if err := o.validate(); err != nil {
 		return err
 	}
-	ref, err := machine.ParseImageRef(o.image)
+	ref, err := parseImage(o.image)
 	if err != nil {
-		return usage(err)
+		return err
 	}
 	src, ref, err := imageSource(ref, o.disk)
 	if err != nil {
 		return err
 	}
+	// Refuse an existing name before touching the host: no backend or
+	// tool check is needed to say "already exists".
+	s := store()
+	if s.Exists(name) {
+		return withHint(fmt.Errorf("machine %q already exists", name), fmt.Sprintf("run 'jm rm%s' first, or pick another name", nameHint(name)))
+	}
 	// The backend is chosen per host OS (override: $JM_BACKEND) and recorded
 	// in the machine; it checks its own host prerequisites (ADR 0002).
-	backendName := backend.DefaultForHost()
+	backendName, err := backend.DefaultForHost()
+	if err != nil {
+		return err
+	}
 	b, err := backend.Get(backendName)
 	if err != nil {
 		return err
@@ -134,10 +183,6 @@ func runInit(ctx context.Context, args []string, o initOpts) error {
 		return err
 	}
 
-	s := store()
-	if s.Exists(name) {
-		return withHint(fmt.Errorf("machine %q already exists", name), fmt.Sprintf("run 'jm rm%s' first, or pick another name", nameHint(name)))
-	}
 	unlock, err := lock(name)
 	if err != nil {
 		return err
@@ -171,13 +216,30 @@ func runInit(ctx context.Context, args []string, o initOpts) error {
 
 	// Stage: disk image. Fetch is atomic, so an existing disk.raw is done.
 	diskPath := s.Path(name, machine.DiskFile)
+	untrustedPath := s.Path(name, machine.ImageUntrustedFile)
 	if _, err := os.Stat(diskPath); err != nil {
 		logf(stdout, "image: fetching %s", m.Image)
 		if err := src.Fetch(ctx, diskPath, progressOut()); err != nil {
-			return withHint(fmt.Errorf("image: %w", err), fmt.Sprintf("re-run 'jm init%s'; a partial download resumes where it stopped", nameHint(name)))
+			return withHint(fmt.Errorf("image: %w", err), fetchHint(name, ref, err))
+		}
+		// Trust is a property of the source (ADR 0003): the checksummed
+		// sources fail rather than install an unverified image; BYO
+		// installs it and says so. The verdict is persisted next to the
+		// disk so a re-run after an interruption (before the record is
+		// saved) cannot promote the reused disk to trusted.
+		if t, ok := src.(image.Trust); ok && !t.Trusted() {
+			m.ImageTrusted = false
+			if err := os.WriteFile(untrustedPath, []byte(ref.Release+"\n"), 0o600); err != nil {
+				return fmt.Errorf("image: %w", err)
+			}
+			fmt.Fprintf(stderr, "jm: warning: %s was not verified against a checksum (no .sha256 sidecar); inspect shows image_trusted=false\n", ref.Release)
 		}
 	} else {
 		logf(stdout, "image: reusing existing %s", diskPath)
+		if _, err := os.Stat(untrustedPath); err == nil {
+			m.ImageTrusted = false
+			fmt.Fprintf(stderr, "jm: warning: %s was installed without a checksum; inspect shows image_trusted=false\n", diskPath)
+		}
 	}
 
 	// Stage: first-boot seed.

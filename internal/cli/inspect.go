@@ -87,7 +87,8 @@ state is read from the hypervisor and the network provider on every call.
   backend, network, image, cpus, memory_mib, disk_gib, mac, ssh_port,
   ssh_user, guest_ip, ssh (host:port), ssh_key, podman_uri,
   podman_sock_uri, api_socket, dns, console, network_logs, dir,
-  provisioned, created, version, backend_opts,
+  provisioned, image_trusted (false for a BYO image without a .sha256 sidecar),
+  created, version, backend_opts,
   ports (array of {proto, local, remote, since, error}), forwarder_state,
   forwarder_log.
 
@@ -124,6 +125,7 @@ func newInspectCmd() *cobra.Command {
 			row("Backend", i.Backend)
 			row("Network", i.networkString)
 			row("Image", i.Image)
+			row("Image trusted", i.ImageTrusted)
 			row("CPUs", i.CPUs)
 			row("Memory", fmt.Sprintf("%d MiB", i.MemoryMiB))
 			row("Disk", fmt.Sprintf("%d GiB", i.DiskGiB))

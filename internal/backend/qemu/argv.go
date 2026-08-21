@@ -55,16 +55,39 @@ type Paths struct {
 	Log     string // qemu.log (not passed to qemu; captured from its stderr)
 }
 
-// Accel returns the hardware accelerator for the current host OS.
+// AccelEnv overrides the accelerator, e.g. JM_QEMU_ACCEL=tcg to run the
+// guest under pure emulation where no hypervisor is available (CI runners
+// without HVF/KVM, the guest-image build job). TCG is an order of magnitude
+// slower than HVF; it is for building images, not for using them.
+const AccelEnv = "JM_QEMU_ACCEL"
+
+// AccelTCG is QEMU's software emulator.
+const AccelTCG = "tcg"
+
+// Accel returns the accelerator for the current host OS, or the $JM_QEMU_ACCEL
+// override.
 func Accel() string {
+	if v := os.Getenv(AccelEnv); v != "" {
+		return v
+	}
 	switch runtime.GOOS {
 	case "darwin":
 		return "hvf"
 	case "linux":
 		return "kvm"
 	default:
-		return "tcg"
+		return AccelTCG
 	}
+}
+
+// CPUModel is the -cpu value that goes with an accelerator: "host" passes
+// the real CPU through under HVF/KVM; TCG has no host CPU to pass through
+// and needs a named model that FreeBSD/arm64 boots on.
+func CPUModel(accel string) string {
+	if accel == AccelTCG {
+		return "cortex-a72"
+	}
+	return "host"
 }
 
 // Args builds the qemu-system-aarch64 argument vector, mirroring bin/jm
@@ -74,9 +97,10 @@ func Args(m *machine.Machine, net backend.NetAttachment, p Paths) []string {
 	if mac == "" {
 		mac = m.MAC
 	}
+	accel := Accel()
 	args := []string{
-		"-M", "virt,accel=" + Accel(),
-		"-cpu", "host",
+		"-M", "virt,accel=" + accel,
+		"-cpu", CPUModel(accel),
 		"-smp", fmt.Sprint(m.CPUs),
 		"-m", fmt.Sprint(m.MemoryMiB),
 		"-drive", "if=pflash,format=raw,readonly=on,file=" + escapeComma(p.Code),

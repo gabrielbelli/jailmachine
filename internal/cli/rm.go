@@ -31,7 +31,7 @@ func newRmCmd() *cobra.Command {
 				if err != nil {
 					return usage(err)
 				}
-			} else if !store().Exists(name) {
+			} else if _, statErr := os.Stat(store().Dir(name)); statErr != nil {
 				if name, err = resolveName(nil); err != nil {
 					return err
 				}
@@ -55,7 +55,10 @@ func newRmCmd() *cobra.Command {
 				// running from this directory, so let the host's default
 				// backend converge it before deleting.
 				fmt.Fprintf(stderr, "jm: %v; removing directory anyway\n", err)
-				m = &machine.Machine{Name: name, Backend: backend.DefaultForHost(), Network: netprov.DefaultForHost(), Dir: s.Dir(name)}
+				// On a platform without a backend the name is empty and
+				// backendFor fails below; the directory still goes.
+				backendName, _ := backend.DefaultForHost()
+				m = &machine.Machine{Name: name, Backend: backendName, Network: netprov.DefaultForHost(), Dir: s.Dir(name)}
 				if p, perr := providerFor(m); perr == nil {
 					stopForwarder(ctx, m, p)
 				}

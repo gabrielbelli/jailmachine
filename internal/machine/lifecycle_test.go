@@ -23,7 +23,7 @@ func TestResolveName(t *testing.T) {
 
 func TestParseImageRef(t *testing.T) {
 	cases := map[string]ImageRef{
-		"":                      {Source: "official"},
+		"":                      {Source: DefaultImage},
 		"official":              {Source: "official"},
 		"official:15.1-RELEASE": {Source: "official", Release: "15.1-RELEASE"},
 	}

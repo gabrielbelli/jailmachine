@@ -1,0 +1,166 @@
+# goreleaser configuration for jailmachine (jm).
+#
+#   goreleaser check                                        # validate
+#   goreleaser release --snapshot --clean --skip=publish    # local dry run -> dist/
+#
+# Releases are cut by .github/workflows/release.yml on tags "v*".
+version: 2
+
+project_name: jailmachine
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  # darwin/arm64 is the only supported platform (QEMU + HVF on Apple
+  # Silicon) and the only one the Homebrew cask installs. Keep the two
+  # build blocks identical apart from id/targets (goreleaser rejects YAML
+  # anchors at the top level).
+  - id: jm
+    targets:
+      - darwin_arm64
+    main: ./cmd/jm
+    binary: jm
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/gabrielbelli/jailmachine/internal/version.Version={{ .Version }}
+      - -X github.com/gabrielbelli/jailmachine/internal/version.Commit={{ .ShortCommit }}
+      - -X github.com/gabrielbelli/jailmachine/internal/version.Date={{ .CommitDate }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+  # Build-only: there is no backend for Linux yet and "jm init" says so
+  # ("no backend for this platform yet"). The binaries exist so the
+  # Linux/KVM backend has something to grow into and so the guest-image CI
+  # job can run "jm image build" under TCG with JM_BACKEND=qemu.
+  - id: jm-linux
+    targets:
+      - linux_arm64
+      - linux_amd64
+    main: ./cmd/jm
+    binary: jm
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/gabrielbelli/jailmachine/internal/version.Version={{ .Version }}
+      - -X github.com/gabrielbelli/jailmachine/internal/version.Commit={{ .ShortCommit }}
+      - -X github.com/gabrielbelli/jailmachine/internal/version.Date={{ .CommitDate }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: darwin
+    ids: [jm]
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE
+  - id: linux
+    ids: [jm-linux]
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  use: git
+  groups:
+    - title: Features
+      regexp: '^.*?(feat|M[0-9]+)(\([[:word:]]+\))?!?:.+$'
+      order: 0
+    - title: Fixes
+      regexp: '^.*?fix(\([[:word:]]+\))?!?:.+$'
+      order: 1
+    - title: Documentation
+      regexp: '^.*?docs?(\([[:word:]]+\))?!?:.+$'
+      order: 2
+    - title: Other
+      order: 999
+  filters:
+    exclude:
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+      - "merge conflict"
+      - Merge pull request
+      - Merge branch
+
+release:
+  github:
+    owner: gabrielbelli
+    name: jailmachine
+  draft: false
+  prerelease: auto
+  footer: |
+    ## Install
+
+    ```sh
+    brew install gabrielbelli/tap/jailmachine
+    ```
+
+    Only the `darwin_arm64` archive is supported; the Linux archives are
+    build-only until a KVM backend lands.
+
+# Homebrew. goreleaser v2.10+ deprecated "brews" (formulae) in favour of
+# casks for prebuilt binaries; casks install with the same command
+# ("brew install gabrielbelli/tap/jailmachine") but have no "test" block.
+homebrew_casks:
+  - name: jailmachine
+    ids: [darwin]
+    binaries: [jm]
+    repository:
+      owner: gabrielbelli
+      name: homebrew-tap
+      branch: main
+      # A fine-grained PAT with contents:write on homebrew-tap; the default
+      # GITHUB_TOKEN cannot push to another repository. See CONTRIBUTING.md.
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Casks
+    commit_author:
+      name: goreleaser[bot]
+      email: bot@goreleaser.com
+    commit_msg_template: "jailmachine {{ .Tag }}"
+    homepage: https://github.com/gabrielbelli/jailmachine
+    description: "Provision and manage a FreeBSD VM for jails and OCI containers, docker-machine style"
+    license: BSD-2-Clause
+    # gvproxy has no formula of its own ("brew search gvproxy" finds none);
+    # the podman formula ships it (libexec/podman/gvproxy), where jm looks.
+    dependencies:
+      - formula: qemu
+      - formula: podman
+    # The binary is not notarised: strip the quarantine flag so Gatekeeper
+    # does not refuse to run it.
+    hooks:
+      post:
+        install: |
+          if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/jm"]
+          end
+    caveats: |
+      Quickstart (macOS on Apple Silicon):
+
+        jm init        # download the prebaked FreeBSD guest image, write the seed
+        jm start       # first boot in seconds with the default image (~2 min with --image official)
+        podman run --rm --os=linux docker.io/alpine echo hi
+
+      The guest is FreeBSD, so podman pulls FreeBSD variants by default.
+      Linux images run through the Linuxulator and need --os=linux
+      (or "podman pull --os=linux"); native FreeBSD images need nothing.
+
+      Docker CLI / compose: eval "$(jm env)"
+      Anything wrong:       jm doctor

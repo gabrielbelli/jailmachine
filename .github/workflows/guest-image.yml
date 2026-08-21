@@ -1,0 +1,80 @@
+name: guest-image
+
+# Builds the prebaked guest image (ADR 0003 "release artefact") and
+# publishes it as a GitHub release "guest-<version>" with its SHA256
+# sidecar, which "jm init" (default image source) downloads.
+#
+# GitHub runners have no hardware virtualisation, so the guest boots under
+# QEMU TCG (pure emulation) via JM_QEMU_ACCEL=tcg: expect 60-120 minutes
+# for what takes ~10 minutes on a Mac. The faster path is local:
+#
+#   make image RELEASE=15.1-RELEASE
+#   gh release create guest-<ver> dist/*.zst dist/*.sha256 --title "guest <ver>"
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: FreeBSD release to base the image on
+        default: 15.1-RELEASE
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      JM_QEMU_ACCEL: tcg
+      # Linux has no supported backend; force the QEMU one for this job.
+      JM_BACKEND: qemu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: install qemu, zstd, xz, gvproxy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-arm qemu-efi-aarch64 qemu-utils zstd xz-utils podman
+          # Debian's qemu-efi-aarch64 installs AAVMF; jm looks for QEMU's
+          # own edk2 file names next to the binary, so link them in.
+          sudo mkdir -p /usr/share/qemu
+          sudo ln -sf /usr/share/AAVMF/AAVMF_CODE.fd /usr/share/qemu/edk2-aarch64-code.fd
+          sudo ln -sf /usr/share/AAVMF/AAVMF_VARS.fd /usr/share/qemu/edk2-arm-vars.fd
+          # gvproxy: Ubuntu's podman package does not ship it; fetch the
+          # release binary from containers/gvisor-tap-vsock.
+          ver=$(curl -fsSL https://api.github.com/repos/containers/gvisor-tap-vsock/releases/latest | jq -r .tag_name)
+          sudo curl -fsSL -o /usr/local/bin/gvproxy \
+            "https://github.com/containers/gvisor-tap-vsock/releases/download/${ver}/gvproxy-linux-amd64"
+          sudo chmod +x /usr/local/bin/gvproxy
+          qemu-system-aarch64 --version
+          gvproxy -version
+      - name: build jm
+        run: make build
+      - name: doctor (informational)
+        run: ./jm doctor || true
+      - name: build guest image
+        run: ./jm image build --release "${{ inputs.release }}" --out dist
+      - name: publish guest-<version> release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ls -l dist
+          set -- dist/*.zst; zst=$1
+          # Guest version is the image's own stamp (image.GuestVersion): the
+          # file is named jailmachine-guest-<GuestVersion>-freebsd<rel>-arm64-zfs.raw.zst
+          # by "jm image build" (image.PrebakedFileName).
+          ver=$(basename "$zst" | sed -E 's/^jailmachine-guest-(.+)-freebsd[^-]+-arm64-zfs\.raw\.zst$/\1/')
+          test "$ver" != "$(basename "$zst")" || { echo "unexpected file name: $zst"; exit 1; }
+          tag="guest-${ver}"
+          echo "publishing ${tag}"
+          gh release create "$tag" dist/*.zst dist/*.sha256 \
+            --repo "${{ github.repository }}" \
+            --title "guest ${ver}" \
+            --notes "Prebaked FreeBSD ${{ inputs.release }} guest image for jm (built under QEMU TCG by workflow run ${{ github.run_id }}). Verify with the .sha256 sidecar."

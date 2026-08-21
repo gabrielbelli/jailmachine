@@ -53,7 +53,7 @@ func TestArgs(t *testing.T) {
 	// Every flag/value pair we expect, in the PoC's order.
 	want := [][2]string{
 		{"-M", "virt,accel=" + Accel()},
-		{"-cpu", "host"},
+		{"-cpu", CPUModel(Accel())},
 		{"-smp", "4"},
 		{"-m", "4096"},
 		{"-drive", "if=pflash,format=raw,readonly=on,file=" + p.Code},
@@ -468,5 +468,32 @@ func TestCleanupOutOfTreeSocket(t *testing.T) {
 	}
 	if _, ok := backend.Backend(b).(backend.Cleaner); !ok {
 		t.Fatal("qemu backend must implement backend.Cleaner")
+	}
+}
+
+func TestAccelOverrideTCG(t *testing.T) {
+	t.Setenv(AccelEnv, "")
+	if got := Accel(); got == AccelTCG {
+		t.Skipf("host default is already tcg (%s)", got)
+	}
+	if got := CPUModel(Accel()); got != "host" {
+		t.Fatalf("CPUModel(%s) = %q, want host", Accel(), got)
+	}
+
+	t.Setenv(AccelEnv, AccelTCG)
+	if got := Accel(); got != AccelTCG {
+		t.Fatalf("Accel = %q, want tcg", got)
+	}
+	args := Args(sampleMachine(), backend.NetAttachment{Kind: "user", HostFwdSSH: 2222}, samplePaths("/state/machines/test"))
+	joined := strings.Join(args, " ")
+	for _, want := range []string{"-M virt,accel=tcg", "-cpu cortex-a72"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("args lack %q: %s", want, joined)
+		}
+	}
+	for _, reject := range []string{"accel=hvf", "accel=kvm", "-cpu host"} {
+		if strings.Contains(joined, reject) {
+			t.Errorf("args still carry %q: %s", reject, joined)
+		}
 	}
 }

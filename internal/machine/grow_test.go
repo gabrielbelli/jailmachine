@@ -22,9 +22,12 @@ func TestPendingGrow(t *testing.T) {
 
 func TestGuestGrowCmd(t *testing.T) {
 	cmd := GuestGrowCmd(80 << 30)
-	for _, want := range []string{"diskinfo vtbd0", "-ge 85899345920", "gpart show -p vtbd0", "freebsd-zfs", "gpart recover vtbd0", `gpart resize -i "$idx" vtbd0`, `zpool online -e zroot vtbd0p"$idx"`} {
+	for _, want := range []string{"diskinfo vtbd0", "-ge 85899345920", "zpool list -vHP zroot", "^/dev/vtbd0p[0-9]+$", "gpart show -p vtbd0", "freebsd-zfs", "gpart recover vtbd0", `gpart resize -i "$idx" vtbd0`, `othing\ to\ do`, "zpool list -Hp -o size zroot", `zpool online -e zroot "$vdev"`, "expandsize", `[ "$after" -gt "$before" ]`} {
 		if !strings.Contains(cmd, want) {
 			t.Errorf("missing %q in:\n%s", want, cmd)
 		}
+	}
+	if strings.Contains(cmd, "|| true\nzpool") || strings.Contains(cmd, `vtbd0p"$idx"`) {
+		t.Errorf("resize failures must not be ignored and the vdev must not be hard-coded:\n%s", cmd)
 	}
 }

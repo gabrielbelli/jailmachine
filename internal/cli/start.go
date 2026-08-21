@@ -10,12 +10,13 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/gabrielbelli/jailmachine/internal/backend"
+	"github.com/gabrielbelli/jailmachine/internal/backend/qemu"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
 	"github.com/gabrielbelli/jailmachine/internal/netprov"
 	"github.com/gabrielbelli/jailmachine/internal/sshx"
 )
 
-// Timeouts for the start stages.
+// Timeouts for the start stages (see stageTimeout for the TCG scaling).
 const (
 	sshTimeout       = 5 * time.Minute
 	provisionTimeout = 15 * time.Minute
@@ -24,7 +25,20 @@ const (
 	// ready marker; podman_service starts as part of provisioning, so it
 	// is normally there already.
 	guestSocketTimeout = 30 * time.Second
+	// tcgTimeoutScale stretches the stage timeouts under QEMU TCG (pure
+	// emulation, as the guest-image CI job runs on amd64): first boot plus
+	// the package install take hours there rather than minutes.
+	tcgTimeoutScale = 8
 )
+
+// stageTimeout returns d, or d scaled by tcgTimeoutScale when the QEMU
+// backend runs without hardware acceleration. HVF keeps the defaults.
+func stageTimeout(d time.Duration) time.Duration {
+	if qemu.Accel() == qemu.AccelTCG {
+		return d * tcgTimeoutScale
+	}
+	return d
+}
 
 func newStartCmd() *cobra.Command {
 	return &cobra.Command{
@@ -187,7 +201,7 @@ func componentDied(m *machine.Machine, b backend.Backend, p netprov.Provider, st
 // waitSSH polls sshd, printing a dot per attempt and bailing out early if
 // the hypervisor or the network provider dies.
 func waitSSH(ctx context.Context, m *machine.Machine, b backend.Backend, p netprov.Provider, ep netprov.Endpoint) (*sshx.Client, error) {
-	ctx, cancel := context.WithTimeout(ctx, sshTimeout)
+	ctx, cancel := context.WithTimeout(ctx, stageTimeout(sshTimeout))
 	defer cancel()
 	var dead error
 	client, err := sshx.WaitReady(ctx, ep.SSHHost, ep.SSHPort, m.SSHUser, sshKey(m), func(attempt int) {
@@ -211,10 +225,15 @@ func waitSSH(ctx context.Context, m *machine.Machine, b backend.Backend, p netpr
 // waitProvisioned waits for the ready marker (ADR 0003). On first boot the
 // provisioning script installs packages, which takes minutes.
 func waitProvisioned(ctx context.Context, m *machine.Machine, b backend.Backend, p netprov.Provider, ep netprov.Endpoint, client *sshx.Client) error {
-	ctx, cancel := context.WithTimeout(ctx, provisionTimeout)
+	ctx, cancel := context.WithTimeout(ctx, stageTimeout(provisionTimeout))
 	defer cancel()
 	hint := fmt.Sprintf("log: jm ssh%s tail -f %s", nameHint(m.Name), machine.GuestProvisionLog)
 
+	// The failure marker wins over a stale ready marker (a re-provisioned
+	// disk whose script aborted), on the first probe as in the loop.
+	if failed, ferr := client.FileExists(ctx, machine.GuestProvisionFailed); ferr == nil && failed {
+		return machine.NewStageError(machine.StageProvision, hint, errors.New("provisioning script failed in the guest"))
+	}
 	ok, err := client.FileExists(ctx, machine.GuestProvisionMarker)
 	switch {
 	case err == nil && ok:
@@ -350,7 +369,7 @@ func waitGuestSocket(ctx context.Context, m *machine.Machine, client *sshx.Clien
 		select {
 		case <-ctx.Done():
 			if err == nil {
-				err = errors.New("guest podman socket did not appear")
+				err = fmt.Errorf("guest podman socket did not appear (see %s in the guest)", machine.GuestProvisionLog)
 			}
 			return machine.NewStageError(machine.StageProvision, hint, err)
 		case <-time.After(sshx.PollInterval):

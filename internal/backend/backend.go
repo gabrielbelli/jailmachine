@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -141,19 +142,26 @@ type Backend interface {
 // BackendEnv overrides the host default backend name.
 const BackendEnv = "JM_BACKEND"
 
+// ErrNoBackend is wrapped by DefaultForHost on platforms jm has no
+// backend for yet.
+var ErrNoBackend = errors.New("backend: no backend for this platform yet")
+
 // DefaultForHost picks the backend for this host OS (ADR 0002: per host OS
 // with an override via $JM_BACKEND). It returns a name, not a Backend, so
 // callers get the registry's "unknown backend" error if nothing matches.
-func DefaultForHost() string {
+//
+// Only macOS on Apple Silicon has a supported backend (QEMU + HVF). Other
+// platforms get a clear ErrNoBackend unless $JM_BACKEND forces one: the
+// guest-image CI job runs the QEMU backend on Linux under TCG that way.
+func DefaultForHost() (string, error) {
 	if v := os.Getenv(BackendEnv); v != "" {
-		return v
+		return v, nil
 	}
-	switch runtime.GOOS {
-	case "darwin", "linux":
-		return "qemu"
-	default:
-		return "qemu" // the only backend so far; Get reports it if absent
+	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
+		return "qemu", nil
 	}
+	return "", fmt.Errorf("%w (%s/%s; jm supports macOS on Apple Silicon only, set %s=qemu to force the experimental QEMU backend)",
+		ErrNoBackend, runtime.GOOS, runtime.GOARCH, BackendEnv)
 }
 
 var (

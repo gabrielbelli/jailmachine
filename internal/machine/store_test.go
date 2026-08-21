@@ -134,3 +134,27 @@ func TestLockExclusive(t *testing.T) {
 	}
 	unlock2()
 }
+
+func TestLoadLegacyRecordIsImageTrusted(t *testing.T) {
+	// Records written before image_trusted existed came from the
+	// checksummed official source: absent key loads as true, and an
+	// explicit false survives.
+	s := NewStore(t.TempDir())
+	dir := s.Dir("old")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.Path("old", RecordFile), []byte(`{"version":1,"name":"old","image":"official:15.1-RELEASE"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m, err := s.Load("old")
+	if err != nil || !m.ImageTrusted {
+		t.Fatalf("legacy record: %+v, %v", m, err)
+	}
+	if err := os.WriteFile(s.Path("old", RecordFile), []byte(`{"version":1,"name":"old","image":"byo:/x.raw","image_trusted":false}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if m, err = s.Load("old"); err != nil || m.ImageTrusted {
+		t.Fatalf("explicit false: %+v, %v", m, err)
+	}
+}

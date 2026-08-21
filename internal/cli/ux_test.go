@@ -114,6 +114,9 @@ func TestExitCodes(t *testing.T) {
 		{"init", "--memory", "1"},
 		{"init", "--image", ":x"},
 		{"env", "--shell", "csh"},
+		{"set", "--cpus", "0"},
+		{"set", "--disk", "1"},
+		{"set"},
 	}
 	for _, args := range usageCases {
 		_, err := run(t, root, args...)

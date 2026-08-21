@@ -10,18 +10,22 @@ const Version = 1
 
 // Fixed filenames inside a machine directory (relative to Dir(name)).
 const (
-	RecordFile   = "machine.json"
-	LockFile     = "machine.lock"
-	DiskFile     = "disk.raw"
-	SeedFile     = "seed.iso"
-	EFIVarsFile  = "efivars.fd"
-	SSHDir       = "ssh"
-	SSHKeyFile   = "ssh/id_ed25519"
-	SSHPubFile   = "ssh/id_ed25519.pub"
-	ConsoleFile  = "console.log"
-	MachinesDir  = "machines"
-	DefaultName  = "jailmachine"
-	DefaultImage = "official"
+	RecordFile = "machine.json"
+	LockFile   = "machine.lock"
+	DiskFile   = "disk.raw"
+	// ImageUntrustedFile marks a disk.raw that was installed without a
+	// checksum (BYO image, no .sha256 sidecar), so an interrupted init
+	// that reuses the disk still records image_trusted=false (ADR 0003).
+	ImageUntrustedFile = "disk.raw.untrusted"
+	SeedFile           = "seed.iso"
+	EFIVarsFile        = "efivars.fd"
+	SSHDir             = "ssh"
+	SSHKeyFile         = "ssh/id_ed25519"
+	SSHPubFile         = "ssh/id_ed25519.pub"
+	ConsoleFile        = "console.log"
+	MachinesDir        = "machines"
+	DefaultName        = "jailmachine"
+	DefaultImage       = "prebaked"
 )
 
 // Guest-side fixed paths (ADR 0003).
@@ -58,11 +62,16 @@ type Machine struct {
 	// GuestIP is the stable guest address the provider hands out, recorded
 	// so that tools can reconnect without the provider being up. It is
 	// configuration derived from the provider, not runtime state.
-	GuestIP     string            `json:"guest_ip,omitempty"`
-	Created     time.Time         `json:"created"`
-	Provisioned bool              `json:"provisioned"`
-	BackendOpts map[string]string `json:"backend_opts,omitempty"`
-	Dir         string            `json:"-"`
+	GuestIP     string    `json:"guest_ip,omitempty"`
+	Created     time.Time `json:"created"`
+	Provisioned bool      `json:"provisioned"`
+	// ImageTrusted records whether the disk image was verified against a
+	// published checksum when fetched (ADR 0003: trust is a property of
+	// the source, surfaced uniformly). Records written before the field
+	// existed came from the checksummed official source and load as true.
+	ImageTrusted bool              `json:"image_trusted"`
+	BackendOpts  map[string]string `json:"backend_opts,omitempty"`
+	Dir          string            `json:"-"`
 }
 
 // Defaults returns a Machine populated with the PoC defaults. The caller
@@ -70,15 +79,16 @@ type Machine struct {
 // host OS; this package stays hypervisor-neutral, ADR 0002).
 func Defaults() Machine {
 	return Machine{
-		Version:     Version,
-		Name:        DefaultName,
-		Image:       DefaultImage,
-		CPUs:        4,
-		MemoryMiB:   4096,
-		DiskGiB:     64,
-		MAC:         "5a:94:ef:e4:0c:ee",
-		SSHPort:     2222,
-		SSHUser:     "root",
-		BackendOpts: map[string]string{},
+		Version:      Version,
+		Name:         DefaultName,
+		Image:        DefaultImage,
+		CPUs:         4,
+		MemoryMiB:    4096,
+		DiskGiB:      64,
+		MAC:          "5a:94:ef:e4:0c:ee",
+		SSHPort:      2222,
+		SSHUser:      "root",
+		ImageTrusted: true,
+		BackendOpts:  map[string]string{},
 	}
 }
