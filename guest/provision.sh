@@ -101,5 +101,12 @@ i=0; until [ -S /var/run/podman/podman.sock ] || [ $i -ge 30 ]; do sleep 1; i=$(
 # bastille; its rc script complains until the jails directory exists
 sysrc bastille_enable=YES
 mkdir -p /usr/local/bastille/jails
+# bastille on a ZFS host needs its zfs settings, a loopback for jail IPs, and NAT.
+# We do NOT run 'bastille setup pf': it would overwrite podman's pf.conf.
+sysrc -f /usr/local/etc/bastille/bastille.conf bastille_zfs_enable=YES bastille_zfs_zpool=zroot
+sysrc cloned_interfaces+=lo1 ifconfig_lo1_name=bastille0
+service netif cloneup || true
+grep -q 'table <jails>' /etc/pf.conf || printf '\n# bastille jails\ntable <jails> persist\nnat on $v4egress_if inet from <jails> to any -> ($v4egress_if)\nrdr-anchor "rdr/*"\n' >> /etc/pf.conf
+pfctl -nf /etc/pf.conf && service pf reload
 rm -f /var/db/jm-provision-failed
 touch /var/db/jm-provisioned

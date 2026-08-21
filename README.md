@@ -99,6 +99,18 @@ State lives in `~/.jailmachine/machines/<name>/` (`disk.raw`, `seed.iso`,
 `efivars.fd`, `ssh/`, `machine.json`, logs and sockets); `rm -rf` of that
 directory is a complete uninstall. `JM_HOME` or `--state-root` move it.
 
+## Jails
+
+`bastille` is installed and configured (ZFS, `bastille0` loopback, NAT via pf):
+
+```bash
+jm ssh -- bastille bootstrap 15.1-RELEASE
+jm ssh -- bastille create demo 15.1-RELEASE 10.17.89.10
+jm ssh -- bastille cmd demo pkg install -y curl
+```
+
+Jail management from the host (`jm jail ...`) is post-MVP (ADR 0006).
+
 ## Known limits
 
 FreeBSD kernel, not ours — documented, not fought:
