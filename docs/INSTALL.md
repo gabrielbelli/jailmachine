@@ -55,6 +55,12 @@ brew install qemu podman
 go install github.com/gabrielbelli/jailmachine/cmd/jm@latest
 ```
 
+A binary installed this way reports the module version it was built from
+(`jm version` shows `0.1.1`, with an empty commit when the module proxy built
+it); the Homebrew cask and the release archives carry the commit and build date
+as well. `jpodman` is not created for you: link it yourself with
+`ln -s "$(command -v jm)" "$(dirname "$(command -v jm)")/jpodman"`.
+
 Then put the Go bin directory on your `PATH` and create the `jpodman`
 symlink by hand:
 
