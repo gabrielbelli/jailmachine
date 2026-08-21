@@ -1,9 +1,16 @@
 # jailmachine MVP plan
 
+> **Historical.** This is the plan the MVP was built to; it is kept for the
+> reasoning, not as current documentation. [USAGE.md](USAGE.md) is the
+> command reference and [ARCHITECTURE.md](ARCHITECTURE.md) the shape as
+> built.
+
 Goal: `brew install gabrielbelli/tap/jailmachine && jm init && jm start &&
-podman run -p 8080:80 docker.io/busybox httpd -f -p 80` works on an Apple
-Silicon Mac, with both Linux and native FreeBSD images, in under 3 minutes
-from a cold start. (`docker.io/nginx` works too, with `accept_mutex on;` in
+jpodman run --os=linux -p 8080:80 docker.io/busybox httpd -f -p 80` works on
+an Apple Silicon Mac, with both Linux and native FreeBSD images, in under 3
+minutes from a cold start. (`jpodman` because jm deliberately leaves your
+default podman connection alone unless you pass `jm start --set-default`, and
+`--os=linux` because the guest kernel is FreeBSD.) (`docker.io/nginx` works too, with `accept_mutex on;` in
 its `events` block — FreeBSD's `linux_epoll` has no `EPOLLEXCLUSIVE`; see
 `docs/USAGE.md` for the verified Docker Hub matrix.)
 
@@ -17,7 +24,7 @@ internal/cli/           one file per subcommand
 internal/machine/       Machine struct, state dir, machine.json, lifecycle
 internal/backend/       Backend interface
 internal/backend/qemu/  QEMU+HVF (macOS) — later +KVM (Linux)
-internal/net/gvproxy/   gvproxy process + API client (expose/unexpose)
+internal/netprov/gvproxy/  gvproxy process + API client (expose/unexpose)
 internal/forwarder/     podman events -> gvproxy port publishing
 internal/image/         sources: prebaked (releases), official (download.freebsd.org), byo; verify
 internal/seed/          NoCloud ISO builder (pure Go iso9660, no hdiutil)

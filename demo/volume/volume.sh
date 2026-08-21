@@ -1,10 +1,12 @@
 #!/bin/sh
 # jm-demo-volume -- where does a container's data actually live?
 #
-# The most common jailmachine surprise: `-v /Users/you/src:/app` does not
-# work. FreeBSD has no virtiofs driver, so there is no host bind-mount path
-# from macOS into the guest. Named volumes work perfectly -- they just live
-# on the guest's ZFS pool, inside the VM, not on your Mac.
+# Host bind-mounts do work on jailmachine: a shared directory appears in the
+# guest at its own absolute path, so `-v /Users/you/src:/app` resolves. But
+# the transport is virtio-9p and it is slow (~70 MB/s, and far worse on
+# metadata). An engine-managed volume lives on the guest's ZFS pool instead,
+# at native speed, and it survives the container. That is what this demo
+# shows: the fast path for build output and databases.
 set -u
 
 B='\033[1m'; D='\033[2m'; C='\033[36m'; G='\033[32m'; Y='\033[33m'; RD='\033[31m'; R='\033[0m'
@@ -65,9 +67,10 @@ fi
 
 # --- the honest caveat ------------------------------------------------------
 printf "\n${B}%s${R}\n" 'Reaching this data from macOS'
-printf "  ${D}%s${R}\n" 'There is no host bind-mount: FreeBSD has no virtiofs driver, so'
-printf "  ${D}%s${R}\n" '`-v /Users/you/src:/app` cannot work. To get a file out, go through'
-printf "  ${D}%s${R}\n" 'the guest:'
+printf "  ${D}%s${R}\n" 'This volume lives on the ZFS pool inside the VM, not on your Mac.'
+printf "  ${D}%s${R}\n" 'A host directory would be reachable -- `-v /Users/you/src:/app`'
+printf "  ${D}%s${R}\n" 'works, at its own path -- but over 9p, which is slow. To get a'
+printf "  ${D}%s${R}\n" 'file out of the volume:'
 printf "\n      ${G}%s${R}\n" 'jm ssh -- podman volume inspect jm-demo-data'
 printf "      ${G}%s${R}\n" 'jpodman cp <container>:/data/visits.log ./visits.log'
-printf "\n  ${D}%s${R}\n\n" 'For a live shared tree, export NFS or sshfs from the Mac instead.'
+printf "\n  ${D}%s${R}\n\n" 'Keep source on a share; keep build output and databases in a volume.'

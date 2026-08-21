@@ -45,12 +45,15 @@ jm init      # SSH key, download and verify the guest image, grow the disk, writ
 jm start     # boot, provision, connect podman, share host paths, start the forwarder and resolver
 ```
 
-`jm init` takes about 45–60 s, dominated by the roughly 800 MiB image
-download and its mandatory SHA256 check. On the prebaked image a cold first
-boot takes about 22 s (32 s was observed once with two other VMs already
-running on the host) and a warm start 12–25 s; `--image official:<release>`
-provisions a stock FreeBSD cloud image on first boot instead, taking about
-2 minutes.
+`jm init` takes **60–115 s**. It downloads roughly 800 MiB and checks its
+SHA256, but the download is the smaller half — about 31 s on this link,
+against 59–113 s for an `init` from an image already cached on disk. Writing
+`disk.raw` out is what dominates, and that is a bug of ours: see
+[the machine itself](docs/LIMITATIONS.md#the-machine-itself). On the prebaked
+image a cold first boot takes about 22 s (32 s was observed once with two
+other VMs already running on the host) and a warm start 12–25 s on an idle
+Mac; `--image official:<release>` provisions a stock FreeBSD cloud image on
+first boot instead, taking about 2 minutes.
 
 `jpodman` is `podman` pointed at the machine and `jdocker` is the docker CLI
 pointed at the same engine, whatever your default connection or docker context
@@ -128,22 +131,37 @@ is visible to a container at the same path.
 ```bash
 jm init --mount /work --mount /srv/data:ro   # on top of the defaults
 jm init --no-mounts                          # share nothing
-jm set --mount /work --unmount /Volumes      # machine stopped; takes effect on start
+
+# the share set changes only on a stopped machine, and applies on the next start
+jm stop && jm set --mount /work --unmount /Volumes && jm start
+jm stop && jm set --no-mounts && jm start    # drop every share
+
 jm inspect | grep -i share
 ```
 
 > **Every container can read and write everything shared** — by default that
 > is your whole home directory, including `~/.ssh`, `~/.aws` and
 > `~/.jailmachine` itself. That is the same posture as Docker Desktop's
-> default, and it is a deliberate one: narrow it with `jm set --no-mounts`
-> plus explicit `--mount` roots, or mount what you need read-only with
-> `--mount /srv/data:ro`, if you run images you do not trust.
+> default, and it is a deliberate one. If you run images you do not trust,
+> narrow it on a **stopped** machine:
+>
+> ```bash
+> jm stop
+> jm set --no-mounts                                    # drop every share
+> jm set --mount ~/code --mount "/srv/data:ro"          # add back only these
+> jm start
+> ```
+>
+> `--no-mounts` cannot be combined with `--mount` or `--unmount` in one
+> call, hence the two commands.
 
 > **`/tmp` is the one path that cannot follow the rule.** On macOS it is a
 > symlink to `/private/tmp`, and a share mounted at the guest's own `/tmp`
 > would shadow it — so jm shares `/private/tmp` instead and never rewrites
 > your `-v` argument. Write `-v /private/tmp/x:/app`, not `-v /tmp/x:/app`;
-> the latter silently binds the guest's own empty `/tmp/x`.
+> the latter fails with `source path does not exist` — or, if that path
+> happens to exist in the guest as well, silently binds the guest's own
+> empty `/tmp/x`.
 
 > **zsh users: quote a `:ro` suffix.** `:ro` at the end of an unquoted word
 > is a history modifier, so `jm set --mount $P:ro` fails with
@@ -151,12 +169,15 @@ jm inspect | grep -i share
 > `jm set --mount "${P}:ro"` — and the same for a volume argument,
 > `-v "${P}:${P}:ro"`.
 
-> Shares are for source trees and data. `utimes` is a silent no-op, no
-> `inotify` events reach a container (use a polling watcher — see
-> [#4](https://github.com/gabrielbelli/jailmachine/issues/4)), and 9p is far
-> slower than the guest's ZFS (~70 MB/s, and worse on metadata: 1000 small
-> files in 3.6 s against 0.76 s) — keep build output in an engine-managed
-> volume.
+> Shares are for source trees and data. `utimes` is a silent no-op, an
+> `inotify` watch **cannot be created** on a share at all —
+> `inotify_add_watch` fails with `Bad file descriptor`, where it works on an
+> engine-managed volume and on the container's own filesystem, so use a
+> polling watcher
+> ([#4](https://github.com/gabrielbelli/jailmachine/issues/4)) — and 9p is
+> far slower than the guest's ZFS (~70 MB/s, and worse on metadata: 1000
+> small files in 3.6 s against 0.76 s) — keep build output in an
+> engine-managed volume.
 
 > **A file a container creates shows up on the Mac as `0600`**, with its real
 > mode and owner in `user.virtfs.*` xattrs. Shares use the 9p `mapped-xattr`
@@ -207,11 +228,9 @@ the guest's container state.
 > and `jm ports`; `JM_PUBLISH_ADDR` is an override read at `jm start` time and
 > written onto the record.
 
-Naming a host address in the flag itself (`-p 127.0.0.1:8080:80`) does not
-work yet: the engine binds that address inside the guest, and `jm ports`
-reports it rather than forwarding it. Publish as `-p 8080:80` and choose the
-host-side address with `--publish-addr`. **Being fixed** — see
-[what works, and what does not yet](#what-works-and-what-does-not-yet).
+Naming a host address in the flag itself works and wins over the default:
+`-p 127.0.0.1:8080:80` binds that address **on the Mac** and nothing else,
+whatever `--publish-addr` says.
 
 ## How it works
 
@@ -274,7 +293,7 @@ Every flag and environment variable is in [docs/USAGE.md](docs/USAGE.md).
 | `jm env [name]` | Shell exports (`CONTAINER_HOST`, `DOCKER_HOST`) for podman and docker clients |
 | `jm ports [name]` | Published container ports, where they bind, and the error per mapping |
 | `jm list` / `jm inspect` | Machines and their computed state, shares and publish address (`--json` on both) |
-| `jm set [name]` | Change `--cpus`, `--memory`, `--ssh-port`, `--disk` (grows only, live if running), `--mount`/`--unmount`, `--publish-addr` |
+| `jm set [name]` | Change `--cpus`, `--memory`, `--ssh-port`, `--disk` (grows only, live if running), `--mount`/`--unmount`/`--no-mounts`, `--publish-addr` |
 | `jm console [name]` | Guest serial console log (`-f` to follow) |
 | `jm rm [name]` | Remove the machine, its directory and its podman connections |
 | `jm doctor` | Check qemu, HVF, EDK2 firmware, gvproxy, podman, ssh, the state root, share parity, resolver parity and every machine |
@@ -332,7 +351,7 @@ The full matrix, both workarounds, and the script that produced it
 |---|---|
 | Native FreeBSD OCI images | Works — run and build, e.g. `ghcr.io/freebsd/freebsd-runtime:15.1` |
 | Linux images | Works through the Linuxulator, with `--os=linux` (podman) or the wrapper's default platform (`jdocker`) |
-| Host directory sharing | Works — host paths appear in the guest at the **same absolute path** over 9p; defaults are your home tree, `/Volumes`, `/private/tmp` and `$TMPDIR`'s root. Slow (~70 MB/s), `utimes` is a no-op, no `inotify` events, and guest ownership and modes live in host xattrs |
+| Host directory sharing | Works — host paths appear in the guest at the **same absolute path** over 9p; defaults are your home tree, `/Volumes`, `/private/tmp` and `$TMPDIR`'s root. Slow (~70 MB/s), `utimes` is a no-op, an `inotify` watch cannot be created on a share at all, and guest ownership and modes live in host xattrs |
 | Container DNS matching the host | Works — the host's own resolver answers for the guest, so VPN, split-horizon, `/etc/hosts` and `.local` names all match, and the Mac is `host.docker.internal` |
 | Autostart | Works on demand: `jpodman` and `jdocker` start a stopped machine. There is deliberately **no** login agent — `JM_AUTOSTART=0` opts out |
 | `docker.io/nginx` (Linux) | Works with **one config line**: `accept_mutex on;` in the `events` block. Stock nginx registers its listening socket with `EPOLLEXCLUSIVE` when `worker_processes > 1`, which FreeBSD's `linux_epoll` rejects. A ready-made image is in [demo/](demo/README.md#the-nginx-finding) |
@@ -342,7 +361,7 @@ The full matrix, both workarounds, and the script that produced it
 | Jails | Works — `bastille bootstrap`, `create`, `cmd`, `pkg install` in the guest |
 | Several machines at once | Works, but each needs its own SSH port — `jm init --ssh-port 2223 dev`, then `JM_MACHINE=dev jpodman ps` |
 | UDP from a Linux container | Works — binding, sending, receiving, DNS-over-UDP and publishing with `-p 5354:53/udp`, verified from the Mac's loopback and its LAN address. One idiom fails: busybox's `nc -u -l` reports `Address family not supported by protocol`. Use `apk add netcat-openbsd`, `socat`, or any real UDP server. Datagrams are capped at 8972 bytes by the gvproxy link, which does not fragment: it is MTU 9000 (the virtio-net jumbo frame) by default, and `JM_MTU` at `jm start` moves the ceiling — `JM_MTU=1500` restores Docker's link size and its 1472-byte cap. See [UDP in a Linux container](docs/TROUBLESHOOTING.md#udp-in-a-linux-container) |
-| `docker.io/node` (Linux) | **No.** The one image known to be broken: the binary starts and `node --version` prints, but `console.log` output never reaches the pipe and its HTTP servers do not accept connections. No known workaround |
+| `docker.io/node` (Linux) | **Partly.** `node --version` prints and exits 0; **every other invocation hangs**, `node -e ''` and `node -p 1+1` included — they never reach your script. FreeBSD's `linux_mremap` cannot grow a mapping, which node's allocator retries forever. Workaround: `node:22-bookworm-slim` (glibc), verified working. See [node](docs/USAGE.md#node-the-one-known-bad-image) |
 | Routable VM IP | **No.** gvproxy is NAT; vmnet/bridged is a later step |
 | Intel Macs, Linux and Windows hosts | **No.** Only `darwin/arm64` has a backend; the Linux release binaries are build-only. Apple Virtualization.framework cannot boot FreeBSD/arm64, hence QEMU |
 
@@ -354,7 +373,7 @@ The full matrix, both workarounds, and the script that produced it
 | `start` hangs or fails at a stage | The error names the stage and the log to read; `jm console` shows the guest's serial console (`-f` to follow the boot) |
 | Provisioning failed | `jm ssh -- cat /var/log/jm-provision.log`; the marker `/var/db/jm-provision-failed` means the script aborted |
 | Port not reachable | `jm ports` lists each mapping with its error (host port busy, loopback bind, forwarder down) |
-| `-v` mounts an empty directory | The host path is outside the shared set (`jm inspect`), or you wrote `/tmp/...` instead of `/private/tmp/...` |
+| `-v` mounts an empty directory, or fails `source path does not exist` | The host path is outside the shared set (`jm inspect`), or you wrote `/tmp/...` instead of `/private/tmp/...` |
 | A name resolves on the Mac but not in a container | `jm doctor`, then `resolver.log` |
 | `nc -u -l` in a Linux container says `Address family not supported` | Only busybox's UDP listener is affected — `apk add netcat-openbsd`, or use `socat`. UDP itself works |
 | UDP datagrams over 8972 bytes never arrive | The gvproxy link does not fragment, so its MTU (9000 by default) is a hard ceiling; `jm doctor` states the limit per machine, and `JM_MTU` at `jm start` changes it (576–16384) |
@@ -391,6 +410,8 @@ the Go binary is the product.
 - [docs/USAGE.md](docs/USAGE.md) — every command, flag and environment variable
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the pieces fit together
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — symptoms, logs and fixes
+- [docs/LIMITATIONS.md](docs/LIMITATIONS.md) — everything it cannot do, attributed and measured
+- [docs/COMPARISON.md](docs/COMPARISON.md) — against Docker Desktop and podman machine, on one Mac, in numbers
 - [demo/README.md](demo/README.md) — five published demo images that prove FreeBSD and Linux containers side by side, including a Docker Hub nginx serving traffic under the Linuxulator
 - [docs/adr/](docs/adr/) — decisions; [docs/tech-choices.md](docs/tech-choices.md) for the concrete tools
 - [CONTRIBUTING.md](CONTRIBUTING.md) — build, test, release
@@ -398,6 +419,7 @@ the Go binary is the product.
 ## Licence
 
 BSD-2-Clause. See [LICENSE](LICENSE).
+
 ## Known issues
 
 Tracked, with measurements, in the issue tracker:
@@ -405,6 +427,6 @@ Tracked, with measurements, in the issue tracker:
 | Issue | Effect | Workaround today |
 |---|---|---|
 | [#2 UDP datagrams larger than the link MTU are dropped](https://github.com/gabrielbelli/jailmachine/issues/2) | gvproxy does not fragment: the ceiling is 8972 bytes at the default MTU, where Linux delivers 65507. Native FreeBSD containers hit the same wall, so it is the link, not the Linuxulator | `JM_MTU` (576–16384) moves the ceiling; `jm doctor` states it per machine |
-| [#3 Healthchecks never run, restart policies are not enforced](https://github.com/gabrielbelli/jailmachine/issues/3) | A podman-on-FreeBSD gap: no systemd timers, so `--health-interval` never fires and `--restart=always` applies only at boot. A bare-metal FreeBSD container host behaves the same | `jm ssh -- podman healthcheck run <name>`, or a cron entry in the guest |
-| [#4 9p shares deliver no inotify events, and run at ~70 MB/s](https://github.com/gabrielbelli/jailmachine/issues/4) | File watchers do not fire on host-side writes; reads are coherent immediately. Metadata is the bigger cost: 1000 small files take **3.6 s** on a share against **0.76 s** on the guest's own disk | Use polling watchers (`CHOKIDAR_USEPOLLING=1`, `nodemon --legacy-watch`, `--watch.usePolling`); keep build output in an engine-managed volume |
+| [#3 Healthchecks never run](https://github.com/gabrielbelli/jailmachine/issues/3) | A podman-on-FreeBSD gap: healthchecks are scheduled with systemd transient timers and there is no systemd, so `--health-interval` never fires and the status sits at `starting` with zero log entries. A bare-metal FreeBSD container host behaves the same. **Restart policies do work** — the issue's title still says otherwise and needs amending | `jm ssh -- podman healthcheck run <name>`, or a cron entry in the guest |
+| [#4 an inotify watch cannot be created on a 9p share, which also runs at ~70 MB/s](https://github.com/gabrielbelli/jailmachine/issues/4) | Not missing events — `inotify_add_watch` on a shared path fails outright with `Bad file descriptor`, so the watch is never created; it works on an engine-managed volume and on the container's own filesystem. Reads are coherent immediately. Metadata is the bigger cost: 1000 small files take **3.6 s** on a share against **0.76 s** on the guest's own disk | Use polling watchers (`CHOKIDAR_USEPOLLING=1`, `nodemon --legacy-watch`, `--watch.usePolling`); keep build output in an engine-managed volume |
 

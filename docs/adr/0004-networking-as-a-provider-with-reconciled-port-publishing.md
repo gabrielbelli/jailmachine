@@ -107,7 +107,8 @@ lifts the published-UDP ceiling from 1472 to **8972 bytes** (every size from
 1400 to 8972 echoed back byte-exact through a published `-p …/udp` mapping)
 at no cost to TCP, which segments to fit: 10 MB in 2.4–2.8 s at 9000 against
 2.9–3.8 s at 1500. `$JM_MTU`, read from the environment at `jm start` and
-clamped to 576–9000, overrides it; `JM_MTU=1500` restores Docker's exact link
+clamped to 576–16384 (`MaxMTU`, the largest size verified end to end:
+the guest applied it and 16356-byte datagrams came through), overrides it; `JM_MTU=1500` restores Docker's exact link
 size. `jm doctor` names the knob alongside the limit it reports.
 
 This does not make the link fragment. There is still a hard ceiling and still

@@ -46,7 +46,7 @@ directory is a complete uninstall.
 | `qemu.pid`, `qemu.log`, `console.log`, `qmp.sock` | `internal/backend/qemu` |
 | `gvproxy.pid`, `gvproxy.log`, `net.sock`, `api.sock`, `podman.sock`, `forward.pid`, `forward.log` | `internal/netprov/gvproxy` |
 | `forwarder.pid`, `forwarder.log`, `forwards.json` | `internal/forwarder` |
-| `resolver.pid`, `resolver.log`, `resolver.addr` | `internal/resolver` |
+| `resolver.pid`, `resolver.log`, `resolver.addr`, `resolver.port` | `internal/resolver` (`resolver.port` is reused across restarts, so a rebooted guest resolves before `jm start` reaches it) |
 | `guest/shares.tab` | `internal/machine` (the share table, itself exported to the guest read-only as the `jmconf` 9p share) |
 
 The record is the source of *configuration*; the source of *runtime state*
@@ -170,8 +170,9 @@ any working directory.
   An unmountable share is a logged non-event; boot completes regardless.
 
 9p semantics are best-effort POSIX and the gaps are contractual: `utimes` is
-a silent no-op, no `inotify` events reach a container, and throughput is around
-70 MB/s. Shares are exported with the `mapped-xattr` security model, so guest
+a silent no-op, an `inotify` watch cannot be created on a shared path at all
+(`inotify_add_watch` → `EBADF`; it works on an engine-managed volume), and
+throughput is around 70 MB/s. Shares are exported with the `mapped-xattr` security model, so guest
 ownership and modes live in host `user.virtfs.*` xattrs rather than on the host
 file — without it the host end, an unprivileged Mac user, cannot honour a
 container running as root (ADR 0007 amendment, `$JM_9P_SECURITY` to override). Every
@@ -336,7 +337,7 @@ sequenceDiagram
     JM->>P: system connection add <name> and <name>-sock
     JM->>F: forwarder: start detached
     F->>G: podman ps and podman events (over the ssh connection)
-    F->>GV: expose 127.0.0.1:8080 to 192.168.127.2:8080
+    F->>GV: expose 0.0.0.0:8080 to 192.168.127.2:8080
     JM-->>U: ready
 ```
 

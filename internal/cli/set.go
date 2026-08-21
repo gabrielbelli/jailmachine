@@ -35,7 +35,7 @@ func newSetCmd() *cobra.Command {
 		Short: "Change a machine's resources",
 		Long: "Change CPUs, memory, disk size, the SSH port or the shared host\n" +
 			"directories of a machine.\n" +
-			"--cpus, --memory, --ssh-port, --mount and --unmount need the machine stopped.\n" +
+			"--cpus, --memory, --ssh-port, --mount, --unmount and --no-mounts need the\nmachine stopped.\n" +
 			"--disk only grows (disk.raw is extended sparsely); on a running machine the\n" +
 			"guest's partition and ZFS pool are extended at once, otherwise on the next\n" +
 			"'jm start'.\n\n" +
@@ -50,6 +50,7 @@ func newSetCmd() *cobra.Command {
 		Example: `  jm set --cpus 8 --memory 8GiB
   jm set --mount /work --mount /srv/data:ro
   jm set --unmount /srv/data
+  jm set --no-mounts
   jm set --publish-addr 127.0.0.1   # keep published ports off the LAN`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -68,6 +69,7 @@ func newSetCmd() *cobra.Command {
 	f.IntVar(&o.sshPort, "ssh-port", 0, "host port forwarded to the guest's sshd")
 	f.StringArrayVar(&o.mount, "mount", nil, mountFlagUsage)
 	f.StringArrayVar(&o.unmount, "unmount", nil, "stop sharing a host directory (repeatable)")
+	f.BoolVar(&o.noMounts, "no-mounts", false, "share no host directories at all (drops every share)")
 	f.StringVar(&o.publishAddr, "publish-addr", "", publishAddrFlagUsage)
 	return cmd
 }
@@ -77,6 +79,7 @@ type setOpts struct {
 	memory                                  string
 	publishAddr                             string
 	mount, unmount                          []string
+	noMounts                                bool
 	cpusSet, memorySet, diskSet, sshPortSet bool
 	publishAddrSet                          bool
 }
@@ -142,10 +145,10 @@ func (o setOpts) validate(m *machine.Machine) (changes, error) {
 	c := changes{
 		cpusSet: o.cpusSet, memorySet: o.memorySet, diskSet: o.diskSet, sshPortSet: o.sshPortSet,
 		publishAddrSet: o.publishAddrSet,
-		sharesSet:      len(o.mount) > 0 || len(o.unmount) > 0,
+		sharesSet:      len(o.mount) > 0 || len(o.unmount) > 0 || o.noMounts,
 	}
 	if !c.any() {
-		return c, errors.New("nothing to set (use --cpus, --memory, --disk, --ssh-port, --publish-addr, --mount or --unmount)")
+		return c, errors.New("nothing to set (use --cpus, --memory, --disk, --ssh-port, --publish-addr, --mount, --unmount or --no-mounts)")
 	}
 	if o.publishAddrSet {
 		addr, err := parsePublishAddr(o.publishAddr)
@@ -155,11 +158,20 @@ func (o setOpts) validate(m *machine.Machine) (changes, error) {
 		c.publishAddr = addr
 	}
 	if c.sharesSet {
-		shares, err := applyMounts(m.Shares, o.mount, o.unmount)
-		if err != nil {
-			return c, err
+		// --no-mounts drops everything: it is the remediation the security
+		// note offers, so it must not need a list of paths to unmount.
+		if o.noMounts {
+			if len(o.mount) > 0 || len(o.unmount) > 0 {
+				return c, usage(errors.New("--no-mounts cannot be combined with --mount or --unmount"))
+			}
+			c.shares = nil
+		} else {
+			shares, err := applyMounts(m.Shares, o.mount, o.unmount)
+			if err != nil {
+				return c, err
+			}
+			c.shares = shares
 		}
-		c.shares = shares
 	}
 	if o.cpusSet {
 		if o.cpus < minCPUs || o.cpus > maxCPUs {

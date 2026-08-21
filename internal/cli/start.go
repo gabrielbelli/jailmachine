@@ -46,7 +46,7 @@ func newStartCmd() *cobra.Command {
 		Short: "Boot a machine and connect podman to it",
 		Long: "Boot a machine in stages: network provider, hypervisor, SSH, first-boot\n" +
 			"provisioning, podman connection, port forwarder. Starting a running machine\n" +
-			"re-checks the ssh, provision, connect and forwarder stages (so an interrupted start can be\n" +
+			"re-checks the ssh, provision, dns, connect and forwarder stages (so an interrupted start can be\n" +
 			"finished); a broken one (half of it running) is stopped and started again.\n\n" +
 			"On failure the error names the stage and the log to read: qemu.log and\n" +
 			"console.log (hypervisor), gvproxy.log and forward.log (networking),\n" +

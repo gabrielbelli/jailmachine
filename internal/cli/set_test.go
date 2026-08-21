@@ -245,3 +245,23 @@ func TestPortsHeaderIsTheDefaultNotTheWholeTruth(t *testing.T) {
 		t.Errorf("a mapping was reported as unforwardable:\n%s", out)
 	}
 }
+
+func TestSetNoMountsDropsEveryShare(t *testing.T) {
+	m := &machine.Machine{Name: "t", Shares: []machine.Share{
+		{HostPath: "/Users/x", GuestPath: "/Users/x"},
+		{HostPath: "/Volumes", GuestPath: "/Volumes"},
+	}}
+	c, err := setOpts{noMounts: true}.validate(m)
+	if err != nil {
+		t.Fatalf("--no-mounts: %v", err)
+	}
+	if !c.sharesSet || len(c.shares) != 0 {
+		t.Fatalf("--no-mounts left %d shares (sharesSet=%v)", len(c.shares), c.sharesSet)
+	}
+	if !c.needsStopped() {
+		t.Error("--no-mounts must require a stopped machine, like the other share flags")
+	}
+	if _, err := (setOpts{noMounts: true, mount: []string{"/tmp"}}).validate(m); err == nil {
+		t.Error("--no-mounts with --mount should be rejected")
+	}
+}

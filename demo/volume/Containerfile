@@ -1,8 +1,8 @@
-# jm-demo-volume -- "your data lives in the guest, not on your Mac"
+# jm-demo-volume -- "the fast path for data is a volume, not a share"
 #
-# Teaches the single biggest jailmachine gotcha: no virtiofs on FreeBSD means
-# no macOS host bind-mounts. Named volumes work; they live on the guest's
-# ZFS pool.
+# Host bind-mounts do work on jailmachine, at identity paths -- but over
+# virtio-9p, which is slow. An engine-managed volume lives on the guest's ZFS
+# pool at native speed, and outlives the container. That is what this shows.
 #
 #   jpodman run --rm -v jm-demo-data:/data ghcr.io/gabrielbelli/jm-demo-volume
 #
@@ -10,7 +10,7 @@
 FROM ghcr.io/freebsd/freebsd-runtime:15.1
 
 LABEL org.opencontainers.image.title="jm-demo-volume" \
-      org.opencontainers.image.description="Shows that container volumes live on the guest's ZFS pool, and why macOS bind-mounts do not work." \
+      org.opencontainers.image.description="Shows that container volumes live on the guest's ZFS pool -- the fast path for data, unlike a 9p host share." \
       org.opencontainers.image.source="https://github.com/gabrielbelli/jailmachine" \
       org.opencontainers.image.licenses="BSD-2-Clause"
 

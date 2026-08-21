@@ -124,9 +124,13 @@ exists.
 ### Version stamping
 
 `internal/version` holds `Version`, `Commit` and `Date`, set with
-`-ldflags -X`. goreleaser fills them from the tag; `make build` from
-`git describe`; a bare `go build` leaves `dev`/`none`/`unknown`, which is how
-`jm version` tells a development build from a release.
+`-ldflags -X`. goreleaser fills them from the tag and `make build` from
+`git describe`. Without the flags, `fromBuildInfo` falls back to the module
+version Go recorded plus the `vcs.revision`/`vcs.time` build settings, so a
+bare `go build` inside a checkout and a `go install ...@latest` are both
+stamped (`0.1.2-0.20260821181258-8a20dda2181b+dirty`, commit `8a20dda`).
+`dev`/`none`/`unknown` is what is left when a build has neither source — a
+`go build` outside a git checkout.
 
 ### Guest image
 

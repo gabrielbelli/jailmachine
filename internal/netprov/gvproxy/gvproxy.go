@@ -64,7 +64,11 @@ const (
 	// no cost to TCP throughput (10 MB in 2.4-2.8 s at 9000 against
 	// 2.9-3.8 s at 1500). $JM_MTU overrides it, e.g. JM_MTU=1500 to match
 	// Docker exactly.
-	DefaultMTU = MaxMTU
+	// 9000 is the virtio-net jumbo frame the guest NIC advertises, and the
+	// value measured for this default: a published UDP datagram of 8972
+	// bytes arrives, 8973 does not. MaxMTU is higher because the guest
+	// accepts it, not because it is the default.
+	DefaultMTU = 9000
 	// MaxMTU is the largest link size verified end to end on this stack:
 	// the guest applied 16384 and single datagrams of 16356 bytes came
 	// through, 16357 did not. The ceiling tracks the MTU exactly, so it is

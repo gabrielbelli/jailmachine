@@ -26,11 +26,14 @@ and every worker dies with `epoll_ctl(1, 6) failed (22: Invalid argument)`.
 Linux AIO is absent too (`io_setup` returns `ENOSYS`), but that one is
 benign: nginx logs `io_setup() failed (38: Function not implemented)` once,
 disables file AIO and serves normally. `redis-server` needs
-`--ignore-warnings ARM64-COW-BUG`, and `docker.io/node` does not work at
-all. UDP is fine — Linux containers bind, send, receive and publish
+`--ignore-warnings ARM64-COW-BUG`, and `docker.io/node` runs only far enough
+to print `node --version`: every other invocation hangs, because
+`linux_mremap` cannot grow a mapping and node's allocator retries forever
+(`node:22-bookworm-slim`, on glibc, works). UDP is fine — Linux containers bind, send, receive and publish
 `/udp` ports normally — except for busybox's `nc -u -l`, which peeks its
 peer with a zero-length `recvmsg()`; that returns at once on FreeBSD where
 Linux blocks, so it dies with `EAFNOSUPPORT`. Any other UDP server
-(`netcat-openbsd`, `socat`) works. Ports published with a loopback `host_ip` (`-p 127.0.0.1:8080:80`)
-bind the guest's loopback, not the host's; `jm ports` reports them with a
-reason instead of forwarding them, which is also being fixed.
+(`netcat-openbsd`, `socat`) works. A port published with a host address
+(`-p 127.0.0.1:8080:80`) binds that address on the Mac: the forwarder loads
+an `rdr` rule into the guest's own `rdr/jm` pf anchor to make it so, and
+`jm ports` shows the resulting mapping.

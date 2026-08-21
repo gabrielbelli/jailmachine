@@ -25,7 +25,7 @@ Every image runs with no arguments, prints something worth reading, and exits
 | `jm-demo-linuxulator` | `docker.io/library/alpine:3.24` | A **stock, unpatched Alpine** running on FreeBSD's Linux ABI — with every piece of evidence annotated in one or two words. | `jpodman run --rm --os=linux ghcr.io/gabrielbelli/jm-demo-linuxulator` |
 | `jm-demo-nginx-linuxulator` | `docker.io/library/nginx:1.31-alpine` | A **real Docker Hub server image serving traffic** under the Linuxulator. One config line makes it work; see [the finding](#the-nginx-finding). | `jpodman run -d --os=linux -p 8080:80 ghcr.io/gabrielbelli/jm-demo-nginx-linuxulator` |
 | `jm-demo-nginx-native` | `ghcr.io/freebsd/freebsd-runtime:15.1` + `pkg install nginx` | The **same site, same URLs, native FreeBSD nginx** on `kqueue`. Put it next to the one above and compare. | `jpodman run -d -p 8081:80 ghcr.io/gabrielbelli/jm-demo-nginx-native` |
-| `jm-demo-volume` | `ghcr.io/freebsd/freebsd-runtime:15.1` | Your container data lives on the **guest's ZFS pool inside the VM**, not on your Mac — which is why `-v /Users/you/src:/app` cannot work. | `jpodman run --rm -v jm-demo-data:/data ghcr.io/gabrielbelli/jm-demo-volume` |
+| `jm-demo-volume` | `ghcr.io/freebsd/freebsd-runtime:15.1` | An engine-managed volume lives on the **guest's ZFS pool inside the VM**, at native speed — the fast path for build output and databases, unlike a 9p share (`-v /Users/you/src:/app` does work, it is just slow). | `jpodman run --rm -v jm-demo-data:/data ghcr.io/gabrielbelli/jm-demo-volume` |
 
 Sizes (uncompressed, on the guest): 9 MB, 32 MB, 32 MB, 64 MB, 67 MB.
 
@@ -68,7 +68,7 @@ No Linux kernel exists anywhere in this stack.
 # 3. A real Docker Hub server image, serving real traffic.
 jpodman run -d --name nginx-linux --os=linux -p 8080:80 \
     ghcr.io/gabrielbelli/jm-demo-nginx-linuxulator
-curl -s localhost:8080/whoami.txt
+curl -s --retry 10 --retry-connrefused localhost:8080/whoami.txt
 open http://localhost:8080          # a browser is more fun
 ```
 
@@ -76,7 +76,7 @@ open http://localhost:8080          # a browser is more fun
 # 4. The same site, native.
 jpodman run -d --name nginx-native -p 8081:80 \
     ghcr.io/gabrielbelli/jm-demo-nginx-native
-curl -s localhost:8081/whoami.txt
+curl -s --retry 10 --retry-connrefused localhost:8081/whoami.txt
 open http://localhost:8081
 ```
 Two tabs, identical pages. One is an `x86`/`aarch64` **Linux** ELF binary, the
@@ -114,8 +114,9 @@ jpodman run --rm -v jm-demo-data:/data ghcr.io/gabrielbelli/jm-demo-volume
 jpodman run --rm -v jm-demo-data:/data ghcr.io/gabrielbelli/jm-demo-volume   # log grew
 jm ssh -- ls -l /var/db/containers/storage/volumes/jm-demo-data/_data
 ```
-The last command is the punchline: the file is on the guest's ZFS pool, and
-`jm ssh` is how you reach it. There is no bind mount from macOS.
+The last command is the punchline: the file is on the guest's ZFS pool, where
+writes run at native ZFS speed rather than across a 9p share, and it outlives
+every container that used it. `jm ssh` is how you reach it directly.
 
 ```bash
 # 7. Tidy up.
@@ -209,26 +210,30 @@ It covers `alpine`, `debian`, `ubuntu`, `python`, `golang`, `hello-world`,
 the two workarounds and one known-bad image documented in
 [`docs/USAGE.md`](../docs/USAGE.md#docker-hub-compatibility-verified):
 `nginx` needs `accept_mutex on;`, `redis-server` needs
-`--ignore-warnings ARM64-COW-BUG`, and `node:22-alpine` does not work at
-all. Each container is run under `timeout 120`.
+`--ignore-warnings ARM64-COW-BUG`, and `node:22-alpine` runs only
+`node --version` — every other invocation hangs. Each container is run under
+`timeout 120`.
 
 ## Known limits
 
 - **Bind mounts work, but over 9p.** FreeBSD has no virtiofs driver, so jm
   shares host directories with `virtio-9p` at the *same absolute path* —
   `-v /Users/you/src:/app` works, from any directory. It is slow (~70 MB/s,
-  and metadata far worse), `utimes` is a silent no-op and no `inotify` events
-  reach a container, so keep build output in a named volume on the guest's ZFS
+  and metadata far worse), `utimes` is a silent no-op and an `inotify` watch
+  cannot be created on a shared path at all (`inotify_add_watch` →
+  `Bad file descriptor`; it works on a volume and on the container's own
+  filesystem), so keep build output in a named volume on the guest's ZFS
   pool and use a polling watcher (`CHOKIDAR_USEPOLLING=1`,
   `nodemon --legacy-watch`, `--watch.usePolling`). A file a container creates
   shows on the Mac as `0600`, its real mode in a `user.virtfs.mode` xattr —
   the price of the `mapped-xattr` security model that makes root in a
-  container work. `jm inspect` lists what is shared; `jm set --mount/--unmount`
-  changes it.
+  container work. `jm inspect` lists what is shared;
+  `jm set --mount/--unmount/--no-mounts` changes it, on a stopped machine.
 - **`--os=linux` on every Linux image**, for `build` and `run` alike.
 - **Not every Linux image works.** The Linuxulator implements most of the
   Linux syscall surface, not all of it — the missing `EPOLLEXCLUSIVE` is
-  what this demo runs into, and `docker.io/node` fails outright. The
+  what this demo runs into, and `docker.io/node` hangs on anything past
+  `node --version` (use `node:22-bookworm-slim`). The
   verified matrix is in
   [`docs/USAGE.md`](../docs/USAGE.md#docker-hub-compatibility-verified) and
   `hub-matrix.sh` re-runs it. Expect to meet more gaps with anything that

@@ -229,41 +229,41 @@ jm inspect
 ```
 
 ```
-Name:           jailmachine
-State:          running
-Backend:        qemu
-Network:        gvproxy
-Image:          prebaked:15.1.0
-Image trusted:  true
-CPUs:           4
-Memory:         4096 MiB
-Disk:           64 GiB
-MAC:            5a:94:ef:e4:0c:ee
-Guest IP:       192.168.127.2
-DNS:            192.168.127.2
-SSH:            root@127.0.0.1:2222
-SSH key:        /Users/you/.jailmachine/machines/jailmachine/ssh/id_ed25519
-Podman:         ssh://root@127.0.0.1:2222/var/run/podman/podman.sock (jailmachine)
-Podman socket:  unix:///Users/you/.jailmachine/machines/jailmachine/podman.sock (jailmachine-sock)
-Docker host:    unix:///Users/you/.jailmachine/machines/jailmachine/podman.sock (jdocker)
-Autostart:      on
-Console:        /Users/you/.jailmachine/machines/jailmachine/console.log
-Network log:    /Users/you/.jailmachine/machines/jailmachine/gvproxy.log
-Network log:    /Users/you/.jailmachine/machines/jailmachine/forward.log
-Resolver:       running
-Resolver address: 127.0.0.1:53042
-Resolver log:   /Users/you/.jailmachine/machines/jailmachine/resolver.log
-Publish address: 0.0.0.0
-Forwarder:      running
-Forwarder log:  /Users/you/.jailmachine/machines/jailmachine/forwarder.log
-Port:           0.0.0.0:8080 -> 192.168.127.2:8080 tcp (ok)
-Share:          /Users/you (rw)
-Share:          /Volumes (rw)
-Share:          /private/tmp (rw)
-Share:          /var/folders/qb/8x1s7c9d0000gn (rw)
-Dir:            /Users/you/.jailmachine/machines/jailmachine
-Provisioned:    true
-Created:        2026-08-21T02:37:54Z
+Name:              jailmachine
+State:             running
+Backend:           qemu
+Network:           gvproxy
+Image:             prebaked:15.1.0
+Image trusted:     true
+CPUs:              4
+Memory:            4096 MiB
+Disk:              64 GiB
+MAC:               5a:94:ef:e4:0c:ee
+Guest IP:          192.168.127.2
+DNS:               192.168.127.2
+SSH:               root@127.0.0.1:2222
+SSH key:           /Users/you/.jailmachine/machines/jailmachine/ssh/id_ed25519
+Podman:            ssh://root@127.0.0.1:2222/var/run/podman/podman.sock (jailmachine)
+Podman socket:     unix:///Users/you/.jailmachine/machines/jailmachine/podman.sock (jailmachine-sock)
+Docker host:       unix:///Users/you/.jailmachine/machines/jailmachine/podman.sock (jdocker)
+Autostart:         on (jpodman/jdocker start this machine on demand)
+Console:           /Users/you/.jailmachine/machines/jailmachine/console.log
+Network log:       /Users/you/.jailmachine/machines/jailmachine/gvproxy.log
+Network log:       /Users/you/.jailmachine/machines/jailmachine/forward.log
+Resolver:          running
+Resolver address:  127.0.0.1:49900
+Resolver log:      /Users/you/.jailmachine/machines/jailmachine/resolver.log
+Publish address:   0.0.0.0
+Forwarder:         running
+Forwarder log:     /Users/you/.jailmachine/machines/jailmachine/forwarder.log
+Port:              0.0.0.0:8080 -> 192.168.127.2:8080 tcp (ok)
+Share:             /Users/you (rw)
+Share:             /Volumes (rw)
+Share:             /private/tmp (rw)
+Share:             /var/folders/qb/8x1s7c9d0000gn (rw)
+Dir:               /Users/you/.jailmachine/machines/jailmachine
+Provisioned:       true
+Created:           2026-08-21T16:16:47Z
 ```
 
 One `Port:` line is printed per published mapping and one `Share:` line per
@@ -276,7 +276,9 @@ has no file-sharing capability at all.
 `--json` prints one object with snake_case keys: `name`, `state`
 (`running` | `stopped` | `broken`), `backend_state`, `network_state`,
 `backend`, `network`, `image`, `cpus`, `memory_mib`, `disk_gib`, `mac`,
-`ssh_port`, `ssh_user`, `guest_ip`, `ssh` (host:port), `ssh_key`,
+`ssh_port`, `ssh_user`, `guest_ip`, `mtu` (the link size gvproxy and the
+guest agree on — the plain-text output has no row for it; `jm doctor` states
+the resulting UDP ceiling), `ssh` (host:port), `ssh_key`,
 `podman_uri`, `podman_sock_uri`, `docker_host`, `api_socket`, `dns`,
 `console`, `network_logs`, `dir`, `provisioned`, `image_trusted`, `created`,
 `version`, `backend_opts`, `ports` (array of `{proto, local, remote, since,
@@ -406,13 +408,15 @@ Change a machine's resources.
 | `--memory <size>` | machine stopped | Memory: a bare number is MiB, or use a unit — `4096MiB`, `4GiB`, `4g`. Between 256 MiB and 1 TiB |
 | `--disk <GiB>` | stopped **or** running | Disk size, **grow only**, 1–16384 GiB |
 | `--ssh-port <port>` | machine stopped | Host port forwarded to the guest's sshd, 1–65535 |
-| `--mount <dir>[:ro]` | takes effect on the next start | Share a host directory at the same absolute path. Repeatable |
-| `--unmount <dir>` | takes effect on the next start | Stop sharing a host directory. Repeatable |
+| `--mount <dir>[:ro]` | machine stopped | Share a host directory at the same absolute path, from the next start. Repeatable |
+| `--unmount <dir>` | machine stopped | Stop sharing a host directory, from the next start. Repeatable |
+| `--no-mounts` | machine stopped | Drop **every** share. Cannot be combined with `--mount` or `--unmount` |
 | `--publish-addr <addr>` | takes effect on the next start | **Default** host address published ports bind to; a `-p` that names one binds that instead |
 
-`--mount`, `--unmount` and `--publish-addr` are accepted while the machine
-runs — they are recorded, and jm prints the `jm stop && jm start` needed to
-apply them.
+`--publish-addr` is accepted while the machine runs: it is recorded, and jm
+prints the `jm stop && jm start` needed to apply it. `--mount`, `--unmount`
+and `--no-mounts` change the share set, which needs the machine **stopped**;
+the new set is attached at the next start.
 
 `--disk` extends `disk.raw` sparsely. On a running machine the guest's
 partition and ZFS pool are extended immediately; on a stopped one they are
@@ -422,14 +426,15 @@ pending flag and the next start retries it.
 ```bash
 jm stop && jm set --cpus 8 --memory 8GiB && jm start
 jm set --disk 128                       # works while running
-jm set --mount /work --unmount /Volumes # recorded now, applied at the next start
+jm stop && jm set --mount /work --unmount /Volumes && jm start
+jm stop && jm set --no-mounts && jm start  # drop every share
 jm set --mount "${P}:ro"                # quote the :ro suffix in zsh
 jm set --publish-addr 127.0.0.1
 ```
 
-Exit codes: `0`; `2` for no flags at all, an out-of-range value or a
-shrink; `1` when the machine is running but the change needs it stopped, or
-when a grow failed part-way.
+Exit codes: `0`; `2` for no flags at all, an out-of-range value, a shrink, or
+`--no-mounts` combined with `--mount`/`--unmount`; `1` when the machine is
+running but the change needs it stopped, or when a grow failed part-way.
 
 ## `jm console [name]`
 
@@ -451,11 +456,16 @@ or the backend has no serial console; `2` usage.
 
 ## `jm doctor`
 
-Check the host for everything jm needs: the QEMU backend preflight,
-`qemu-system-aarch64` and its version (8+), the HVF accelerator, the EDK2
-firmware, `gvproxy`, `podman` and its version (5+), `ssh`, `ssh-keygen`,
-`xz` (optional — a warning, not a failure), the state root, the length of
-the socket paths it implies, and one row per machine directory.
+Check the host for everything jm needs: the host's own resolver, the QEMU
+backend preflight, `qemu-system-aarch64` and its version (8+), the HVF
+accelerator, the EDK2 firmware, `gvproxy`, `podman` and its version (5+),
+`ssh`, `ssh-keygen`, `xz` (optional — a warning, not a failure), the state
+root, the length of the socket paths it implies, the `jpodman` and `jdocker`
+wrappers and whether autostart is on — then, per machine: its state, host and
+guest resolver parity, the share set, **share parity** (a file written on the
+host really is visible to a container at the same path), the published-UDP
+datagram limit, and the guest clock. A healthy Mac with one machine reports
+23 checks.
 
 Each row that is not `[ ok ]` carries a `fix:` line. See
 [INSTALL.md](INSTALL.md#verify-the-install) for a full sample report.
@@ -622,15 +632,20 @@ jm version
 ```
 
 ```
-jm version dev
-  commit:     none
-  built:      unknown
+jm version 0.1.2-0.20260821181258-8a20dda2181b+dirty
+  commit:     8a20dda
+  built:      2026-08-21T18:12:58Z
   go version: go1.26.5
   os/arch:    darwin/arm64
 ```
 
-`dev`/`none`/`unknown` means an unstamped build (`go build`, `go install`);
-a release or `make build` binary carries its tag and commit. `--json`
+Three sources, in order: the linker flags a release or `make build` sets win;
+failing those, the module version and the `vcs.revision`/`vcs.time` Go
+records in the binary are used, so `go install ...@latest` and a plain
+`go build` inside a git checkout are both stamped (the `+dirty` suffix above
+is an uncommitted working tree). `dev`/`none`/`unknown` appears only when a
+build has neither — a `go build` outside a checkout, from an unpacked
+tarball. `--json`
 prints `{version, commit, date, go_version, os, arch}`. `jm --version`
 prints just the version string.
 
@@ -669,7 +684,7 @@ machine record.
 | `JM_9P_SECURITY` | `jm start` (QEMU backend) | 9p security model for the share devices: `mapped-xattr` (the default), `none` or `mapped-file`. Anything else falls back to the default. Read from the environment at every `jm start` and **not** stored in the machine record, so a machine uses whatever was set when it was last started. `mapped-xattr` keeps guest ownership and modes in host xattrs, which is what lets a container running as root rewrite its own files; `none` passes the Mac's own modes straight through and breaks that. See [Modes and ownership on a share](#modes-and-ownership-on-a-share) |
 | `JM_IMAGE_BASEURL` | prebaked image source | Fetch the prebaked image and its `.sha256` from `$JM_IMAGE_BASEURL/<file name>` instead of the GitHub release. For testing an image that is not published yet |
 | `JM_GVPROXY` | gvproxy provider | Path to the `gvproxy` binary, instead of `PATH` and then `/opt/homebrew/opt/podman/libexec/podman/gvproxy` |
-| `JM_MTU` | `jm start` (gvproxy provider) | Link size gvproxy and the guest agree on. Default **9000**, the virtio-net jumbo frame; clamped to **576–16384** (a value below 576 or that is not a number falls back to the default, one above 9000 clamps to 9000). It caps published UDP at the MTU less 28 bytes — 8972 by default, 1472 with `JM_MTU=1500`, which is Docker's link size. Read from the environment at every `jm start` and **not** stored in the machine record, so a machine uses whatever was set when it was last started; the guest picks it up over DHCP. See [Datagrams are capped at 8972 bytes](#datagrams-are-capped-at-8972-bytes) |
+| `JM_MTU` | `jm start` (gvproxy provider) | Link size gvproxy and the guest agree on. Default **9000**, the virtio-net jumbo frame; clamped to **576–16384** (a value below 576 or that is not a number falls back to the default; one above 16384 clamps to 16384). It caps published UDP at the MTU less 28 bytes — 8972 by default, 1472 with `JM_MTU=1500`, which is Docker's link size. Read from the environment at every `jm start` and **not** stored in the machine record, so a machine uses whatever was set when it was last started; the guest picks it up over DHCP. See [Datagrams are capped at 8972 bytes](#datagrams-are-capped-at-8972-bytes) |
 | `JM_E2E` | `make e2e` | `JM_E2E=1` enables the end-to-end test; it is skipped otherwise |
 
 Testing an unpublished guest image:
@@ -716,6 +731,7 @@ Everything jm creates at runtime lives under the state root
 | `forwards.json` | The mappings the forwarder owns, with the last error per mapping; what `jm ports` reads |
 | `resolver.log`, `resolver.pid` | The detached host resolver that answers the guest's DNS queries |
 | `resolver.addr` | The `127.0.0.1:<port>` the resolver listens on, which the guest's `local_unbound` forwards to |
+| `resolver.port` | The port the resolver reuses across restarts, so a rebooted guest resolves through the same address before `jm start` reaches it |
 | `guest/shares.tab` | The share table, exported to the guest read-only as the `jmconf` 9p share so it can mount the shares declaratively at boot |
 
 > Long state-root paths can overflow the 103-byte unix socket path limit;
@@ -847,8 +863,15 @@ sees it at the same path.
 > deliberate one, but if you run images you do not trust, narrow it:
 >
 > ```bash
-> jm set --no-mounts --mount ~/code --mount "/srv/data:ro"
+> jm stop
+> jm set --no-mounts                            # drop every share
+> jm set --mount ~/code --mount "/srv/data:ro"  # add back only these
+> jm start
 > ```
+>
+> The share set changes only on a stopped machine, and `--no-mounts` cannot
+> be combined with `--mount` or `--unmount` in one call — hence two
+> commands.
 
 ## `/tmp` is the one path that cannot follow the rule
 
@@ -880,8 +903,10 @@ so the only suffix is `:ro` (or `:rw`, the default). `~` is expanded, paths
 are canonicalised, and a path that does not exist yet is kept: an unplugged
 disk is dropped at `jm start` with one warning and comes back when it does.
 
-`--mount` and `--unmount` are recorded immediately and applied at the next
-`jm stop` + `jm start`; jm prints the commands.
+`--mount`, `--unmount` and `--no-mounts` need the machine **stopped**: on a
+running one `jm set` refuses with `<name> is running; cpus, memory, the ssh
+port and the shared directories change only on a stopped machine` and exits
+`1`. The new set is attached at the next `jm start`.
 
 > **zsh: quote the `:ro` suffix.** In zsh, `:ro` at the end of an unquoted
 > word is a *history modifier*, so `jm set --mount $P:ro` fails before jm ever
@@ -942,7 +967,7 @@ Semantics are best-effort POSIX and the gaps are contractual:
 
 | Gap | Effect |
 |---|---|
-| No `inotify`/`kqueue` events ([#4](https://github.com/gabrielbelli/jailmachine/issues/4)) | A file watcher in a container never fires on a host-side write, though reads are coherent straight away. Use a polling watcher: `CHOKIDAR_USEPOLLING=1` (chokidar, and everything built on it), `nodemon --legacy-watch`, `--watch.usePolling` for Vite and Vitest |
+| An `inotify` watch cannot be created ([#4](https://github.com/gabrielbelli/jailmachine/issues/4)) | Not events going missing — `inotify_add_watch` on a shared path fails outright: `inotifywait: Couldn't watch /w: Bad file descriptor`. The same image watches its own filesystem and an engine-managed volume fine, so it is `p9fs` specifically. Reads are coherent straight away. Use a polling watcher: `CHOKIDAR_USEPOLLING=1` (chokidar, and everything built on it), `nodemon --legacy-watch`, `--watch.usePolling` for Vite and Vitest |
 | `utimes` is a silent no-op | Explicitly-set timestamps do not stick; `make` and other mtime-driven tools can misbehave on a shared tree |
 | Guest ownership and modes live in host xattrs | Under `mapped-xattr` a `chown` in the guest sticks, but it is recorded in `user.virtfs.uid`/`user.virtfs.gid` rather than applied to the host file, and device and fifo nodes are plain host files carrying their real type in `user.virtfs.mode`. See [Modes and ownership on a share](#modes-and-ownership-on-a-share) |
 | Throughput ~70 MB/s, and metadata much slower still — creating 1000 small files takes **3.6 s** on a share against **0.76 s** on the guest's own disk ([#4](https://github.com/gabrielbelli/jailmachine/issues/4)) | Large builds and dependency installs are noticeably slower |
@@ -1006,7 +1031,9 @@ and `resolver.log` says why; `jm inspect` shows `Resolver:` and
 
 `jpodman` and `jdocker` (and `jm podman` / `jm docker`) **start a stopped
 machine on demand**, printing one line on stderr while it boots, then run
-your command. A warm start is about 25 s, almost all of it guest boot.
+your command. A warm start is 12–25 s on an idle Mac, almost all of it guest
+boot; a loaded one stretches it (36.7 s measured — see
+[COMPARISON](COMPARISON.md#start-up-and-footprint)).
 
 ```bash
 jm stop
@@ -1401,14 +1428,17 @@ mapping appears a second or two after the container starts, and a failure is
 reported per mapping rather than failing the stack. See
 [Publishing ports and `--publish-addr`](#publishing-ports-and---publish-addr).
 
-## Healthchecks and restart policies do not fire
+## Healthchecks do not fire
 
 **Anything long-lived started from a compose file or a Pod manifest is
-affected**: podman on FreeBSD has no systemd timers, so a `healthcheck:` /
-`livenessProbe` never runs on a schedule (the status sits at `starting`), and
-`restart: always` applies only at boot, not when a process dies. That is a
-podman-on-FreeBSD gap, not a jm one — a bare-metal FreeBSD container host
-behaves the same way — and it is tracked as
+affected**: podman schedules healthchecks with systemd transient timers, and
+there is no systemd on FreeBSD, so a `healthcheck:` / `livenessProbe` never
+runs on a schedule. Measured with `--health-cmd true --health-interval 2s`,
+the status sits at `{"Status":"starting","FailingStreak":0,"Log":null}` after
+14 s — zero log entries, the timer never ran — while
+`podman healthcheck run <name>` by hand returns `healthy` immediately. That
+is a podman-on-FreeBSD gap, not a jm one — a bare-metal FreeBSD container
+host behaves the same way — and it is tracked as
 [#3](https://github.com/gabrielbelli/jailmachine/issues/3).
 
 Run one by hand, or from a cron entry in the guest:
@@ -1418,8 +1448,16 @@ jm ssh -- podman healthcheck run web
 jm ssh -- podman ps --format '{{.Names}}  {{.Status}}'
 ```
 
-Do not design a stack that depends on the engine restarting a crashed
-container for you until that is fixed.
+**Restart policies do work.** `--restart=always`, `on-failure:N` and `no` are
+all honoured while the machine runs, and an `always` container comes back
+after `jm stop` + `jm start`. Measured twice, on two days: a container exiting
+3 every 2 s took `RestartCount` from 2 to 10 over 25 s, `--restart=on-failure:3`
+stopped at exactly 3, and across a stop/start cycle `always` came back `Up`
+while a `no` control stayed `Exited (143)`. Issue #3's title still says
+otherwise; only its healthcheck half holds.
+
+What you cannot lean on is the *supervision* around a restart — there is no
+healthcheck-driven restart, because the healthcheck never fires.
 
 ---
 
@@ -1570,7 +1608,7 @@ Two rules cover every row:
 | `docker.io/library/postgres:17-alpine` | `postgres --version` → 17.11 | Works |
 | `docker.io/library/redis:alpine` | `redis-server --version` → 8.10.1 | Works — but `redis-server` needs one flag to start, see [redis](#redis-one-flag) |
 | `docker.io/library/nginx:1.31-alpine` | HTTP 200 through a published port | Works — with one config line, see [nginx](#nginx-one-config-line) |
-| `docker.io/library/node:22-alpine` | `node --version` → `v22.23.2` | **Broken**, see [node](#node-the-one-known-bad-image) |
+| `docker.io/library/node:22-alpine` | `node --version` → `v22.23.2` | **Broken** past `--version`; `node:22-bookworm-slim` works, see [node](#node-the-one-known-bad-image) |
 
 ## FreeBSD images, no flag
 
@@ -1662,18 +1700,32 @@ Verified end to end, including the published port.
 
 ## node: the one known-bad image
 
-`docker.io/library/node:22-alpine` does not work, and there is no known
-workaround for it.
+`docker.io/library/node:22-alpine` runs exactly one thing. **`node --version`
+is the only invocation that works**; everything else hangs before it reaches
+any script of yours.
 
-| Symptom | Detail |
+| Invocation | Result |
 |---|---|
-| The binary does start | `node --version` prints `v22.23.2` |
-| JavaScript output never arrives | Anything written with `console.log` never reaches the pipe |
-| Sockets never answer | An HTTP server started inside the container does not accept connections — `curl` gets `connection reset by peer`, both from inside the guest and through a published port |
+| `node --version` | Prints `v22.23.2` and exits 0 |
+| `node -e ''` | Never returns. So does `node -p 1+1`, with or without a TTY |
+| `node -e 'fs.writeSync(1, "x")'` | Never returns — it hangs before the script runs, so nothing reaches the pipe |
+| An HTTP server, or any real script | Never gets far enough to listen |
 | `UV_USE_IO_URING=0` | Changes nothing |
 
-Use another runtime image (`python:3-alpine` and `golang:alpine` both work),
-or a native FreeBSD image, until this is fixed.
+Under `truss` the process sits in `linux_mremap(...) ERR#-12 'Cannot allocate
+memory'`, retried forever: **FreeBSD's Linuxulator cannot grow a mapping**,
+and musl's `mallocng` grows its heap that way. One thread spins at 100 % of a
+core while four sleep on `futex`.
+
+This is **not a musl problem** — alpine's own busybox, `python:3-alpine`,
+`apk add` and `pip install` all work on the same kernel, and `nginx:1.31` on
+Debian/glibc fails in exactly the same way as its alpine build for an
+unrelated reason. The same `mremap` gap is what breaks `apt-get` in
+Debian and Ubuntu containers.
+
+**The workaround is `node:22-bookworm-slim`** — the glibc build, verified
+working including exit codes. `python:3-alpine`, `golang:alpine` and a native
+FreeBSD image are all fine too.
 
 ## Re-running the matrix
 
@@ -1688,7 +1740,10 @@ Each image is run with `timeout 120`, its exit status captured from the
 
 # What this does not do (yet)
 
-Stated plainly, so you can plan around it.
+Stated plainly, so you can plan around it. The full, measured account — every
+limitation, what it looks like, whose it is and what would have to change — is
+[docs/LIMITATIONS.md](LIMITATIONS.md); the same ground against Docker Desktop
+and podman machine, in numbers, is [docs/COMPARISON.md](COMPARISON.md).
 
 **Known limits, narrow ones:**
 
@@ -1702,9 +1757,9 @@ Stated plainly, so you can plan around it.
 | Not here | Why / what instead |
 |---|---|
 | Autostart at login | Deliberate: `jpodman`/`jdocker` start a stopped machine on demand and nothing else does. See [Autostart](#autostart) |
-| Full POSIX semantics on a share | 9p, not virtiofs: `utimes` is a no-op, guest ownership and modes live in host xattrs, there are no `inotify` events, and it is far slower than ZFS (~70 MB/s). See [What 9p does not do](#what-9p-does-not-do) |
+| Full POSIX semantics on a share | 9p, not virtiofs: `utimes` is a no-op, guest ownership and modes live in host xattrs, an `inotify` watch cannot be created at all, and it is far slower than ZFS (~70 MB/s). See [What 9p does not do](#what-9p-does-not-do) |
 | `--os=linux` per service under compose | Compose cannot ask for a platform. Under `jdocker` the wrapper's default platform covers it; under a plain `eval "$(jm env)"` shell, pre-pull with `jpodman pull --os=linux <image>` plus `pull_policy: missing` |
-| `docker.io/node` | The one Docker Hub image known not to work under the Linuxulator; see [Docker Hub compatibility](#docker-hub-compatibility-verified) |
+| `docker.io/node` on alpine | Only `node --version` works; everything else hangs on `linux_mremap`. Use `node:22-bookworm-slim`. See [node](#node-the-one-known-bad-image) |
 | A routable VM IP | gvproxy is NAT; vmnet/bridged networking is a later step |
 | vsock | The podman socket is forwarded over SSH instead |
 | Host-side jail management | Jails are reached through `jm ssh -- bastille ...` |

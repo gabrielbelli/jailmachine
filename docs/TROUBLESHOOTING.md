@@ -9,7 +9,10 @@
 > ([UDP in a Linux container](#udp-in-a-linux-container)).
 
 Everything here is on macOS/Apple Silicon, the only supported host. For how
-the pieces fit together, see [ARCHITECTURE.md](ARCHITECTURE.md).
+the pieces fit together, see [ARCHITECTURE.md](ARCHITECTURE.md); for the
+limits that are not bugs — measured, and attributed to the layer that owns
+them — see [LIMITATIONS.md](LIMITATIONS.md) and, against Docker Desktop and
+podman machine, [COMPARISON.md](COMPARISON.md).
 
 ## Four commands that answer most questions
 
@@ -22,10 +25,13 @@ jm ssh -- <command>       # run anything in the guest, e.g. jm ssh -- service po
 
 `jm doctor` checks `qemu-system-aarch64` (≥ 8) and HVF, the EDK2 firmware,
 `gvproxy`, `podman` (≥ 5), `ssh`/`ssh-keygen`, `xz`, the state root, the
-socket-path budget, each machine's combined state, **share parity** (a file
-written on the host must be visible to a container at the same path) and
-**resolution parity** (a name only the host can resolve must resolve in the
-guest, to the same address) — printing a one-line fix per failure. Note that it inspects the default state root
+socket-path budget, the `jpodman`/`jdocker` wrappers and autostart, then per
+machine: its combined state, **share parity** (a file written on the host
+must be visible to a container at the same path), **resolution parity** (a
+name only the host can resolve must resolve in the guest, to the same
+address), the published-UDP **datagram limit** and the guest **clock** —
+printing a one-line fix per failure. That is 23 checks on a Mac with one
+machine. Note that it inspects the default state root
 (`~/.jailmachine`, or `$JM_HOME`) unless you pass `--state-root`.
 
 ## Symptom → cause → fix
@@ -46,11 +52,11 @@ guest, to the same address) — printing a one-line fix per failure. Note that i
 | Published port not reachable | Host port busy, loopback bind, or the forwarder is down | `jm ports` prints the reason per mapping |
 | `docker.io/nginx` workers die with `epoll_ctl(1, 6) failed (22: Invalid argument)` | FreeBSD's `linux_epoll` has no `EPOLLEXCLUSIVE`, which nginx uses when `worker_processes > 1` | Add `accept_mutex on;` to the `events` block (or `worker_processes 1;`), or run `ghcr.io/gabrielbelli/jm-demo-nginx-linuxulator` |
 | `redis-server` exits with `Failed to test the kernel for a bug … Redis will now exit` | Redis' ARM64 copy-on-write probe cannot run under the Linuxulator | `redis-server --ignore-warnings ARM64-COW-BUG` |
-| `docker.io/node` prints `node --version` but nothing from `console.log`, and its servers never accept | Known-bad Linux image in this release | None. Use another image; see [USAGE](USAGE.md#node-the-one-known-bad-image) |
+| `docker.io/node` on alpine prints `node --version` and then hangs on everything else | FreeBSD's `linux_mremap` cannot grow a mapping, and musl's allocator retries forever | Use `node:22-bookworm-slim` (glibc); see [USAGE](USAGE.md#node-the-one-known-bad-image) |
 | `docker compose up` → `no image found in image index for … OS "freebsd"` | Compose cannot ask for a platform, and the guest is FreeBSD | `jpodman pull --os=linux <image>` first, then `pull_policy: missing` on the service — or `platform: linux/arm64` on it. See [Compose and Kubernetes YAML](USAGE.md#compose-and-kubernetes-yaml) |
 | `jpodman compose …` → `command [ssh -l root … docker system dial-stdio] has exited with exit status 255` | podman's compose shim handed the external provider the machine's `ssh://` URI, so Compose went looking for a docker daemon **inside** the guest | Nothing on a current jm: a `compose` invocation is targeted at the machine's socket connection (`<name>-sock`) with `DOCKER_HOST` set to it. On an older binary, use `jdocker compose …`, or `eval "$(jm env)"` then `docker compose …`. See [Compose and Kubernetes YAML](USAGE.md#compose-and-kubernetes-yaml) |
 | `jpodman kube play` fails with an error naming `catatonit` | A pod's infra container needs `catatonit` as its init, and the guest image predates the package | `jm ssh -- pkg install -y catatonit`, or re-create the machine on a current image (`jm rm && jm init && jm start`), which installs it with `podman-suite` |
-| `-v /Users/me/src:/app` mounts an empty directory | The host path is outside the machine's share set, or it is under `/tmp` | `jm inspect` lists the shares; write `/private/tmp/...` not `/tmp/...`; add a root with `jm set --mount`. See *a share is empty* below |
+| `-v /Users/me/src:/app` mounts an empty directory | The host path is outside the machine's share set, or it is under `/tmp` | `jm inspect` lists the shares; write `/private/tmp/...` not `/tmp/...`; add a root with `jm stop && jm set --mount <dir> && jm start`. See *a share is empty* below |
 | `Permission denied` writing inside a shared directory, or `git clone` into one dies with `Unable to create temporary file '….git/objects/pack/tmp_pack_XXXXXX'` | The machine was started with `JM_9P_SECURITY=none`, where the host end of the share acts as your unprivileged Mac user and cannot rewrite a file the container has just made read-only | Drop the override (the default is `mapped-xattr`) and `jm stop && jm start`. See *permission denied writing to a share* below |
 | `zsh: no such file or directory` from `jm set --mount $P:ro` | zsh reads a trailing `:ro` as a history modifier | Quote it: `jm set --mount "${P}:ro"`, and `-v "${P}:${P}:ro"` |
 | A name resolves on the Mac but not in a container | The host resolver is down, or the guest was not pointed at it | `jm doctor`, then `resolver.log`. See *names do not resolve* below |
@@ -143,12 +149,15 @@ Which path you are on decides what "slow" means:
 |---|---|---|
 | `prebaked` (default) | about 22 s | Disk is already provisioned; the seed only applies the key and hostname |
 | `official[:<release>]` | about 2 min | `provision.sh` runs in full: `pkg install podman-suite bastille`, ZFS dataset, Linuxulator, `pf`, `podman_service` |
-| any, later starts | 12–20 s | Nothing to provision — the time is the guest's own boot |
+| any, later starts | 12–25 s | Nothing to provision — the time is the guest's own boot |
 
 A busy host stretches all three: 32 s was measured for a prebaked first boot
-with two other VMs already running. `jm init` is separate and takes about
-45–60 s, almost all of it the roughly 800 MiB download of the
-`guest-15.1.0` release asset and its SHA256 check.
+with two other VMs already running, and 36.7 s for a warm start on the same
+kind of load. `jm init` is separate and takes **60–115 s**: it fetches the
+roughly 800 MiB `guest-15.1.0` release asset and checks its SHA256, but the
+download is only about 31 s of that — writing `disk.raw` out dominates, which
+is a bug of ours
+([LIMITATIONS](LIMITATIONS.md#the-machine-itself)).
 
 The `provision` stage waits up to 15 minutes and fails fast if
 `/var/db/jm-provision-failed` appears. Watch or read the log in the guest:
@@ -296,14 +305,19 @@ jpodman run -d --os=linux -p 6379:6379 docker.io/library/redis:alpine \
 printf 'PING\r\n' | nc 127.0.0.1 6379      # +PONG
 ```
 
-### node: no workaround
+### node: use the glibc image
 
-`docker.io/library/node:22-alpine` is the one image in the matrix that does
-not work. `node --version` prints `v22.23.2`, so the binary starts, but
-`console.log` output never reaches the pipe and an HTTP server started
-inside the container never accepts a connection (`connection reset by peer`,
-locally and through a published port). `UV_USE_IO_URING=0` makes no
-difference. Use another image.
+`docker.io/library/node:22-alpine` runs `node --version` (`v22.23.2`, exit 0)
+and **nothing else**. `node -e ''` and `node -p 1+1` hang before they reach
+any script, with or without a TTY; under `truss` the process loops on
+`linux_mremap(...) ERR#-12 'Cannot allocate memory'`, one thread spinning at
+100 % of a core while four sleep on `futex`. FreeBSD's Linuxulator cannot
+grow a mapping, and musl's `mallocng` grows its heap that way.
+`UV_USE_IO_URING=0` makes no difference.
+
+**Use `node:22-bookworm-slim`** — the glibc build, verified working including
+exit codes. This is not a musl problem in general: alpine's busybox,
+`python:3-alpine`, `apk add` and `pip install` all work.
 
 ### General
 
@@ -460,7 +474,7 @@ jm doctor                     # writes a host file and asserts a container sees 
 
 | Cause | Fix |
 |---|---|
-| The host path is outside the share set | `jm set --mount /that/root`, then `jm stop && jm start`. Defaults are your home tree, `/Volumes`, `/private/tmp` and `$TMPDIR`'s parent |
+| The host path is outside the share set | `jm stop && jm set --mount /that/root && jm start` — the share set changes only on a stopped machine and is attached at the next start. Defaults are your home tree, `/Volumes`, `/private/tmp` and `$TMPDIR`'s parent |
 | You wrote `/tmp/...` | Write `/private/tmp/...`. On macOS `/tmp` is a symlink to `/private/tmp`, and a share at the guest's own `/tmp` would shadow it, so jm shares the real path and never rewrites your argument |
 | The share shows `— missing on the host, not shared` | The directory has vanished (an unplugged disk). `jm start` drops it with a warning and picks it up again at the next start once it is back |
 | The guest image predates the `jm_shares` service | `jm start` warns about it. Re-create the machine on a current image: `jm rm && jm init && jm start` |
@@ -474,9 +488,13 @@ Two more things that look like bugs and are not:
   modes live in host xattrs rather than on the host file. A build that sets
   timestamps will misbehave; keep build output in an engine-managed volume
   (`-v myvol:/out`) on the guest's ZFS.
-- **File watchers never fire** on a host-side write: 9p delivers no `inotify`
-  events ([#4](https://github.com/gabrielbelli/jailmachine/issues/4)). Reads
-  are coherent immediately, so a polling watcher works —
+- **An `inotify` watch cannot be created on a share.** It is not that events
+  go missing — `inotify_add_watch` fails outright:
+  `inotifywait: Couldn't watch /w: Bad file descriptor`. The same image
+  watches its own filesystem and an engine-managed volume without trouble, so
+  the gap is `p9fs` specifically
+  ([#4](https://github.com/gabrielbelli/jailmachine/issues/4)). Reads are
+  coherent immediately, so a polling watcher works —
   `CHOKIDAR_USEPOLLING=1`, `nodemon --legacy-watch`, `--watch.usePolling`.
 - **zsh eats a trailing `:ro`.** `jm set --mount $P:ro` and
   `-v $P:$P:ro` fail before the command runs, because zsh reads `:ro` as a

@@ -62,8 +62,9 @@ go install github.com/gabrielbelli/jailmachine/cmd/jm@latest
 
 A binary installed this way reports the module version it was built from
 (`jm version` shows `0.1.1`, with an empty commit when the module proxy built
-it); the Homebrew cask and the release archives carry the commit and build date
-as well. `jpodman` and `jdocker` are not created for you: link them yourself (see
+it, or a pseudo-version and a `vcs.revision` when Go built it from a checkout);
+the Homebrew cask and the release archives carry the tag, commit and build date
+from the linker flags instead. `jpodman` and `jdocker` are not created for you: link them yourself (see
 below).
 
 Then put the Go bin directory on your `PATH` and create the wrapper symlinks
@@ -78,9 +79,6 @@ ln -sf "$(go env GOPATH)/bin/jm" "$(go env GOPATH)/bin/jdocker"
 `jm` decides it is being called as a wrapper from the name of the binary, so
 the links must be called exactly `jpodman` and `jdocker`.
 
-> A binary built by `go install` is not stamped with a version: `jm version`
-> reports `dev`, `none`, `unknown`. That is expected, and it is how jm tells
-> a development build from a release.
 
 ### 3. From source
 
@@ -109,13 +107,14 @@ jm doctor
 
 Every host tool, the state root and every existing machine is checked, with
 a one-line fix for anything that is not `[ ok ]`. Real output on a healthy
-Mac:
+Mac with one running machine (2026-08-21):
 
 ```
-jm dev (none, unknown)
+jm 0.1.2 (8a20dda, 2026-08-21T18:12:58Z)
 
 STATUS  CHECK                        DETAIL
 [ ok ]  host                         darwin/arm64
+[ ok ]  host resolver                queries go through the host resolver (getaddrinfo)
 [ ok ]  backend qemu                 preflight passed
 [ ok ]  qemu-system-aarch64 version  11.1.0 at /opt/homebrew/bin/qemu-system-aarch64
 [ ok ]  qemu-system-aarch64 hvf      Hypervisor.framework accelerator available
@@ -128,13 +127,24 @@ STATUS  CHECK                        DETAIL
 [ ok ]  state root                   /Users/you/.jailmachine
 [ ok ]  socket paths                 58 of 103 bytes used
 [ ok ]  machine jailmachine          running (qemu, gvproxy)
+[ ok ]  resolver jailmachine         127.0.0.1:49900 answers through the host resolver: broadcasthost resolves to [255.255.255.255], as it does on the host
+[ ok ]  guest resolver jailmachine   the guest resolves host.containers.internal to 192.168.127.254, this machine's host resolver
+[ ok ]  shares jailmachine           4 share(s) at their host path: /Users/you (rw), /Volumes (rw), /private/tmp (rw), /var/folders/qb/8x1s7c9d0000gn (rw)
+[ ok ]  share parity jailmachine     a file written in /Users/you is in the guest at the same path
+[ ok ]  datagram limit jailmachine   published udp carries payloads up to 8972 bytes (gvproxy MTU 9000); larger datagrams are dropped, not fragmented. $JM_MTU changes the link size (576..16384; JM_MTU=1500 matches Docker)
+[ ok ]  jpodman                      /opt/homebrew/bin/jpodman
+[ ok ]  jdocker                      /opt/homebrew/bin/jdocker
+[ ok ]  autostart                    on: jpodman/jdocker boot a stopped machine
+[ ok ]  clock jailmachine            in step with the host (jm_rtcsync running)
 
-13 ok, 0 warning(s), 0 failure(s)
+23 ok, 0 warning(s), 0 failure(s)
 ```
 
-The first line is the build identity. `jm dev (none, unknown)` means an
-unstamped build (`go install`, plain `go build`); a Homebrew or `make
-install` build prints its tag, short commit and build date there instead.
+The first line is the build identity: a Homebrew, release or `make install`
+binary prints its tag, short commit and build date from the linker flags, and
+a `go install` or `go build` from a checkout falls back to the module version
+and the VCS revision Go recorded. `jm dev (none, unknown)` appears only for a
+build that had neither.
 
 The `machine …` rows only appear once you have created a machine. Failures
 carry a `fix:` line under the row:
@@ -162,23 +172,27 @@ Measured on an Apple Silicon Mac (2026-08-21):
 
 | | Time |
 |---|---|
-| `jm init` from the published release | about 45–60 s on a fast link, almost all of it the download |
+| `jm init` from the published release | **60–115 s**. The roughly 800 MiB download is about 31 s of it; writing `disk.raw` out is the rest, and it is a bug of ours ([LIMITATIONS](LIMITATIONS.md#the-machine-itself)) |
 | First boot, prebaked image (the default) | about 22 s (32 s measured once with two other VMs already running on the host) |
 | First boot, `--image official:<release>` | about 2 min (packages are installed inside the guest, including one kernel reboot) |
-| Later starts of an existing machine | 12–25 s |
+| Later starts of an existing machine | 12–25 s on an idle Mac (36.7 s measured on a loaded one) |
 
 Most of that is the guest's own boot, so a later start costs much the same
-as the first one on the prebaked path; a busy host adds to both. `jm init`
-is separate and dominated by the download — it fetches the
-`guest-<version>` release asset named by the binary, roughly 800 MiB, then verifies its SHA256 and
-decompresses it sparsely.
+as the first one on the prebaked path; a busy host adds to both. `jm init` is
+separate: it fetches the `guest-<version>` release asset named by the binary,
+roughly 800 MiB, verifies its SHA256 and decompresses it to `disk.raw`. The
+decompression, not the download, is what dominates — an `init` from an image
+already cached on disk still took 59–113 s with no network at all, because
+the sparse writer is not punching holes reliably
+([LIMITATIONS](LIMITATIONS.md#the-machine-itself)).
 
 The guest is FreeBSD, so podman pulls FreeBSD image variants by default.
 **Linux images need `--os=linux`**; native FreeBSD images need nothing, and
 they come from Docker Hub as well as GHCR. Almost everything on Docker Hub
 works — the verified matrix, including the two images that need a
-workaround and the one that does not work at all, is in
-[USAGE.md](USAGE.md#docker-hub-compatibility-verified).
+workaround and the one that runs no further than `node --version`, is in
+[USAGE.md](USAGE.md#docker-hub-compatibility-verified). The complete,
+measured list of limits is [LIMITATIONS.md](LIMITATIONS.md).
 
 Docker clients and compose reach the machine through `jdocker` (`brew install
 docker` for the client), or with `eval "$(jm env)"` for a client you would
@@ -196,8 +210,9 @@ starts a machine unless you or a wrapper asks.
 
 Host directories are shared into the guest at the same absolute path — your
 home tree, `/Volumes`, `/private/tmp` and `$TMPDIR`'s root by default — so
-`-v ~/code:/app` works out of the box. `jm init --mount`, `--no-mounts` and
-`jm set --mount/--unmount` change the set; see
+`-v ~/code:/app` works out of the box. `jm init --mount` and `--no-mounts`
+choose the set at creation; `jm set --mount/--unmount/--no-mounts` changes it
+on a **stopped** machine, from the next start. See
 [USAGE.md](USAGE.md#sharing-host-directories).
 
 ## Upgrade
