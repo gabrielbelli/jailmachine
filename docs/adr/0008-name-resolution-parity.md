@@ -56,4 +56,8 @@ in my browser, so it must work in my container".
   one. Anything that substitutes a self-contained resolver loses scoped and
   link-local names while public ones keep working, an invisible regression,
   so `jm doctor` asserts parity against a name only the host can resolve,
-  comparing the address and not merely that resolution succeeded.
+  comparing the address and not merely that resolution succeeded. The
+  assertion is made of the *running* resolver, over the wire — it reports its
+  own resolution path under a reserved name — because neither the build tag
+  read in another process nor an alias round trip can see the regression:
+  aliases are answered from jm's own table and never reach the host at all.

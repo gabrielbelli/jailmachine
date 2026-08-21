@@ -65,3 +65,30 @@ func TestMappingString(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// The host<->guest link does not fragment, so the number that matters to
+// someone sending datagrams is the MTU less the IPv4 and UDP headers. It was
+// measured against a real gvproxy machine: a 1472-byte payload arrives, 1473
+// is dropped in silence.
+func TestMaxDatagram(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mtu  int
+		want int
+	}{
+		{"gvproxy", 1500, 1472},
+		{"jumbo", 9000, 8972},
+		// A provider that declares nothing must not have a limit invented
+		// for it, and one whose MTU cannot hold a header has no payload
+		// room at all; both read as "unknown".
+		{"undeclared", 0, 0},
+		{"smaller than the headers", 20, 0},
+		{"exactly the headers", 28, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := (Capabilities{MTU: tc.mtu}).MaxDatagram(); got != tc.want {
+				t.Errorf("MTU %d: MaxDatagram = %d, want %d", tc.mtu, got, tc.want)
+			}
+		})
+	}
+}

@@ -33,10 +33,13 @@ type info struct {
 	Ports        []forwarder.Entry `json:"ports"`
 	Forwarder    backend.State     `json:"forwarder_state"`
 	ForwarderLog string            `json:"forwarder_log,omitempty"`
-	// PublishAddr is the host address published ports bind to, resolved
-	// (the record's value or the default); the record's own publish_addr
-	// is omitted when unset.
-	PublishAddr string `json:"publish_addr_effective"`
+	// PublishAddr is the host address published ports bind to when the
+	// publish flag names none — what the *running* forwarder was started
+	// with, which is what is really bound. PublishAddrPending is the
+	// record's value when it has been changed since and is waiting for a
+	// restart. The record's own publish_addr is omitted when unset.
+	PublishAddr        string `json:"publish_addr_effective"`
+	PublishAddrPending string `json:"publish_addr_pending,omitempty"`
 	// FileSharing is whether the backend can export the machine's Shares
 	// (ADR 0007); false with shares configured means they are ignored.
 	FileSharing bool `json:"file_sharing"`
@@ -62,20 +65,22 @@ func describe(m *machine.Machine) info {
 		Forwarder:     backend.Stopped,
 		Resolver:      backend.Stopped,
 	}
-	if fw := forwards(m); fw != nil {
-		i.Ports = fw
+	fw := forwardState(m)
+	if fw.Owned != nil {
+		i.Ports = fw.Owned
 	}
-	i.PublishAddr = forwarder.HostIP(m.PublishAddr)
 	i.Autostart = autostartEnabled()
+	running := false
 	if m.Dir != "" {
 		pr := forwarderProcess(m)
 		i.ForwarderLog = pr.LogPath()
 		if _, ok := pr.Alive(); ok {
-			i.Forwarder = backend.Running
+			i.Forwarder, running = backend.Running, true
 		}
 		rp := resolverProcess(m)
 		i.ResolverLog, i.ResolverAddr, i.Resolver = rp.LogPath(), rp.Addr(), resolverState(m)
 	}
+	i.PublishAddr, i.PublishAddrPending = publishAddrs(m, running, fw)
 	b, p, err := components(m)
 	if err != nil {
 		return i
@@ -115,7 +120,10 @@ state is read from the hypervisor and the network provider on every call.
   created, version, backend_opts, file_sharing, autostart, docker_host,
   shares (array of {host_path, guest_path, read_only, tag}),
   ports (array of {proto, local, remote, since, error}), forwarder_state,
-  forwarder_log, publish_addr (only when set) and publish_addr_effective,
+  forwarder_log, publish_addr (only when set), publish_addr_effective (what
+  the running forwarder binds when -p names no host address) and
+  publish_addr_pending (the record's value when it differs and is waiting
+  for a restart),
   resolver_state, resolver_addr, resolver_log.
 
 Keys whose value is empty are omitted.`
@@ -185,7 +193,12 @@ func newInspectCmd() *cobra.Command {
 			if i.ResolverLog != "" {
 				row("Resolver log", i.ResolverLog)
 			}
-			row("Publish address", i.PublishAddr)
+			if i.PublishAddrPending != "" {
+				row("Publish address", fmt.Sprintf("%s (the record says %s; jm stop%s && jm start%s to apply)",
+					i.PublishAddr, i.PublishAddrPending, nameHint(i.Name), nameHint(i.Name)))
+			} else {
+				row("Publish address", i.PublishAddr)
+			}
 			row("Forwarder", i.Forwarder)
 			if i.ForwarderLog != "" {
 				row("Forwarder log", i.ForwarderLog)

@@ -121,19 +121,28 @@ func Run(ctx context.Context, o Options) Report {
 	return r
 }
 
-// checkHostResolver reports whether this build can reach the host operating
+// checkHostResolver reports whether this jm can reach the host operating
 // system's resolver. Without it jm answers guest queries from Go's own DNS
 // client, which sees neither scoped (VPN) resolvers nor /etc/hosts nor
 // .local: public names keep working and everything private stops, which is
 // exactly the invisible regression ADR 0008 refuses to allow.
+//
+// It asks resolver.SystemMode rather than the build tag alone, because
+// GODEBUG=netdns=go gives the path up at run time in a build that has it.
+// This is still only *this* process; what the resolver serving a machine
+// does is asserted over the wire, per machine, by resolverParityCheck.
 func checkHostResolver() Result {
 	res := Result{Name: "host resolver"}
-	if resolver.HostResolver {
+	if resolver.SystemMode() == resolver.ModeHost {
 		res.Status, res.Detail = OK, "queries go through the host resolver (getaddrinfo)"
 		return res
 	}
 	res.Status = Fail
-	res.Detail = "built with the netgo build tag: name resolution in the guest would miss VPN, /etc/hosts and .local names"
+	if resolver.HostResolver {
+		res.Detail = "GODEBUG=netdns=go is set: name resolution in the guest would miss VPN, /etc/hosts and .local names"
+	} else {
+		res.Detail = "built with the netgo build tag: name resolution in the guest would miss VPN, /etc/hosts and .local names"
+	}
 	res.Fix = "rebuild jm without '-tags netgo' (CGO_ENABLED does not matter on darwin), and do not set GODEBUG=netdns=go"
 	return res
 }

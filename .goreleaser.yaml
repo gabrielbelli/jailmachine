@@ -171,8 +171,16 @@ homebrew_casks:
           # user's docker contexts.
           FileUtils.ln_sf "#{HOMEBREW_PREFIX}/bin/jm", "#{HOMEBREW_PREFIX}/bin/jpodman"
           FileUtils.ln_sf "#{HOMEBREW_PREFIX}/bin/jm", "#{HOMEBREW_PREFIX}/bin/jdocker"
-    # goreleaser's cask hooks have no uninstall phase; the symlink is removed by
-    # brew's zap/uninstall stanza below.
+    # goreleaser's cask hooks have no uninstall phase, so the two symlinks
+    # the post-install hook makes are removed by brew's own uninstall
+    # stanza: zap alone would not do it, being opt-in ("brew uninstall
+    # --zap"), and a plain "brew uninstall" would leave them dangling at a
+    # binary that is no longer there. zap lists them too, for a zap of a
+    # cask whose files were removed by hand.
+    uninstall:
+      delete:
+        - "#{HOMEBREW_PREFIX}/bin/jpodman"
+        - "#{HOMEBREW_PREFIX}/bin/jdocker"
     zap:
       trash:
         - "#{HOMEBREW_PREFIX}/bin/jpodman"

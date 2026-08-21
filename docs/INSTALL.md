@@ -5,9 +5,11 @@
 > published ports reach the host, and bastille jails work inside the guest.
 > Since v0.1.0 it also shares host directories at identical paths, resolves
 > names exactly as the Mac does, starts a stopped machine on demand from
-> `jpodman`/`jdocker`, and ships a `jdocker` wrapper for the docker CLI. Two
-> known gaps are being fixed: `-p 127.0.0.1:PORT:PORT` publishes nothing on
-> the host, and Linux containers cannot bind UDP sockets.
+> `jpodman`/`jdocker`, ships a `jdocker` wrapper for the docker CLI, and
+> publishes ports with docker-identical `-p` semantics, UDP included. The
+> one Linuxulator gap left is narrow: busybox's `nc -u -l` fails where every
+> other UDP server works — see
+> [TROUBLESHOOTING](TROUBLESHOOTING.md#udp-in-a-linux-container).
 
 See [USAGE.md](USAGE.md) for the command reference once jm is installed,
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md) when something misbehaves, and

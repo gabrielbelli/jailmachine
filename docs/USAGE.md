@@ -3,10 +3,11 @@
 > **Still an MVP — a working demo**, but a wider one than v0.1.0. Everything
 > documented on this page is implemented and verified against the binary,
 > including host directory mounts at identical paths, name resolution 1:1
-> with the host, autostart on demand and the `jdocker` wrapper. Two gaps are
-> called out where they bite and are **being fixed**:
-> `-p 127.0.0.1:PORT:PORT` publishes nothing on the host, and Linux
-> containers cannot bind UDP sockets.
+> with the host, autostart on demand, the `jdocker` wrapper and
+> docker-identical `-p` semantics — a host address in the flag binds that
+> address on the **Mac**, as it does under Docker Desktop. UDP works from
+> Linux containers as well, publishing included; the one narrow Linuxulator
+> gap left is called out where it bites.
 
 Install first: [INSTALL.md](INSTALL.md). When something misbehaves, see
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md); for how the pieces fit together,
@@ -74,7 +75,7 @@ finished steps are skipped and a partial download resumes.
 | `--ssh-port <port>` | `2222` | Host loopback port forwarded to the guest's sshd |
 | `--mount <dir>[:ro]` | — | Share a host directory with the guest **at the same absolute path**, on top of the defaults. Repeatable; `:ro` makes it read-only. See [Sharing host directories](#sharing-host-directories) |
 | `--no-mounts` | — | Share nothing at all, not even the defaults |
-| `--publish-addr <addr>` | `0.0.0.0` | Host address published container ports bind to. `127.0.0.1` keeps them off the LAN. See [Publishing ports](#publishing-ports-and---publish-addr) |
+| `--publish-addr <addr>` | `0.0.0.0` | **Default** host address published container ports bind to. `127.0.0.1` keeps them off the LAN; a `-p` that names an address of its own binds that one instead. See [Publishing ports](#publishing-ports-and---publish-addr) |
 
 ```bash
 jm init
@@ -279,7 +280,10 @@ has no file-sharing capability at all.
 `podman_uri`, `podman_sock_uri`, `docker_host`, `api_socket`, `dns`,
 `console`, `network_logs`, `dir`, `provisioned`, `image_trusted`, `created`,
 `version`, `backend_opts`, `ports` (array of `{proto, local, remote, since,
-error}`), `forwarder_state`, `forwarder_log`, `publish_addr_effective`,
+error}`), `forwarder_state`, `forwarder_log`, `publish_addr_effective`
+(what the running forwarder binds when `-p` names no host address),
+`publish_addr_pending` (the record's value when it differs and is waiting for
+a restart),
 `shares` (array of `{host_path, guest_path, read_only, tag}`),
 `file_sharing`, `resolver_state`, `resolver_addr`, `resolver_log` and
 `autostart`. Empty values are omitted.
@@ -362,30 +366,29 @@ jm ports
 ```
 
 ```
-# publishing on 0.0.0.0
-LOCAL         REMOTE              PROTO  STATUS
-0.0.0.0:8080  192.168.127.2:8080  tcp    ok
-0.0.0.0:5432  192.168.127.2:5432  tcp    error: listen tcp 0.0.0.0:5432: address already in use
-0.0.0.0:7070  -                   tcp    error: guest binds 127.0.0.1 only; publish with -p 7070:7070 (or 0.0.0.0)
+# publishing on 0.0.0.0 unless -p names a host address
+LOCAL           REMOTE              PROTO  STATUS
+0.0.0.0:8080    192.168.127.2:8080  tcp    ok
+0.0.0.0:5432    192.168.127.2:5432  tcp    error: another process on this Mac already holds this host port
+127.0.0.1:8082  192.168.127.2:8082  tcp    ok
+[::1]:8087      192.168.127.2:8087  tcp    ok
 ```
 
-`LOCAL` is the host side, `REMOTE` the guest side. A publish that names no
-host address binds the machine's **publish address**, `0.0.0.0` by default —
-every interface, as `docker run -p` does on Linux. A `#` comment line above
-the table says which address that is.
+`LOCAL` is the host side, `REMOTE` the guest side. Rows no longer share one
+host address: `-p 8080:80` binds the machine's **publish address** (`0.0.0.0`
+by default — every interface, as `docker run -p` does on Linux), while
+`-p 127.0.0.1:8082:80` binds your loopback and only that. The `#` comment
+line names the default, not the whole table.
 
-`STATUS` is `ok`, or `error: <cause>` — a host port already in use, a
-provider that could not be reached, or a publish that cannot be forwarded at
-all. Failed mappings are retried on every resync, so the error is a live
-status, not a permanent verdict.
+After `jm set --publish-addr` on a running machine, a second `#` line names
+the record's new address and says the running forwarder keeps the old one
+until `jm stop && jm start`. `jm inspect` says the same on its
+`Publish address:` row.
 
-A `REMOTE` of `-` is a mapping that is never forwarded, which is what
-`-p 127.0.0.1:7070:7070` looks like: podman bound it to the **guest's**
-loopback, so there is nothing outside the guest to forward to. Publish
-without a host address and set the host-side address with
-`jm set --publish-addr 127.0.0.1` instead. **This is a gap being fixed**, not
-a design decision — a host IP in `-p` should confine the mapping to that
-address on the Mac.
+`STATUS` is `ok`, or `error: <cause>` — a host port already in use, an
+address your Mac does not have, a provider that could not be reached, or a
+guest-side redirect not yet in place. Failed mappings are retried on every
+resync, so the error is a live status, not a permanent verdict.
 
 If the forwarder is not running, a `#` comment line says so above the table.
 The exit code is still `0`.
@@ -405,7 +408,7 @@ Change a machine's resources.
 | `--ssh-port <port>` | machine stopped | Host port forwarded to the guest's sshd, 1–65535 |
 | `--mount <dir>[:ro]` | takes effect on the next start | Share a host directory at the same absolute path. Repeatable |
 | `--unmount <dir>` | takes effect on the next start | Stop sharing a host directory. Repeatable |
-| `--publish-addr <addr>` | takes effect on the next start | Host address published ports bind to |
+| `--publish-addr <addr>` | takes effect on the next start | **Default** host address published ports bind to; a `-p` that names one binds that instead |
 
 `--mount`, `--unmount` and `--publish-addr` are accepted while the machine
 runs — they are recorded, and jm prints the `jm stop && jm start` needed to
@@ -945,11 +948,12 @@ guest with whatever resolution it already had. `jm doctor` reports the loss
 and `resolver.log` says why; `jm inspect` shows `Resolver:` and
 `Resolver address:`.
 
-> **Known gap, being fixed:** Linux containers cannot bind UDP sockets under
-> the Linuxulator. Resolution inside a Linux container still works — the
-> guest's `local_unbound` does the UDP for it — but a Linux container that
-> runs its *own* resolver, or any Linux UDP service, will fail to bind.
-> Native FreeBSD containers are unaffected.
+> A Linux container that runs its **own** resolver works too: UDP sockets
+> bind, send and receive normally under the Linuxulator, so a container
+> talking to `/etc/resolv.conf` itself gets the same answers the guest's
+> `local_unbound` would give it. See
+> [UDP from a container](#udp-from-a-container) for the one idiom that does
+> not work.
 
 ---
 
@@ -986,10 +990,22 @@ finds the machine running by the time it gets in.
 
 # Publishing ports and `--publish-addr`
 
-`-p` works as on any other machine: the detached forwarder watches podman
-events and converges gvproxy's mapping table onto the guest's containers
-(ADR 0004). What differs from a Linux box is only *which host address* the
-mapping binds.
+`-p` works as on any other machine, and the address you write in it means
+what it means under Docker Desktop: **the address on your Mac**. The
+detached forwarder watches podman events and converges gvproxy's mapping
+table onto the guest's containers (ADR 0004).
+
+| You type | Bound on the Mac |
+|---|---|
+| `-p 8080:80` | the machine's **publish address** — `0.0.0.0` by default, every interface |
+| `-p 0.0.0.0:8080:80` | every interface, whatever the machine's default is |
+| `-p 127.0.0.1:8080:80` | your loopback only; the LAN gets connection refused |
+| `-p [::1]:8080:80` | your IPv6 loopback only |
+| `-p 192.168.0.18:8080:80` | that address only; an address your Mac does not have is a per-mapping error, as under docker |
+| `-p 8080-8082:80-82`, `-p 8080:80/udp` | as above, one mapping per port, protocol preserved |
+
+`-p localhost:8080:80` is the one docker spelling that does not reach jm at
+all: podman rejects the name client-side.
 
 **The default is `0.0.0.0` — every interface — as `docker run -p` does on
 Linux.** `127.0.0.1`, `::1`, `localhost` and your Mac's LAN address all reach
@@ -1002,19 +1018,128 @@ JM_PUBLISH_ADDR=127.0.0.1 jm start      # for this boot, folded into the record
 jm ports                                # "# publishing on ..." above the table
 ```
 
+`--publish-addr` is the **default** for a `-p` that names no address of its
+own. It never overrides one that does: on a machine publishing on the LAN,
+`-p 127.0.0.1:8080:80` is still your loopback and nothing else.
+
 The address is a property of the **machine**, not of the shell that happened
 to boot it. The forwarder runs detached, so a variable read inside it would
 be invisible to `jm inspect` and `jm ports` and would change under you the
 next time anyone ran a plain `jm start`. `$JM_PUBLISH_ADDR` is therefore
 folded into the record at start time, and `jm inspect` shows
-`Publish address:`.
+`Publish address:`. A running forwarder keeps binding the address it started
+with: after `jm set --publish-addr`, `jm ports` and `jm inspect` show what is
+really bound and mark the record's new value as waiting for a restart.
 
-> **Known gap, being fixed:** naming a host address in the flag itself,
-> `-p 127.0.0.1:8080:80`, publishes **nothing** on the Mac. podman binds that
-> address inside the *guest*, so there is nothing outside the guest to
-> forward; `jm ports` lists the mapping with an empty `REMOTE` and the
-> reason. Until it is fixed, publish as `-p 8080:80` and choose the host-side
-> address with `--publish-addr`.
+### How a host address in `-p` is made to work
+
+The engine inside the guest reads that address as a *guest*-side bind
+address: `-p 127.0.0.1:8080:80` makes it redirect the **guest's** loopback,
+where nothing on the Mac can reach it. jm therefore does both halves itself —
+it binds `127.0.0.1:8080` on the Mac through gvproxy, and loads a redirect of
+its own into a pf anchor (`rdr/jm`) inside the guest so that the port is
+reachable at the guest's address, which is where gvproxy delivers. The anchor
+is rewritten whole on every change, so it is always exactly the current
+container set and never accumulates.
+
+Two consequences worth knowing:
+
+- the guest leg is IPv4 even for `-p [::1]:…`: the container network is
+  `10.88.0.0/16`. What you observe matches docker; the plumbing does not;
+- while the redirect is not in place yet (a container that has just started,
+  a guest that could not be reached), the host port is bound but nothing
+  answers, and `jm ports` shows the reason on that mapping. The next resync
+  fixes it.
+
+## UDP from a container
+
+UDP works, from native FreeBSD containers and Linux ones alike. Binding,
+sending, receiving, DNS-over-UDP and publishing with `-p <host>:<port>/udp`
+were all verified end to end, reached from the Mac's loopback and from its
+LAN address:
+
+```bash
+jpodman run -d --name udpecho --os=linux -p 5354:53/udp docker.io/alpine \
+  sh -c 'apk add -q socat && exec socat UDP4-RECVFROM:53,fork SYSTEM:"tr a-z A-Z"'
+
+echo "hello from the mac" | nc -u -w3 127.0.0.1 5354   # -> HELLO FROM THE MAC
+echo "over the lan"       | nc -u -w3 192.168.0.18 5354 # -> OVER THE LAN
+```
+
+`jm ports` lists a udp mapping like any other:
+
+```
+LOCAL         REMOTE              PROTO  STATUS
+0.0.0.0:5354  192.168.127.2:5354  udp    ok
+```
+
+### The one thing that does not work: busybox `nc -u -l`
+
+```
+$ jpodman run --rm --os=linux docker.io/alpine sh -c 'nc -u -l -p 9999'
+nc: can't connect to remote host: Address family not supported by protocol
+```
+
+This is busybox's UDP listener alone, not UDP. To learn who is talking to it
+so it can reply, busybox peeks the sender's address with a **zero-length**
+`recvmsg()` and then `connect()`s the socket to whatever came back. On Linux
+that call blocks until a datagram arrives and fills in the address; on
+FreeBSD — as on macOS, and in the guest outside any container — it returns
+`0` immediately with no address, so busybox connects to an all-zero sockaddr
+and gets `EAFNOSUPPORT`. The Linuxulator inherits the FreeBSD behaviour
+verbatim. It is a blocking-semantics gap, not a missing address family: a
+`recvmsg()` with even one byte of buffer blocks on all three systems.
+
+Anything that is not that idiom is fine:
+
+```bash
+# a real netcat
+jpodman run --rm --os=linux docker.io/alpine \
+  sh -c 'apk add -q netcat-openbsd && nc -u -l -p 9999'
+
+# socat
+jpodman run --rm --os=linux docker.io/alpine \
+  sh -c 'apk add -q socat && socat UDP4-RECVFROM:9999,fork SYSTEM:"tr a-z A-Z"'
+```
+
+### Datagrams are capped at 1472 bytes
+
+The host-to-guest link is gvproxy's, with an MTU of 1500, and **it does not
+fragment**. A UDP payload of 1472 bytes (1500 less the 20-byte IPv4 and
+8-byte UDP headers) arrives; 1473 is dropped in silence, with no error on
+either side and nothing in any log:
+
+```
+1470 bytes -> reply 1470
+1472 bytes -> reply 1472
+1473 bytes -> no reply
+4000 bytes -> no reply
+```
+
+TCP never meets this — the stack segments to fit — so it only shows up on
+UDP. `jm doctor` prints the number for each machine:
+
+```
+[ ok ]  datagram limit dev   published udp carries payloads up to 1472 bytes (gvproxy MTU 1500); larger datagrams are dropped, not fragmented
+```
+
+Design for it as you would for any other network: keep datagrams under
+1472 bytes, or use TCP. DNS is unaffected in practice — a reply that does
+not fit falls back to TCP, which is exactly what the truncation bit is for.
+
+### Picking a host port
+
+Choose the host side of a UDP publish with the Mac in mind: macOS runs
+mDNSResponder on `5353/udp`, so `-p 5353:53/udp` collides with it and any
+other listener on that port. jm reports the collision per mapping rather
+than failing the container:
+
+```
+0.0.0.0:5353  192.168.127.2:5353  udp  error: another process on this Mac already holds this host port (lsof -nP -iUDP:5353); publish the container on a different host port
+```
+
+Publish on a free port instead — `-p 5354:53/udp`. The mapping is retried on
+every resync, so freeing the port is enough to make it come up.
 
 ---
 
@@ -1070,10 +1195,9 @@ answers `404` rather than a page.
 
 A plain `-p 8080:80` binds the machine's publish address, `0.0.0.0` by
 default — so `curl http://localhost:8080/` works, and so does anyone else on
-your network. `jm set --publish-addr 127.0.0.1` confines it to your loopback.
-Naming an address in the publish itself — `-p 127.0.0.1:8080:80` — binds the
-**guest's** loopback and publishes nothing on the Mac; `jm ports` reports the
-mapping with an empty `REMOTE` and the reason. See
+your network. `jm set --publish-addr 127.0.0.1` changes that default, and
+naming an address in the publish itself — `-p 127.0.0.1:8080:80` — confines
+that one mapping to your Mac's loopback, exactly as under Docker Desktop. See
 [Publishing ports and `--publish-addr`](#publishing-ports-and---publish-addr).
 
 ## Run a jail with bastille
@@ -1286,12 +1410,12 @@ Each image is run with `timeout 120`, its exit status captured from the
 
 Stated plainly, so you can plan around it.
 
-**Being fixed right now:**
+**Known limits, narrow ones:**
 
-| Gap | What it looks like / what instead |
+| Limit | What it looks like / what instead |
 |---|---|
-| `-p 127.0.0.1:8080:80` publishes nothing | podman binds the address inside the *guest*; `jm ports` shows an empty `REMOTE` and the reason. Use `-p 8080:80` plus `jm set --publish-addr 127.0.0.1` |
-| Linux containers cannot bind UDP sockets | Any Linux UDP service — including a resolver of the container's own — fails to bind under the Linuxulator. Native FreeBSD containers are unaffected, and ordinary DNS lookups from a Linux container still work |
+| busybox `nc -u -l` in a Linux container | Fails with `Address family not supported by protocol`. It is the only known casualty of FreeBSD returning at once from a zero-length `recvmsg()` where Linux blocks. UDP itself works — `apk add netcat-openbsd`, `socat`, or any real UDP server. See [UDP from a container](#udp-from-a-container) |
+| UDP datagrams over 1472 bytes | Dropped in silence: the gvproxy link is MTU 1500 and does not fragment. `jm doctor` states the limit per machine. Keep datagrams under it, or use TCP. See [Datagrams are capped at 1472 bytes](#datagrams-are-capped-at-1472-bytes) |
 
 **Not planned for the MVP:**
 

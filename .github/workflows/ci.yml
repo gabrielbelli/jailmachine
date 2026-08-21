@@ -12,10 +12,12 @@ on:
 permissions:
   contents: read
 
-# A push and its pull_request event share a group (head_ref falls back to
-# ref), so a PR branch does not run the whole matrix twice.
+# A push and its pull_request event share a group, so a PR branch does not
+# run the whole matrix twice: head_ref is the bare branch name on a
+# pull_request and empty on a push, where ref_name is that same bare name
+# (github.ref would be "refs/heads/<branch>", which never collides).
 concurrency:
-  group: ci-${{ github.head_ref || github.ref }}
+  group: ci-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
@@ -47,6 +49,12 @@ jobs:
         run: go vet ./...
       - name: unit tests
         run: go test ./...
+      # The resolver is the most concurrent thing here (a DNS server with a
+      # goroutine per datagram, a TCP listener and an alias table refreshed
+      # in the background), so the race detector is not optional: a fixture
+      # race would otherwise hide a real one.
+      - name: unit tests (race detector)
+        run: go test -race ./...
       - name: cross-compile build-only targets
         if: runner.os == 'Linux'
         run: |

@@ -66,7 +66,7 @@ func TestServeAnswersOverUDPAndTCP(t *testing.T) {
 	for i := 0; i < 120; i++ {
 		many = append(many, net.IPv4(10, 1, byte(i/256), byte(i%256)))
 	}
-	sys.ips["big.example"] = many
+	sys.setIPs("big.example", many)
 	ips, err = r.LookupIP(ctx, "ip4", "big.example.")
 	if err != nil {
 		t.Fatalf("tcp lookup: %v", err)

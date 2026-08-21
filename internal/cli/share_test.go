@@ -100,50 +100,76 @@ func TestInitOptsShares(t *testing.T) {
 			t.Fatalf("--mount dropped the default share %s from %+v", s.HostPath, got)
 		}
 	}
-	// The default set is whatever of the default roots this host has, and
-	// it always includes the home directory.
+	// The default set is a rule, not a list of paths: whichever of the
+	// default roots this host has, each shared read-write at its own
+	// absolute path (ADR 0007), always covering the home directory. Both
+	// halves of that hold on any Unix, which is what lets "go test ./..."
+	// pass on the Linux CI runner as well as on the macOS one, where the
+	// roots the rule picks up happen to be the macOS ones.
 	got, err = initOpts{}.shares()
 	if err != nil {
 		t.Fatal(err)
 	}
-	home, _ := os.UserHomeDir()
-	home, _ = filepath.EvalSymlinks(home)
-	var found bool
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err = machine.CanonicalHostPath(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var homeShared bool
 	for _, s := range got {
-		if s.HostPath == home || strings.HasPrefix(home, s.HostPath+"/") {
-			found = true
-		}
 		if s.GuestPath != s.HostPath {
 			t.Errorf("identity-path rule broken: %+v", s)
 		}
+		if s.HostPath == home || strings.HasPrefix(home, s.HostPath+"/") {
+			homeShared = true
+			if s.ReadOnly {
+				t.Errorf("the home directory is shared read-only: %+v", s)
+			}
+		}
 	}
-	if !found {
+	if !homeShared {
 		t.Errorf("default shares %v do not cover the home directory %s", got, home)
 	}
-	// ... and the per-user temporary directory, where "mktemp -d" and
-	// os.MkdirTemp put things: without it "-v $(mktemp -d):/app" would
-	// mount an empty guest directory (ADR 0007).
-	//
-	// This half is macOS-shaped, like the feature: userTempRoot only
-	// recognises the /var/folders/<hash> layout, so on a Linux CI runner
-	// $TMPDIR is /tmp, no default root covers it, and there is nothing to
-	// assert. jm has no Linux backend, so that is correct rather than a
-	// gap -- but the assertion has to say so, or "go test ./..." on
-	// ubuntu-latest fails on a platform the feature does not target.
+	// A root the host does not have is dropped rather than shared: /Volumes
+	// exists on macOS and not on a Linux runner, and either way the set
+	// agrees with the filesystem.
+	for _, root := range defaultMountRoots() {
+		canonical, err := machine.CanonicalHostPath(root)
+		if err != nil {
+			continue
+		}
+		st, statErr := os.Stat(root)
+		exists := statErr == nil && st.IsDir()
+		// A root nested in one already shared is folded into it
+		// (NormaliseShares), so its own entry is not expected; what must
+		// never happen is an entry for a root that is not there.
+		if !exists && hasShare(got, canonical, false) {
+			t.Errorf("%s does not exist on this host but is shared: %+v", root, got)
+		}
+	}
+	// $TMPDIR is where "mktemp -d" and os.MkdirTemp put things, so a
+	// "-v $(mktemp -d):/app" has to reach the guest (ADR 0007). The share
+	// that carries it is userTempRoot's, which only recognises the macOS
+	// /var/folders/<hash> layout; on a host without it $TMPDIR is /tmp,
+	// covered by no default root, and the rule has nothing to say.
 	if userTempRoot() == "" {
-		t.Skipf("no per-user temp root on %s ($TMPDIR=%s); the default-share set is macOS-shaped", runtime.GOOS, os.TempDir())
+		t.Logf("no per-user temp root on %s ($TMPDIR=%s); that half of the default set is macOS-shaped", runtime.GOOS, os.TempDir())
+		return
 	}
 	tmp, err := machine.CanonicalHostPath(os.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	found = false
+	var tmpShared bool
 	for _, s := range got {
 		if s.HostPath == tmp || strings.HasPrefix(tmp, s.HostPath+"/") {
-			found = true
+			tmpShared = true
 		}
 	}
-	if !found {
+	if !tmpShared {
 		t.Errorf("default shares %v do not cover $TMPDIR %s", got, tmp)
 	}
 }

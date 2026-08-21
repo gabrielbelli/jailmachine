@@ -15,8 +15,9 @@ import (
 // user the next time anyone ran a plain "jm start".
 
 // publishAddrFlagUsage is shared by "jm init" and "jm set".
-const publishAddrFlagUsage = "host address published container ports bind to (default " +
-	forwarder.DefaultHostIP + ", every interface, as docker does on Linux; 127.0.0.1 keeps them off the LAN)"
+const publishAddrFlagUsage = "default host address published container ports bind to (default " +
+	forwarder.DefaultHostIP + ", every interface, as docker does on Linux; 127.0.0.1 keeps them off the LAN). " +
+	"A -p that names a host address of its own binds that address instead"
 
 // parsePublishAddr validates a --publish-addr value as a usage error.
 func parsePublishAddr(v string) (string, error) {
@@ -47,6 +48,18 @@ func applyPublishAddrEnv(m *machine.Machine) error {
 		forwarder.HostIP(m.PublishAddr), forwarder.HostIP(addr), forwarder.PublishAddrEnv)
 	m.PublishAddr = addr
 	return store().Save(m)
+}
+
+// publishAddrs reports the publish address that is really in force and, when
+// the record has been changed since the forwarder started, the one waiting
+// for a restart. A running forwarder goes on binding what it booted with, so
+// "jm ports" and "jm inspect" must not read the record back as fact.
+func publishAddrs(m *machine.Machine, running bool, st *forwarder.State) (inForce, pending string) {
+	record := forwarder.HostIP(m.PublishAddr)
+	if running && st != nil && st.PublishAddr != "" && st.PublishAddr != record {
+		return st.PublishAddr, record
+	}
+	return record, ""
 }
 
 // publishAddrNote is the line "jm set" prints when the address changed on a

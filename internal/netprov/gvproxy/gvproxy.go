@@ -167,7 +167,7 @@ func (Provider) Logs(m *machine.Machine) []string {
 // Capabilities implements netprov.Provider: gvproxy is a host process that
 // can die independently of the hypervisor.
 func (Provider) Capabilities() netprov.Capabilities {
-	return netprov.Capabilities{Supervised: true}
+	return netprov.Capabilities{Supervised: true, MTU: MTU}
 }
 
 // Endpoint implements netprov.Provider.

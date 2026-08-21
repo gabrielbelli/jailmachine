@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -52,13 +54,17 @@ func TestDesired(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Every reachable port binds every host interface, as docker does on
-	// Linux: "-p 8080:80" is reachable at 127.0.0.1, ::1 and the host's
-	// LAN address. The range becomes one mapping per port, udp keeps its
-	// protocol, and the duplicate host port is published once.
+	// A publish that names no host address binds every host interface, as
+	// docker does on Linux. One that names a host address binds that
+	// address and only that one — again as docker does — which is why
+	// 0.0.0.0:8443 and 127.0.0.1:7070 are here rather than in an apology.
+	// The range becomes one mapping per port, udp keeps its protocol, and
+	// the duplicate host port is published once.
 	want := []netprov.Mapping{
 		{Proto: "tcp", Local: "0.0.0.0:7071", Remote: guest + ":7071"},
 		{Proto: "tcp", Local: "0.0.0.0:8080", Remote: guest + ":8080"},
+		{Proto: "tcp", Local: "0.0.0.0:8443", Remote: guest + ":8443"},
+		{Proto: "tcp", Local: "127.0.0.1:7070", Remote: guest + ":7070"},
 		{Proto: "udp", Local: "0.0.0.0:6000", Remote: guest + ":6000"},
 		{Proto: "udp", Local: "0.0.0.0:6001", Remote: guest + ":6001"},
 		{Proto: "udp", Local: "0.0.0.0:6002", Remote: guest + ":6002"},
@@ -66,30 +72,34 @@ func TestDesired(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("Desired =\n%v\nwant\n%v", got, want)
 	}
-	// A published port that names a host address is bound inside the guest
-	// (or, for the literal wildcard, redirected to an address no packet
-	// carries): not exposed, reported with a reason instead.
-	_, skipped, err := Plan([]byte(psJSON), guest, "")
+	// The two that name a host address are the two the engine leaves
+	// unreachable inside the guest, so jm redirects them itself; the rest
+	// need nothing.
+	pl, err := Compute([]byte(psJSON), guest, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(skipped) != 2 {
-		t.Fatalf("Plan skipped = %+v", skipped)
+	if len(pl.Unpublishable) != 0 {
+		t.Errorf("Unpublishable = %+v, want none", pl.Unpublishable)
 	}
-	if skipped[0].Local != "0.0.0.0:8443" || skipped[0].Remote != "" ||
-		!strings.Contains(skipped[0].Error, "never matches") ||
-		!strings.Contains(skipped[0].Error, "-p 8443:443") {
-		t.Errorf("Plan skipped wildcard = %+v", skipped[0])
+	wantRules := map[int]string{8443: "a1", 7070: "f6"}
+	if len(pl.Rules) != len(wantRules) {
+		t.Fatalf("rules = %+v", pl.Rules)
 	}
-	// The remedy must name the machine's publish address as well as the
-	// bare "-p": "-p 7070:80" on its own publishes on every interface, so
-	// advising it alone answers "keep this off the LAN" with "put it on
-	// the LAN".
-	if skipped[1].Local != "127.0.0.1:7070" || skipped[1].Remote != "" ||
-		!strings.Contains(skipped[1].Error, "guest's own loopback") ||
-		!strings.Contains(skipped[1].Error, "-p 7070:80") ||
-		!strings.Contains(skipped[1].Error, "--publish-addr 127.0.0.1") {
-		t.Errorf("Plan skipped loopback = %+v", skipped[1])
+	for _, r := range pl.Rules {
+		if id, ok := wantRules[r.GuestPort]; !ok || r.ContainerID != id || r.GuestIP != guest {
+			t.Errorf("rule %+v is not one of %v", r, wantRules)
+		}
+	}
+	// A rule is only worth loading once its container's address is known.
+	if AnchorText(pl.Rules) != "" {
+		t.Error("an unresolved rule reached the anchor")
+	}
+	pl.Resolve(map[string]string{"a1": "10.88.0.4", "f6": "10.88.0.7"})
+	if got, want := AnchorText(pl.Rules),
+		"rdr pass inet proto tcp from any to "+guest+" port = 7070 -> 10.88.0.7 port 80\n"+
+			"rdr pass inet proto tcp from any to "+guest+" port = 8443 -> 10.88.0.4 port 443\n"; got != want {
+		t.Errorf("AnchorText =\n%q\nwant\n%q", got, want)
 	}
 	// Empty and "[]" outputs are empty sets; garbage is an error.
 	for _, in := range []string{"", "[]", "null"} {
@@ -388,17 +398,46 @@ func TestRelevant(t *testing.T) {
 // fakeEngine serves a scripted ps output and an event stream fed through a
 // pipe.
 type fakeEngine struct {
-	mu     sync.Mutex
-	ps     []byte
-	events *io.PipeReader
-	w      *io.PipeWriter
-	opened int
+	mu        sync.Mutex
+	ps        []byte
+	ips       map[string]string
+	inspected []string
+	events    *io.PipeReader
+	w         *io.PipeWriter
+	opened    int
+	listed    int
 }
 
 func (e *fakeEngine) PS(context.Context) ([]byte, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.listed++
 	return e.ps, nil
+}
+
+// reconciles counts the resyncs so far: every one lists the containers.
+func (e *fakeEngine) reconciles() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.listed
+}
+
+// Inspect answers with the addresses the test gave it, in the shape podman
+// prints.
+func (e *fakeEngine) Inspect(_ context.Context, ids []string) ([]byte, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.inspected = append(e.inspected, ids...)
+	var b strings.Builder
+	b.WriteByte('[')
+	for i, id := range ids {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"Id":%q,"NetworkSettings":{"Networks":{"podman":{"IPAddress":%q}}}}`, id, e.ips[id])
+	}
+	b.WriteByte(']')
+	return []byte(b.String()), nil
 }
 
 func (e *fakeEngine) setPS(b []byte) {
@@ -441,12 +480,12 @@ func TestRunReactsToEvents(t *testing.T) {
 	if _, err := io.WriteString(w, `{"Name":"web","Status":"start","Type":"container"}`+"\n"); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, func() bool { exposed, _ := p.calls(); return len(exposed) == 5 })
+	waitFor(t, func() bool { exposed, _ := p.calls(); return len(exposed) == 7 })
 
 	// Stream drops: the forwarder resyncs (container gone) and reconnects.
 	eng.setPS([]byte("[]"))
 	_ = w.Close()
-	waitFor(t, func() bool { _, un := p.calls(); return len(un) == 5 })
+	waitFor(t, func() bool { _, un := p.calls(); return len(un) == 7 })
 
 	cancel()
 	if err := <-done; err != nil {
@@ -615,7 +654,7 @@ func TestConvergeReportsUnpublishableOnce(t *testing.T) {
 	st := &State{}
 	skipped := []Entry{{Proto: "tcp", Local: "127.0.0.1:8091", Error: "binds the guest's own loopback"}}
 
-	res, err := ConvergeWith(ctx, p, m, nil, skipped, st, path)
+	res, err := ConvergeWith(ctx, p, m, Plan{Unpublishable: skipped}, st, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -626,7 +665,7 @@ func TestConvergeReportsUnpublishableOnce(t *testing.T) {
 		t.Errorf("first sight: %q", res)
 	}
 
-	res, err = ConvergeWith(ctx, p, m, nil, skipped, st, path)
+	res, err = ConvergeWith(ctx, p, m, Plan{Unpublishable: skipped}, st, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -636,4 +675,313 @@ func TestConvergeReportsUnpublishableOnce(t *testing.T) {
 	if exposed, unexposed := p.calls(); len(exposed) != 0 || len(unexposed) != 0 {
 		t.Errorf("the provider was touched: %v %v", exposed, unexposed)
 	}
+}
+
+// fakeGuest records every rule set loaded into the guest's anchor and
+// keeps the last one as the anchor's content, so that a test can drop it
+// behind the forwarder's back the way a guest reboot, "service pf restart"
+// or "pfctl -F nat" does.
+type fakeGuest struct {
+	mu      sync.Mutex
+	loaded  []string
+	current string
+	err     error
+}
+
+func (g *fakeGuest) ApplyRules(_ context.Context, text string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.err != nil {
+		return g.err
+	}
+	g.loaded = append(g.loaded, text)
+	g.current = text
+	return nil
+}
+
+// anchor is what the guest holds now.
+func (g *fakeGuest) anchor() string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.current
+}
+
+// drop empties the anchor without telling the forwarder, as the guest
+// itself can at any moment.
+func (g *fakeGuest) drop() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.current = ""
+}
+
+func (g *fakeGuest) calls() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]string(nil), g.loaded...)
+}
+
+// The guest-side half of publishing: a "-p 127.0.0.1:8080:80" is bound on
+// the host's loopback and made reachable inside the guest by a rule jm
+// loads itself, because the engine bound the guest's loopback instead. The
+// anchor is loaded whole and only when it changes, so an idle machine costs
+// no SSH round trips, and a machine with nothing published has its anchor
+// cleared once at startup rather than left with a dead forwarder's rules.
+func TestRunLoadsGuestRedirects(t *testing.T) {
+	r, w := io.Pipe()
+	defer w.Close()
+	eng := &fakeEngine{ps: []byte("[]"), events: r, w: w,
+		ips: map[string]string{"a1": "10.88.0.4", "f6": "10.88.0.7"}}
+	g := &fakeGuest{}
+	p := newFake()
+	path := filepath.Join(t.TempDir(), StateFile)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Config{
+			Provider: p, Machine: &machine.Machine{Name: "t"}, GuestIP: guest, HostIP: "127.0.0.1",
+			Engine: eng, Guest: g, StatePath: path, Log: log.New(io.Discard, "", 0),
+			Resync: 20 * time.Millisecond, Debounce: time.Millisecond,
+			MinBackoff: 10 * time.Millisecond, MaxBackoff: 20 * time.Millisecond,
+		})
+	}()
+	// Nothing published: the anchor is cleared once, then left alone.
+	waitFor(t, func() bool { return len(g.calls()) == 1 })
+	if got := g.calls()[0]; got != "" {
+		t.Errorf("first load = %q, want the anchor flushed", got)
+	}
+
+	eng.setPS([]byte(psJSON))
+	waitFor(t, func() bool {
+		for _, text := range g.calls() {
+			if strings.Contains(text, "port = 7070 -> 10.88.0.7 port 80") {
+				return true
+			}
+		}
+		return false
+	})
+	// Only the containers that need a redirect are inspected.
+	eng.mu.Lock()
+	inspected := append([]string(nil), eng.inspected...)
+	eng.mu.Unlock()
+	for _, id := range inspected {
+		if id != "a1" && id != "f6" {
+			t.Errorf("inspected %q, which publishes nothing that needs a redirect", id)
+		}
+	}
+	// A steady state does not rewrite the anchor on every reconcile: the
+	// memo spares the SSH round trip. It is not "never" — every
+	// ReloadEvery-th timer resync writes it again on purpose, because the
+	// memo is a belief about a guest that can lose its pf state without
+	// telling anyone (TestRunReloadsGuestAnchorAfterTheGuestLosesIt).
+	before, reconciled := len(g.calls()), eng.reconciles()
+	time.Sleep(120 * time.Millisecond)
+	rewrites, reconciles := len(g.calls())-before, eng.reconciles()-reconciled
+	if rewrites*2 > reconciles {
+		t.Errorf("anchor rewritten %d times in %d reconciles with nothing changed; the memo is not sparing the round trip", rewrites, reconciles)
+	}
+	// The redirected mappings are ok, not errors: both halves are in place.
+	on, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(on.Errors()) != 0 {
+		t.Errorf("errors = %+v, want none", on.Errors())
+	}
+	if on.PublishAddr != "127.0.0.1" {
+		t.Errorf("state publish_addr = %q, want the address this forwarder binds", on.PublishAddr)
+	}
+	// A publish that names a host address binds it, not the machine's
+	// default: "-p 127.0.0.1:7070:80" on a machine publishing on
+	// 127.0.0.1 is still the loopback, and -p 0.0.0.0:8443:443 is not.
+	var seen []string
+	for _, e := range on.Owned {
+		seen = append(seen, e.Local)
+	}
+	sort.Strings(seen)
+	want := []string{"0.0.0.0:8443", "127.0.0.1:6000", "127.0.0.1:6001", "127.0.0.1:6002",
+		"127.0.0.1:7070", "127.0.0.1:7071", "127.0.0.1:8080"}
+	if !reflect.DeepEqual(seen, want) {
+		t.Errorf("owned locals = %v, want %v", seen, want)
+	}
+
+	// The containers go away: the anchor is emptied again.
+	eng.setPS([]byte("[]"))
+	waitFor(t, func() bool {
+		c := g.calls()
+		return len(c) > 1 && c[len(c)-1] == ""
+	})
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The rule set the forwarder last loaded is a belief about the guest, not
+// a reading of it: the guest can lose its pf state on its own (a reboot
+// with restart-policy containers coming back on the same addresses,
+// "service pf restart", "pfctl -F nat") without anything in the desired
+// state changing. Skipping the reload because the plan is unchanged would
+// leave every host-bound publish bound on the host and answering nothing,
+// while "jm ports" still said ok. So the loop reloads the anchor
+// unconditionally every ReloadEvery timer resyncs, whatever the memo says.
+func TestRunReloadsGuestAnchorAfterTheGuestLosesIt(t *testing.T) {
+	r, w := io.Pipe()
+	defer w.Close()
+	eng := &fakeEngine{ps: []byte(psJSON), events: r, w: w,
+		ips: map[string]string{"a1": "10.88.0.4", "f6": "10.88.0.7"}}
+	g := &fakeGuest{}
+	p := newFake()
+	path := filepath.Join(t.TempDir(), StateFile)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Config{
+			Provider: p, Machine: &machine.Machine{Name: "t"}, GuestIP: guest,
+			Engine: eng, Guest: g, StatePath: path, Log: log.New(io.Discard, "", 0),
+			Resync: 20 * time.Millisecond, Debounce: time.Millisecond,
+			MinBackoff: 10 * time.Millisecond, MaxBackoff: 20 * time.Millisecond,
+			ReloadEvery: 1,
+		})
+	}()
+	const rule = "port = 7070 -> 10.88.0.7 port 80"
+	waitFor(t, func() bool { return strings.Contains(g.anchor(), rule) })
+
+	// The guest flushes the anchor behind the forwarder's back.
+	g.drop()
+	waitFor(t, func() bool { return strings.Contains(g.anchor(), rule) })
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A dropped event stream is a gap in what jm knows about the guest, which
+// may have rebooted while it was blind: the resync that follows the
+// reconnect reloads the anchor whether or not the rules changed (ADR 0004:
+// a full re-sync on start, on reconnect and on a timer). The timer is out
+// of reach here (an hour), so only the reconnect can heal the anchor.
+func TestEventStreamReconnectReloadsGuestAnchor(t *testing.T) {
+	r, w := io.Pipe()
+	eng := &fakeEngine{ps: []byte(psJSON), events: r, w: w,
+		ips: map[string]string{"a1": "10.88.0.4", "f6": "10.88.0.7"}}
+	g := &fakeGuest{}
+	p := newFake()
+	path := filepath.Join(t.TempDir(), StateFile)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Config{
+			Provider: p, Machine: &machine.Machine{Name: "t"}, GuestIP: guest,
+			Engine: eng, Guest: g, StatePath: path, Log: log.New(io.Discard, "", 0),
+			Resync: time.Hour, Debounce: time.Millisecond,
+			MinBackoff: 10 * time.Millisecond, MaxBackoff: 20 * time.Millisecond,
+			ReloadEvery: 1 << 20,
+		})
+	}()
+	const rule = "port = 7070 -> 10.88.0.7 port 80"
+	waitFor(t, func() bool { return strings.Contains(g.anchor(), rule) })
+
+	// The guest loses its rules and the stream drops: reconnecting is the
+	// forwarder's only chance to notice, and it takes it.
+	g.drop()
+	_ = w.Close()
+	waitFor(t, func() bool { return strings.Contains(g.anchor(), rule) })
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A guest-side failure is per mapping and visible in "jm ports": the host
+// leg is bound (docker binds it too) but the mapping says why nothing
+// answers yet, and the next reconcile retries.
+func TestGuestRedirectFailureIsPerMapping(t *testing.T) {
+	r, w := io.Pipe()
+	defer w.Close()
+	eng := &fakeEngine{ps: []byte(psJSON), events: r, w: w, ips: map[string]string{"a1": "10.88.0.4", "f6": "10.88.0.7"}}
+	g := &fakeGuest{err: errors.New("pfctl: /dev/pf: Permission denied")}
+	p := newFake()
+	path := filepath.Join(t.TempDir(), StateFile)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Config{
+			Provider: p, Machine: &machine.Machine{Name: "t"}, GuestIP: guest, Engine: eng, Guest: g,
+			StatePath: path, Log: log.New(io.Discard, "", 0),
+			Resync: 20 * time.Millisecond, MinBackoff: 10 * time.Millisecond, MaxBackoff: 20 * time.Millisecond,
+		})
+	}()
+	waitFor(t, func() bool {
+		st, err := Load(path)
+		return err == nil && len(st.Errors()) == 2
+	})
+	st, _ := Load(path)
+	for _, e := range st.Errors() {
+		if e.Local != "0.0.0.0:8443" && e.Local != "127.0.0.1:7070" {
+			t.Errorf("%s should not depend on a guest redirect", e.Local)
+		}
+		if !strings.Contains(e.Error, "Permission denied") {
+			t.Errorf("%s: %q, want the guest's own words", e.Local, e.Error)
+		}
+	}
+	// The host leg is bound all the same.
+	exposed, _ := p.calls()
+	if len(exposed) != 7 {
+		t.Errorf("exposed %d mappings, want all 7", len(exposed))
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Status updates land on the entries that are actually saved, even when the
+// same reconcile adds a mapping. Recording a new owned entry used to append
+// to st.Owned mid-loop, which reallocates its backing array and orphans the
+// pointers the index handed out, so the cleared errors below went nowhere:
+// a port that had just come up went on reading "error: ..." in "jm ports"
+// until a later reconcile happened to append nothing.
+func TestConvergeClearsErrorsWhileAddingAMapping(t *testing.T) {
+	ctx := context.Background()
+	m := &machine.Machine{Name: "t"}
+	path := filepath.Join(t.TempDir(), StateFile)
+	live := []netprov.Mapping{
+		{Proto: "tcp", Local: "0.0.0.0:8081", Remote: guest + ":8081"},
+		{Proto: "tcp", Local: "0.0.0.0:8082", Remote: guest + ":8082"},
+	}
+	p := newFake(live...)
+	// Two owned, live mappings whose guest-side leg was pending last time,
+	// stored in a slice with no spare capacity so the append reallocates.
+	st := &State{Owned: []Entry{
+		{Proto: "tcp", Local: "0.0.0.0:8081", Remote: guest + ":8081", Error: "no address yet"},
+		{Proto: "tcp", Local: "0.0.0.0:8082", Remote: guest + ":8082", Error: "no address yet"},
+	}}
+	// The new mapping sorts before both, so it is appended first.
+	fresh := netprov.Mapping{Proto: "tcp", Local: "0.0.0.0:8080", Remote: guest + ":8080"}
+	if _, err := ConvergeWith(ctx, p, m, Plan{Mappings: append([]netprov.Mapping{fresh}, live...)}, st, path); err != nil {
+		t.Fatal(err)
+	}
+	for _, got := range []*State{st, mustLoad(t, path)} {
+		if len(got.Owned) != 3 {
+			t.Fatalf("owned = %+v, want three mappings", got.Owned)
+		}
+		if errs := got.Errors(); len(errs) != 0 {
+			t.Errorf("errors = %+v, want none: the pending reasons are stale", errs)
+		}
+	}
+}
+
+func mustLoad(t *testing.T, path string) *State {
+	t.Helper()
+	st, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st
 }

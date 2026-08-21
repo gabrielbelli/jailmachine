@@ -5,10 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"net/netip"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -314,11 +314,21 @@ func resolverState(m *machine.Machine) backend.State {
 var errNoResolver = errors.New("no host resolver is running for this machine")
 
 // resolverParityCheck asserts, for a running machine, that the host
-// resolver really answers from the host's own resolution API: it resolves a
-// name only the host can know — the Mac's own multicast name — through the
-// machine's resolver and compares the address, not merely that an answer
-// came back. A resolver that merely runs, or one that quietly fell back to
-// a public server, would pass a liveness check and fail this one (ADR 0008).
+// resolver really answers from the host's own resolution API. It is three
+// assertions, because a resolver that merely runs would pass any one of
+// them (ADR 0008):
+//
+//  1. the aliases every container expects come back as the host — the
+//     alias table is right and the server answers at all;
+//  2. the process serving the guest reports, over the wire, that it
+//     resolves through the host operating system's resolver — a build with
+//     "-tags netgo" or a process started with GODEBUG=netdns=go keeps
+//     public names working while losing every scoped, /etc/hosts and
+//     .local name, and neither shows up in this process's build tags;
+//  3. a name the alias table does not hold and only this host can answer
+//     resolves through the machine's resolver to the addresses the host
+//     itself gives it — the address compared, not merely that an answer
+//     came back.
 func resolverParityCheck(ctx context.Context, m *machine.Machine) (doctor.Result, bool) {
 	res := doctor.Result{Name: "resolver " + m.Name}
 	if resolverState(m) != backend.Running {
@@ -336,40 +346,101 @@ func resolverParityCheck(ctx context.Context, m *machine.Machine) (doctor.Result
 		res.Status, res.Detail = doctor.Warn, err.Error()
 		return res, true
 	}
-	names := resolver.HostNames(ctx)
-	probe := resolver.ProbeName
-	for _, n := range names {
-		if strings.HasSuffix(n, ".local") {
-			probe = n
-			break
-		}
-	}
-	ips, err := queryResolver(ctx, addr, probe)
+	restart := "see " + pr.LogPath() + "; 'jm stop" + nameHint(m.Name) + " && jm start" + nameHint(m.Name) + "' restarts it"
+
+	// 1. The alias table. This is not parity: these names are answered
+	// from the handler's own table and never reach the host.
+	ips, err := queryResolver(ctx, addr, resolver.ProbeName)
 	if err != nil {
-		res.Status, res.Detail = doctor.Fail, fmt.Sprintf("%s does not answer %s: %v", addr, probe, err)
-		res.Fix = "see " + pr.LogPath() + "; 'jm stop" + nameHint(m.Name) + " && jm start" + nameHint(m.Name) + "' restarts it"
+		res.Status, res.Detail = doctor.Fail, fmt.Sprintf("%s does not answer %s: %v", addr, resolver.ProbeName, err)
+		res.Fix = restart
 		return res, true
 	}
-	for _, ip := range ips {
-		if ip == ep.HostAlias {
-			res.Status = doctor.OK
-			res.Detail = fmt.Sprintf("%s answers %s with %s, the host", addr, probe, ip)
-			return res, true
-		}
+	if !slices.Contains(ips, ep.HostAlias) {
+		res.Status = doctor.Fail
+		res.Detail = fmt.Sprintf("%s answers %s with %v, not with the host at %s", addr, resolver.ProbeName, ips, ep.HostAlias)
+		res.Fix = restart
+		return res, true
 	}
-	res.Status = doctor.Fail
-	res.Detail = fmt.Sprintf("%s answers %s with %v, not with the host at %s", addr, probe, ips, ep.HostAlias)
-	res.Fix = "see " + pr.LogPath() + "; a jm built with '-tags netgo' cannot see the host's own names"
+
+	// 2. The resolution path of the process actually serving the guest.
+	mode, err := resolverMode(ctx, addr)
+	if err != nil {
+		res.Status = doctor.Warn
+		res.Detail = fmt.Sprintf("%s answers, but does not report how it resolves (%v); "+
+			"a resolver started by an older jm predates this check", addr, err)
+		res.Fix = restart
+		return res, true
+	}
+	if mode != resolver.ModeHost {
+		res.Status = doctor.Fail
+		res.Detail = fmt.Sprintf("%s resolves through Go's own DNS client, not the host resolver: "+
+			"VPN, /etc/hosts and .local names are lost in %s and its containers", addr, m.Name)
+		res.Fix = "rebuild jm without '-tags netgo' and start it without GODEBUG=netdns=go, then " +
+			"'jm stop" + nameHint(m.Name) + " && jm start" + nameHint(m.Name) + "'"
+		return res, true
+	}
+
+	// 3. Parity proper, against a name the alias table does not hold.
+	hostAlias, _ := netip.ParseAddr(ep.HostAlias)
+	gateway, _ := netip.ParseAddr(ep.Gateway)
+	aliases := resolver.DefaultAliases(hostAlias, gateway, resolver.HostNames(ctx))
+	// Bounded as a whole: picking the probe costs one host lookup per
+	// candidate, and a wedged VPN resolver must not stall "jm doctor".
+	pctx, pcancel := context.WithTimeout(ctx, probeTimeout)
+	probe, want, ok := resolver.ParityProbe(pctx, nil, hostAlias, aliases)
+	pcancel()
+	if !ok {
+		// Nothing on this host is both host-only and comparable; say what
+		// was asserted rather than claim more.
+		res.Status = doctor.OK
+		res.Detail = fmt.Sprintf("%s answers through the host resolver (%s is the host at %s); "+
+			"this host offers no name of its own to compare addresses against", addr, resolver.ProbeName, ep.HostAlias)
+		return res, true
+	}
+	got, err := queryResolver(ctx, addr, probe)
+	if err != nil {
+		res.Status, res.Detail = doctor.Fail, fmt.Sprintf("%s does not answer %s, which the host resolves: %v", addr, probe, err)
+		res.Fix = restart
+		return res, true
+	}
+	if !sameAddrs(got, want) {
+		res.Status = doctor.Fail
+		res.Detail = fmt.Sprintf("%s answers %s with %v; the host answers it with %v", addr, probe, got, want)
+		res.Fix = restart
+		return res, true
+	}
+	res.Status = doctor.OK
+	res.Detail = fmt.Sprintf("%s answers through the host resolver: %s resolves to %v, as it does on the host",
+		addr, probe, got)
 	return res, true
 }
 
+// sameAddrs compares an answer with the host's own, as sets: parity is
+// about the addresses, not the order a resolver happened to list them in.
+func sameAddrs(got []string, want []netip.Addr) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	left := append([]string(nil), got...)
+	right := make([]string, 0, len(want))
+	for _, a := range want {
+		right = append(right, a.String())
+	}
+	slices.Sort(left)
+	slices.Sort(right)
+	return slices.Equal(left, right)
+}
+
 // guestResolverParityCheck asserts that the guest itself — and therefore
-// every container in it — really resolves through the host resolver, rather
-// than through whatever it booted with. It is the other half of
-// resolverParityCheck, which only proves that the host-side resolver
-// answers: "jm start" degrades to a warning when the guest-side forwarder
-// will not come up (a bring-your-own image, a transient failure), so this is
-// what reports the loss afterwards (ADR 0008).
+// every container in it — really sends its queries to *this machine's* host
+// resolver, rather than to whatever it booted with: no other server answers
+// the alias with this machine's host alias. Chained with
+// resolverParityCheck, which asserts that that resolver is in parity with
+// the host, it is what makes the guest's answers the host's answers.
+// "jm start" degrades to a warning when the guest-side forwarder will not
+// come up (a bring-your-own image, a transient failure), so this is what
+// reports the loss afterwards (ADR 0008).
 func guestResolverParityCheck(ctx context.Context, m *machine.Machine) (doctor.Result, bool) {
 	res := doctor.Result{Name: "guest resolver " + m.Name}
 	if st, err := currentState(m); err != nil || st != backend.Running {
@@ -396,25 +467,24 @@ func guestResolverParityCheck(ctx context.Context, m *machine.Machine) (doctor.R
 		return res, true
 	}
 	res.Status = doctor.OK
-	res.Detail = fmt.Sprintf("the guest resolves %s to %s, the host", resolver.ProbeName, ep.HostAlias)
+	res.Detail = fmt.Sprintf("the guest resolves %s to %s, this machine's host resolver", resolver.ProbeName, ep.HostAlias)
 	return res, true
 }
 
 // guestProbeTimeout bounds one guest-side doctor probe.
 const guestProbeTimeout = 30 * time.Second
 
-// queryResolver asks one machine's host resolver for a name's IPv4
-// addresses, going nowhere near the host's normal resolution path.
+// probeTimeout bounds one query put to a machine's host resolver.
+const probeTimeout = 10 * time.Second
+
+// queryResolver asks one machine's host resolver for a name's addresses,
+// going nowhere near this process's own resolution path: resolver.AskAddrs
+// puts the question on the wire itself, so nothing is answered here out of
+// /etc/hosts or expanded through a search list (ADR 0008).
 func queryResolver(ctx context.Context, addr, name string) ([]string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	r := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, network, addr)
-		},
-	}
-	ips, err := r.LookupIP(ctx, "ip4", strings.TrimSuffix(name, ".")+".")
+	ips, err := resolver.AskAddrs(ctx, addr, name)
 	if err != nil {
 		return nil, err
 	}
@@ -423,4 +493,13 @@ func queryResolver(ctx context.Context, addr, name string) ([]string, error) {
 		out = append(out, ip.String())
 	}
 	return out, nil
+}
+
+// resolverMode asks a running resolver how it resolves names. The answer
+// comes from the process serving the guest, which is the only one whose
+// build tags and GODEBUG matter (ADR 0008).
+func resolverMode(ctx context.Context, addr string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	return resolver.AskMode(ctx, addr)
 }

@@ -83,6 +83,9 @@ type Config struct {
 	AllowIPv6 bool
 	// System is the host resolver; NewSystem() when nil.
 	System System
+	// Mode is what StatusName reports about this process's resolution
+	// path; SystemMode() when empty.
+	Mode string
 	// Log receives one line per failed query; discarded when nil.
 	Log *log.Logger
 }
@@ -100,6 +103,9 @@ type Handler struct {
 func NewHandler(cfg Config) *Handler {
 	if cfg.System == nil {
 		cfg.System = NewSystem()
+	}
+	if cfg.Mode == "" {
+		cfg.Mode = SystemMode()
 	}
 	h := &Handler{cfg: cfg}
 	h.SetAliases(cfg.Aliases)
@@ -210,6 +216,9 @@ func (h *Handler) Answer(ctx context.Context, query []byte) []byte {
 // resolve produces the answer section for one question.
 func (h *Handler) resolve(ctx context.Context, q dnsmessage.Question) ([]dnsmessage.Resource, dnsmessage.RCode) {
 	name := canonical(q.Name.String())
+	if name == statusFQDN {
+		return h.statusAnswer(q), dnsmessage.RCodeSuccess
+	}
 	if ip, ok := h.alias(name); ok {
 		return h.aliasAnswer(q, ip), dnsmessage.RCodeSuccess
 	}
@@ -330,6 +339,22 @@ func (h *Handler) resolve(ctx context.Context, q dnsmessage.Question) ([]dnsmess
 	}
 }
 
+// statusAnswer describes the resolver itself. It is how "jm doctor" learns,
+// over the wire and therefore about the process actually serving the guest,
+// whether queries really go through the host operating system's resolver:
+// one that does not keeps answering public names while losing every scoped,
+// hosts-file and .local name, which is the regression ADR 0008 refuses to
+// let pass unseen. Only TXT: the name is a report, not an address.
+func (h *Handler) statusAnswer(q dnsmessage.Question) []dnsmessage.Resource {
+	if q.Type != dnsmessage.TypeTXT && q.Type != dnsmessage.TypeALL {
+		return nil
+	}
+	return []dnsmessage.Resource{{
+		Header: rrHeader(q, dnsmessage.TypeTXT),
+		Body:   &dnsmessage.TXTResource{TXT: []string{StatusPrefix + h.cfg.Mode}},
+	}}
+}
+
 // aliasAnswer answers a locally-held name. Aliases are IPv4 addresses on
 // the provider's network, so an AAAA (or any other type) for one is an
 // empty NOERROR: the name exists, that record type does not.
@@ -359,6 +384,30 @@ func (h *Handler) addressAnswer(ctx context.Context, q dnsmessage.Question, host
 		return nil, dnsmessage.RCodeSuccess
 	}
 	var out []dnsmessage.Resource
+	for _, a := range GuestAddrs(ips, h.cfg.HostAlias, wantV6) {
+		if wantV6 {
+			out = append(out, dnsmessage.Resource{
+				Header: rrHeader(q, dnsmessage.TypeAAAA),
+				Body:   &dnsmessage.AAAAResource{AAAA: a.As16()},
+			})
+			continue
+		}
+		out = append(out, dnsmessage.Resource{
+			Header: rrHeader(q, dnsmessage.TypeA),
+			Body:   &dnsmessage.AResource{A: a.As4()},
+		})
+	}
+	return out, dnsmessage.RCodeSuccess
+}
+
+// GuestAddrs keeps, of the addresses the host resolver returned, the ones a
+// guest may be handed: the requested family, nothing the guest cannot route
+// to, and the host's loopback rewritten to the host alias. It is exported
+// because asserting parity means comparing an answer against the host's own
+// (ADR 0008), and the comparison has to apply the same rules the answer did
+// rather than a second copy of them.
+func GuestAddrs(ips []net.IP, hostAlias netip.Addr, wantV6 bool) []netip.Addr {
+	var out []netip.Addr
 	seen := map[netip.Addr]bool{}
 	for _, ip := range ips {
 		a, ok := netip.AddrFromSlice(ip)
@@ -384,28 +433,18 @@ func (h *Handler) addressAnswer(ctx context.Context, q dnsmessage.Question, host
 		if a.IsLoopback() {
 			// A host service on the loopback is reachable from the guest
 			// at the host alias; the guest's own loopback is not it.
-			if !h.cfg.HostAlias.IsValid() || wantV6 {
+			if !hostAlias.IsValid() || wantV6 {
 				continue
 			}
-			a = h.cfg.HostAlias
+			a = hostAlias
 		}
 		if seen[a] {
 			continue
 		}
 		seen[a] = true
-		if wantV6 {
-			out = append(out, dnsmessage.Resource{
-				Header: rrHeader(q, dnsmessage.TypeAAAA),
-				Body:   &dnsmessage.AAAAResource{AAAA: a.As16()},
-			})
-			continue
-		}
-		out = append(out, dnsmessage.Resource{
-			Header: rrHeader(q, dnsmessage.TypeA),
-			Body:   &dnsmessage.AResource{A: a.As4()},
-		})
+		out = append(out, a)
 	}
-	return out, dnsmessage.RCodeSuccess
+	return out
 }
 
 // fail turns a host resolver error into the response code the guest must

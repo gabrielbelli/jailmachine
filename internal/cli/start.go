@@ -91,12 +91,6 @@ func startMachine(ctx context.Context, args []string, opts startOpts) error {
 	if err != nil {
 		return err
 	}
-	// $JM_PUBLISH_ADDR is an override read here, once, and written onto the
-	// record: the forwarder runs detached, so the address it binds must be
-	// on the machine rather than in this shell's environment (ADR 0004).
-	if err := applyPublishAddrEnv(m); err != nil {
-		return err
-	}
 	unlock, err := lockMaybeWait(ctx, m.Name, opts.waitLock)
 	if err != nil {
 		return err
@@ -109,6 +103,19 @@ func startMachine(ctx context.Context, args []string, opts startOpts) error {
 	}
 	if opts.skipIfReady && st == backend.Running && engineReachable(m) {
 		return nil
+	}
+	// $JM_PUBLISH_ADDR is an override read here, once, and written onto the
+	// record: the forwarder runs detached, so the address it binds must be
+	// on the machine rather than in this shell's environment (ADR 0004).
+	//
+	// It is read under the lock and only on the path that actually starts
+	// the machine: the record is shared state, and a jpodman shell that
+	// exports the variable must not rewrite the record of a machine that is
+	// already running with another address — which this invocation would
+	// not restart, so the running forwarder would go on binding the old one
+	// while "jm inspect" showed the new.
+	if err := applyPublishAddrEnv(m); err != nil {
+		return err
 	}
 	if st == backend.Broken {
 		// Half of the machine is up or stale; converge both halves to

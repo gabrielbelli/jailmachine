@@ -322,12 +322,12 @@ The full matrix, both workarounds, and the script that produced it
 | Container DNS matching the host | Works — the host's own resolver answers for the guest, so VPN, split-horizon, `/etc/hosts` and `.local` names all match, and the Mac is `host.docker.internal` |
 | Autostart | Works on demand: `jpodman` and `jdocker` start a stopped machine. There is deliberately **no** login agent — `JM_AUTOSTART=0` opts out |
 | `docker.io/nginx` (Linux) | Works with **one config line**: `accept_mutex on;` in the `events` block. Stock nginx registers its listening socket with `EPOLLEXCLUSIVE` when `worker_processes > 1`, which FreeBSD's `linux_epoll` rejects. A ready-made image is in [demo/](demo/README.md#the-nginx-finding) |
-| Publishing ports (`-p 8080:80`) | Works — reconciled onto the host by the forwarder, binding every interface by default (`--publish-addr` to change) |
+| Publishing ports (`-p 8080:80`) | Works — reconciled onto the host by the forwarder, binding every interface by default (`--publish-addr` to change the default) |
+| `-p 127.0.0.1:8080:80`, `-p [::1]:…`, ranges, `/udp` | Works — a host address in the flag binds that address **on the Mac** and nothing else, as under Docker Desktop. `-p localhost:…` is rejected by podman itself |
 | Docker CLI and compose | Works via `jdocker`, or `eval "$(jm env)"` for a client you point yourself. Compose pulls FreeBSD variants under plain `podman`, so a Linux image needs `jpodman pull --os=linux <image>` first plus `pull_policy: missing` on the service |
 | Jails | Works — `bastille bootstrap`, `create`, `cmd`, `pkg install` in the guest |
 | Several machines at once | Works, but each needs its own SSH port — `jm init --ssh-port 2223 dev`, then `JM_MACHINE=dev jpodman ps` |
-| `-p 127.0.0.1:8080:80` | **Not yet.** A host IP in the flag binds the guest's loopback and publishes nothing on the Mac; `jm ports` reports it. Use `-p 8080:80` with `jm set --publish-addr 127.0.0.1`. **Being fixed** |
-| UDP from a Linux container | **Broken.** Linux containers cannot bind UDP sockets under the Linuxulator, so DNS-over-UDP and any UDP service fail inside them (native FreeBSD containers are fine). **Being fixed** |
+| UDP from a Linux container | Works — binding, sending, receiving, DNS-over-UDP and publishing with `-p 5354:53/udp`, verified from the Mac's loopback and its LAN address. One idiom fails: busybox's `nc -u -l` reports `Address family not supported by protocol`. Use `apk add netcat-openbsd`, `socat`, or any real UDP server. Datagrams are capped at 1472 bytes by the gvproxy link, which does not fragment. See [UDP in a Linux container](docs/TROUBLESHOOTING.md#udp-in-a-linux-container) |
 | `docker.io/node` (Linux) | **No.** The one image known to be broken: the binary starts and `node --version` prints, but `console.log` output never reaches the pipe and its HTTP servers do not accept connections. No known workaround |
 | Routable VM IP | **No.** gvproxy is NAT; vmnet/bridged is a later step |
 | Intel Macs, Linux and Windows hosts | **No.** Only `darwin/arm64` has a backend; the Linux release binaries are build-only. Apple Virtualization.framework cannot boot FreeBSD/arm64, hence QEMU |
@@ -342,6 +342,8 @@ The full matrix, both workarounds, and the script that produced it
 | Port not reachable | `jm ports` lists each mapping with its error (host port busy, loopback bind, forwarder down) |
 | `-v` mounts an empty directory | The host path is outside the shared set (`jm inspect`), or you wrote `/tmp/...` instead of `/private/tmp/...` |
 | A name resolves on the Mac but not in a container | `jm doctor`, then `resolver.log` |
+| `nc -u -l` in a Linux container says `Address family not supported` | Only busybox's UDP listener is affected — `apk add netcat-openbsd`, or use `socat`. UDP itself works |
+| UDP datagrams over 1472 bytes never arrive | The gvproxy link is MTU 1500 and does not fragment; `jm doctor` states the limit per machine |
 | Stale state after a crash or reboot | `jm stop` repairs "broken" (pid file without process); `jm rm && jm init` is always a clean slate |
 
 Host-side logs, all under `~/.jailmachine/machines/<name>/`:

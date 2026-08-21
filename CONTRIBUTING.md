@@ -5,8 +5,10 @@
 > and bastille jails, the tree now carries host directory mounts at identical
 > paths (ADR 0007), name resolution 1:1 with the host (ADR 0008), autostart on
 > demand from `jpodman`/`jdocker`, and a `jdocker` wrapper for the docker CLI.
-> Two known gaps are being worked on right now: `-p 127.0.0.1:PORT:PORT`
-> publishes nothing on the host, and Linux containers cannot bind UDP sockets.
+> `-p` now means what it means under Docker Desktop, and UDP works from
+> Linux containers — publishing included. The one Linuxulator gap left is a
+> zero-length `recvmsg()` that returns where Linux blocks, which breaks
+> busybox's `nc -u -l` and nothing else known.
 > There is deliberately **no** autostart-at-login agent — see
 > `docs/tech-choices.md` for why.
 

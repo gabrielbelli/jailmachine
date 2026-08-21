@@ -8,6 +8,7 @@ import (
 
 	"github.com/gabrielbelli/jailmachine/internal/forwarder"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
+	"github.com/gabrielbelli/jailmachine/internal/netprov/gvproxy"
 )
 
 func TestParseMemoryMiB(t *testing.T) {
@@ -169,5 +170,78 @@ func TestApplyPublishAddrEnv(t *testing.T) {
 	t.Setenv(forwarder.PublishAddrEnv, "not-an-ip")
 	if err := applyPublishAddrEnv(reloaded); err == nil {
 		t.Error("a bad address was accepted")
+	}
+}
+
+// The publish address a running forwarder binds is the one it started with,
+// not whatever the record says now: "jm set --publish-addr" takes effect on
+// the next start, so "jm ports" and "jm inspect" must show the live value
+// and mark the record's as pending rather than quietly claim it.
+func TestPublishAddrsMarksAPendingChange(t *testing.T) {
+	cases := []struct {
+		name           string
+		record         string
+		running        bool
+		state          *forwarder.State
+		force, pending string
+	}{
+		{"stopped forwarder shows the record", "127.0.0.1", false,
+			&forwarder.State{PublishAddr: "0.0.0.0"}, "127.0.0.1", ""},
+		{"running forwarder wins over a changed record", "127.0.0.1", true,
+			&forwarder.State{PublishAddr: "0.0.0.0"}, "0.0.0.0", "127.0.0.1"},
+		{"agreement is not a pending change", "127.0.0.1", true,
+			&forwarder.State{PublishAddr: "127.0.0.1"}, "127.0.0.1", ""},
+		{"a forwards.json without the address claims nothing", "127.0.0.1", true,
+			&forwarder.State{}, "127.0.0.1", ""},
+		{"the default is compared, not the empty record", "", true,
+			&forwarder.State{PublishAddr: "127.0.0.1"}, "127.0.0.1", forwarder.DefaultHostIP},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := &machine.Machine{Name: "t", PublishAddr: c.record}
+			force, pending := publishAddrs(m, c.running, c.state)
+			if force != c.force || pending != c.pending {
+				t.Errorf("publishAddrs = (%q, %q), want (%q, %q)", force, pending, c.force, c.pending)
+			}
+		})
+	}
+}
+
+// "jm ports" prints the default publish address as a default, because the
+// rows no longer all share it: a publish that names a host address binds
+// that address and shows it in LOCAL.
+func TestPortsHeaderIsTheDefaultNotTheWholeTruth(t *testing.T) {
+	root := t.TempDir()
+	m := seedGvproxyRecord(t, root, "gv")
+	m.PublishAddr = "0.0.0.0"
+	if err := machine.NewStore(root).Save(m); err != nil {
+		t.Fatal(err)
+	}
+	st := &forwarder.State{PublishAddr: "0.0.0.0", Owned: []forwarder.Entry{
+		{Proto: "tcp", Local: "0.0.0.0:8080", Remote: gvproxy.GuestIP + ":8080"},
+		{Proto: "tcp", Local: "127.0.0.1:8082", Remote: gvproxy.GuestIP + ":8082"},
+		{Proto: "tcp", Local: "[::1]:8087", Remote: gvproxy.GuestIP + ":8087"},
+		{Proto: "udp", Local: "127.0.0.1:8095", Remote: gvproxy.GuestIP + ":8095",
+			Error: "the container has no address on the guest's container network yet"},
+	}}
+	if err := st.Save(forwarder.StatePath(m.Dir)); err != nil {
+		t.Fatal(err)
+	}
+	out, err := run(t, root, "ports", "gv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "# publishing on 0.0.0.0 unless -p names a host address") {
+		t.Errorf("header does not read as a default:\n%s", out)
+	}
+	for _, want := range []string{"0.0.0.0:8080", "127.0.0.1:8082", "[::1]:8087", "udp", "no address"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("ports output lacks %q:\n%s", want, out)
+		}
+	}
+	// Every row is forwarded now; the "-" column is for nothing podman
+	// can produce.
+	if strings.Contains(out, "\t-\t") || strings.Contains(out, " -  ") {
+		t.Errorf("a mapping was reported as unforwardable:\n%s", out)
 	}
 }

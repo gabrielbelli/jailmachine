@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
 	"testing"
 
 	"golang.org/x/net/dns/dnsmessage"
@@ -13,7 +14,13 @@ import (
 
 // fakeSystem is a host resolver that answers from tables, so every test in
 // this file runs without a network.
+//
+// Every field is behind mu: the serve tests hand the same fake to a running
+// server, which reads it from one goroutine per query while the test may
+// still be adding names to it (setIPs), so unguarded maps would make
+// "go test -race" fail on the fixture rather than on the code under test.
 type fakeSystem struct {
+	mu    sync.Mutex
 	ips   map[string][]net.IP
 	cname map[string]string
 	ptr   map[string][]string
@@ -25,17 +32,37 @@ type fakeSystem struct {
 	calls []string
 }
 
-func (f *fakeSystem) record(name string) { f.calls = append(f.calls, name) }
+func (f *fakeSystem) record(name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, name)
+}
+
+// setIPs adds a name while the server may already be serving.
+func (f *fakeSystem) setIPs(host string, ips []net.IP) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.ips == nil {
+		f.ips = map[string][]net.IP{}
+	}
+	f.ips[host] = ips
+}
+
+// asked returns the names the fake was asked for.
+func (f *fakeSystem) asked() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
+}
 
 func notFound(name string) error {
 	return &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
 }
 
 func (f *fakeSystem) fail(name string) error {
-	if err, ok := f.err[name]; ok {
-		return err
-	}
-	return nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.err[name]
 }
 
 func (f *fakeSystem) LookupIP(_ context.Context, host string) ([]net.IP, error) {
@@ -43,7 +70,9 @@ func (f *fakeSystem) LookupIP(_ context.Context, host string) ([]net.IP, error) 
 	if err := f.fail(host); err != nil {
 		return nil, err
 	}
+	f.mu.Lock()
 	ips, ok := f.ips[host]
+	f.mu.Unlock()
 	if !ok {
 		return nil, notFound(host)
 	}
@@ -55,7 +84,9 @@ func (f *fakeSystem) LookupCNAME(_ context.Context, host string) (string, error)
 	if err := f.fail(host); err != nil {
 		return "", err
 	}
+	f.mu.Lock()
 	c, ok := f.cname[host]
+	f.mu.Unlock()
 	if !ok {
 		return "", notFound(host)
 	}
@@ -67,7 +98,9 @@ func (f *fakeSystem) LookupPTR(_ context.Context, addr string) ([]string, error)
 	if err := f.fail(addr); err != nil {
 		return nil, err
 	}
+	f.mu.Lock()
 	n, ok := f.ptr[addr]
+	f.mu.Unlock()
 	if !ok {
 		return nil, notFound(addr)
 	}
@@ -79,7 +112,9 @@ func (f *fakeSystem) LookupTXT(_ context.Context, name string) ([]string, error)
 	if err := f.fail(name); err != nil {
 		return nil, err
 	}
+	f.mu.Lock()
 	t, ok := f.txt[name]
+	f.mu.Unlock()
 	if !ok {
 		return nil, notFound(name)
 	}
@@ -91,7 +126,9 @@ func (f *fakeSystem) LookupSRV(_ context.Context, name string) ([]*net.SRV, erro
 	if err := f.fail(name); err != nil {
 		return nil, err
 	}
+	f.mu.Lock()
 	s, ok := f.srv[name]
+	f.mu.Unlock()
 	if !ok {
 		return nil, notFound(name)
 	}
@@ -103,7 +140,9 @@ func (f *fakeSystem) LookupMX(_ context.Context, name string) ([]*net.MX, error)
 	if err := f.fail(name); err != nil {
 		return nil, err
 	}
+	f.mu.Lock()
 	m, ok := f.mx[name]
+	f.mu.Unlock()
 	if !ok {
 		return nil, notFound(name)
 	}
@@ -115,7 +154,9 @@ func (f *fakeSystem) LookupNS(_ context.Context, name string) ([]*net.NS, error)
 	if err := f.fail(name); err != nil {
 		return nil, err
 	}
+	f.mu.Lock()
 	n, ok := f.ns[name]
+	f.mu.Unlock()
 	if !ok {
 		return nil, notFound(name)
 	}
@@ -230,8 +271,8 @@ func TestAliasesAnsweredLocally(t *testing.T) {
 			t.Errorf("%s = %v, want [%s]", name, got, gatewayIP)
 		}
 	}
-	if len(sys.calls) != 0 {
-		t.Errorf("aliases were forwarded to the host resolver: %v", sys.calls)
+	if calls := sys.asked(); len(calls) != 0 {
+		t.Errorf("aliases were forwarded to the host resolver: %v", calls)
 	}
 }
 
@@ -255,8 +296,8 @@ func TestForwardsToHostResolver(t *testing.T) {
 	if len(got) != 1 || got[0] != "10.1.2.3" {
 		t.Fatalf("got %v, want [10.1.2.3]", got)
 	}
-	if len(sys.calls) != 1 || sys.calls[0] != "internal.example.com" {
-		t.Errorf("host resolver was asked %v", sys.calls)
+	if calls := sys.asked(); len(calls) != 1 || calls[0] != "internal.example.com" {
+		t.Errorf("host resolver was asked %v", calls)
 	}
 }
 

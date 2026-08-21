@@ -59,10 +59,19 @@ jobs:
       - name: doctor (informational)
         run: ./jm doctor || true
       - name: build guest image
-        run: ./jm image build --release "${{ inputs.release }}" --out dist
+        # The input goes through the environment rather than into the script
+        # body: an interpolation is textual substitution, and a shell is the
+        # wrong place to paste an arbitrary string into (release.yml does
+        # the same with its inputs).
+        env:
+          RELEASE: ${{ inputs.release }}
+        run: ./jm image build --release "$RELEASE" --out dist
       - name: publish guest-<version> release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE: ${{ inputs.release }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           ls -l dist
@@ -75,6 +84,6 @@ jobs:
           tag="guest-${ver}"
           echo "publishing ${tag}"
           gh release create "$tag" dist/*.zst dist/*.sha256 \
-            --repo "${{ github.repository }}" \
+            --repo "$REPO" \
             --title "guest ${ver}" \
-            --notes "Prebaked FreeBSD ${{ inputs.release }} guest image for jm (built under QEMU TCG by workflow run ${{ github.run_id }}). Verify with the .sha256 sidecar."
+            --notes "Prebaked FreeBSD ${RELEASE} guest image for jm (built under QEMU TCG by workflow run ${RUN_ID}). Verify with the .sha256 sidecar."

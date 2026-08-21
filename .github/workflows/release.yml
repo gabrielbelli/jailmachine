@@ -83,6 +83,9 @@ jobs:
           if [ -z "${TAP_TOKEN:-}" ]; then
             add_skip homebrew
             echo "::notice title=Homebrew cask skipped::the repository secret HOMEBREW_TAP_GITHUB_TOKEN is not set, so the cask is not pushed to gabrielbelli/homebrew-tap. Everything else still publishes. To enable it see CONTRIBUTING.md, 'Cutting a release' -> 'The Homebrew tap token'."
+            # The summary below is markdown in single quotes on purpose:
+            # its backticks are literal text, not command substitution.
+            # shellcheck disable=SC2016
             {
               echo '### Homebrew cask skipped'
               echo

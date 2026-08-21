@@ -18,13 +18,16 @@ func newPortsCmd() *cobra.Command {
 			"the outcome of the last attempt (a host port already in use shows as an\n" +
 			"error and is retried on the next resync). Reads the machine's forwards.json;\n" +
 			"it never blocks on the machine.\n\n" +
-			"\"-p 8080:80\" publishes on every host interface, as docker does on Linux:\n" +
-			"127.0.0.1, ::1, \"localhost\" and the host's LAN address all reach the\n" +
-			"container — including from other machines on your network. 'jm set\n" +
-			"--publish-addr 127.0.0.1' (or $" + forwarder.PublishAddrEnv + " at start time) keeps them on\n" +
-			"the host's loopback instead. A published port that names a host address\n" +
-			"(\"-p 127.0.0.1:8080:80\", \"-p 0.0.0.0:8080:80\") is bound inside the guest\n" +
-			"and cannot be reached from here; it is listed with the reason.",
+			"The host side is bound exactly as docker binds it. \"-p 8080:80\" publishes on\n" +
+			"every host interface: 127.0.0.1, ::1, \"localhost\" and the host's LAN address\n" +
+			"all reach the container — including from other machines on your network.\n" +
+			"'jm set --publish-addr 127.0.0.1' (or $" + forwarder.PublishAddrEnv + " at start time) changes that\n" +
+			"default. A publish that names a host address of its own\n" +
+			"(\"-p 127.0.0.1:8080:80\", \"-p [::1]:8080:80\") binds that address and only that\n" +
+			"one, whatever the default is.\n\n" +
+			"The first \"#\" line is the default the running forwarder was started with; a\n" +
+			"second one appears when the record has been changed since and is waiting for\n" +
+			"a restart.",
 		Example: `  jm ports
   jm ports --json dev`,
 		Args: cobra.MaximumNArgs(1),
@@ -33,7 +36,8 @@ func newPortsCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			entries := forwards(m)
+			st := forwardState(m)
+			entries := st.Owned
 			if JSON() {
 				if entries == nil {
 					entries = []forwarder.Entry{}
@@ -42,10 +46,16 @@ func newPortsCmd() *cobra.Command {
 				enc.SetIndent("", "  ")
 				return enc.Encode(entries)
 			}
-			if _, alive := forwarderProcess(m).Alive(); !alive {
+			_, running := forwarderProcess(m).Alive()
+			if !running {
 				fmt.Fprintf(stdout, "# port forwarder for %s is not running (jm start%s)\n", m.Name, nameHint(m.Name))
 			}
-			fmt.Fprintf(stdout, "# publishing on %s\n", forwarder.HostIP(m.PublishAddr))
+			inForce, pending := publishAddrs(m, running, st)
+			fmt.Fprintf(stdout, "# publishing on %s unless -p names a host address\n", inForce)
+			if pending != "" {
+				fmt.Fprintf(stdout, "# the record says %s; this forwarder keeps %s until jm stop%s && jm start%s\n",
+					pending, inForce, nameHint(m.Name), nameHint(m.Name))
+			}
 			tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
 			fmt.Fprintln(tw, "LOCAL\tREMOTE\tPROTO\tSTATUS")
 			for _, e := range entries {
@@ -56,8 +66,9 @@ func newPortsCmd() *cobra.Command {
 	}
 }
 
-// remoteOrDash prints "-" for an entry that is never forwarded (a port
-// podman bound to the guest's loopback only).
+// remoteOrDash prints "-" for an entry that is never forwarded. Nothing
+// podman accepts produces one today; the column keeps its shape for a
+// publish shape a future engine might invent.
 func remoteOrDash(remote string) string {
 	if remote == "" {
 		return "-"

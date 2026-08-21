@@ -42,9 +42,11 @@ func newSetCmd() *cobra.Command {
 			"A shared directory appears in the guest at its own absolute path, so\n" +
 			"'-v /work/src:/app' resolves inside the guest unchanged. The share set takes\n" +
 			"effect on the next start; jm says so.\n\n" +
-			"--publish-addr sets the host address container ports are published on (the\n" +
-			"default is every interface, as docker does on Linux); it applies when the\n" +
-			"forwarder is next started.",
+			"--publish-addr sets the host address container ports are published on when\n" +
+			"the publish flag names none (the default is every interface, as docker does\n" +
+			"on Linux). It is a default, not an override: '-p 127.0.0.1:8080:80' binds the\n" +
+			"host's loopback whatever it says. It applies when the forwarder is next\n" +
+			"started; 'jm ports' says so while the old one is still bound.",
 		Example: `  jm set --cpus 8 --memory 8GiB
   jm set --mount /work --mount /srv/data:ro
   jm set --unmount /srv/data

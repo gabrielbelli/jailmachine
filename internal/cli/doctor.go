@@ -88,6 +88,9 @@ func machineChecks(ctx context.Context) []doctor.Result {
 			if res, ok := sharesParityCheck(ctx, m); ok {
 				out = append(out, res)
 			}
+			if res, ok := datagramLimitCheck(m); ok {
+				out = append(out, res)
+			}
 		}
 	}
 	return out
@@ -156,4 +159,33 @@ func checkMachine(name string) doctor.Result {
 	}
 	res.Status = doctor.OK
 	return res
+}
+
+// datagramLimitCheck states the one silent limit of the host<->guest link:
+// it does not fragment, so a UDP datagram bigger than the provider's MTU
+// less its headers is dropped without an error at either end. TCP never
+// meets it — the stack segments to fit — and it is invisible in a packet
+// capture on the sending side, so someone whose 4 kB datagrams vanish has
+// nothing to go on. It is reported as OK rather than a warning because
+// nothing is wrong: it is a number to design against, and a pasted report
+// should carry it.
+//
+// The number comes from the provider's declared MTU rather than a probe: it
+// is a fixed property of the virtual link, and "jm doctor" must not have to
+// reach the guest to state a constant.
+func datagramLimitCheck(m *machine.Machine) (doctor.Result, bool) {
+	res := doctor.Result{Name: "datagram limit " + m.Name}
+	p, err := providerFor(m)
+	if err != nil {
+		return res, false // checkMachine already reports an unknown provider
+	}
+	caps := p.Capabilities()
+	max := caps.MaxDatagram()
+	if max == 0 {
+		return res, false // the provider does not say; do not invent one
+	}
+	res.Status = doctor.OK
+	res.Detail = fmt.Sprintf("published udp carries payloads up to %d bytes (%s MTU %d); larger datagrams are dropped, not fragmented",
+		max, p.Name(), caps.MTU)
+	return res, true
 }

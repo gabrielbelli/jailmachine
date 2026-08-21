@@ -3,10 +3,12 @@
 > **Still an MVP — a working demo**, but a wider one than v0.1.0: host
 > directory mounts at identical paths ([ADR 0007](adr/0007-host-filesystem-sharing.md)),
 > name resolution 1:1 with the host ([ADR 0008](adr/0008-name-resolution-parity.md)),
-> autostart on demand from the client wrappers and a `jdocker` wrapper are
-> all in the tree. Two known gaps are being fixed right now:
-> `-p 127.0.0.1:PORT:PORT` publishes nothing on the host, and Linux
-> containers cannot bind UDP sockets.
+> autostart on demand from the client wrappers, a `jdocker` wrapper and
+> docker-identical `-p` semantics are all in the tree. UDP is in that list
+> too — binding, publishing and DNS-over-UDP all work from Linux containers.
+> The one Linuxulator gap left is narrow: a zero-length `recvmsg()` returns
+> at once on FreeBSD where Linux blocks, which breaks busybox's `nc -u -l`
+> and nothing else known.
 
 This page is for a contributor deciding *where* to make a change. The
 reasoning behind each decision is in the ADRs, which are linked rather than
@@ -197,6 +199,13 @@ as a pure forwarder with no cache.
   a public address. If the resolver cannot be brought up, `jm start` warns and
   leaves the guest's previous resolution alone; `jm doctor` is what reports
   the loss.
+- `jm doctor` asserts parity rather than liveness, and asks the *running*
+  resolver rather than its own build: the reserved name
+  `resolver.jailmachine.internal` (TXT `mode=host|go`) says how the process
+  serving the guest resolves, and a name from the host's own tables that the
+  alias table does not hold is compared address for address with what the
+  host answers. An alias round trip proves the alias table only — those names
+  never reach the host resolver.
 
 > **Never** build with `-tags netgo` or set `GODEBUG=netdns=go`: the pure-Go
 > resolver loses scoped and `.local` names while public ones keep working,
@@ -221,7 +230,8 @@ There is no guest agent and no RPC from the engine. `jm start` launches
 
 1. derives the **desired** set of mappings from `podman --connection <name>
    ps --format json` (`desired.go`: each published host port maps to the
-   same port on the guest IP);
+   same port on the guest IP, and the host address it binds is the one
+   docker would bind);
 2. **converges** gvproxy's table to it, touching only mappings it owns —
    the owned set is persisted atomically in `forwards.json`, so a restarted
    forwarder never unexposes the SSH port or a hand-made mapping;
@@ -237,11 +247,39 @@ The address is a **machine property** (`jm init/set --publish-addr`, with
 `$JM_PUBLISH_ADDR` folded into the record at `jm start`), not ambient state
 of the shell that booted the machine: the forwarder runs detached, so a
 variable read inside it would be invisible to `jm inspect` and `jm ports`.
-`internal/cli/publish.go` owns that folding.
+`internal/cli/publish.go` owns that folding. It is a **default**: an address
+written into the publish flag itself wins over it, as it does under docker.
+A running forwarder keeps the address it started with, and records it in
+`forwards.json`, so `jm ports`/`jm inspect` can show what is bound and mark
+a changed record as pending.
 
-A port podman bound to a loopback `host_ip` **inside the guest**
-(`-p 127.0.0.1:8080:80`) can never be forwarded today and is listed with a
-reason instead of being published — a gap being fixed, not a decision.
+### The guest-side half
+
+The engine in the guest reads the address in `-p 127.0.0.1:8080:80` as a
+*guest*-side bind address and redirects the guest's loopback, where nothing
+on the host can reach it; the literal `0.0.0.0` gets a redirect to the
+wildcard, which matches no packet; `[::1]` gets no redirect at all. Docker's
+meaning is the opposite — a host-side bind address the VM never sees — so jm
+does both halves itself:
+
+- the host leg is gvproxy's, bound at the address the user wrote;
+- the guest leg is a `rdr` rule jm loads into its own pf anchor, `rdr/jm`
+  (a sub-anchor of the `rdr/*` the guest image already declares), pointing
+  the guest's own address at the container's address on the container
+  network. `forwarder.Rule`/`AnchorText` build it; `internal/cli`'s
+  `sshGuest` loads it over the existing SSH control channel.
+
+The anchor is written whole on every change, so it is a pure function of the
+desired state: nothing accumulates, a killed forwarder's rules are replaced
+at the next start, and a container's new address after a restart is picked up
+by the next reconcile (the address comes from a batched `podman inspect`,
+issued only for containers whose publish needs a rule). A failure of either
+half is an error on that mapping, retried at the next resync — never a
+dropped mapping.
+
+This is the one place the guest is no longer entirely unaware of the host;
+[ADR 0004](adr/0004-networking-as-a-provider-with-reconciled-port-publishing.md)
+records the amendment.
 
 ## `jm start`, stage by stage
 
@@ -306,7 +344,7 @@ sequenceDiagram
 | Different networking (vmnet, bridged) | `internal/netprov/<name>` implementing `netprov.Provider` |
 | New image source or verification | `internal/image` |
 | Anything the guest must have | `guest/provision.sh` only — then rebuild the prebaked image |
-| Port publishing behaviour | `internal/forwarder` (`desired.go` for policy, `converge.go` for mechanics); the host bind address in `internal/cli/publish.go` |
+| Port publishing behaviour | `internal/forwarder` (`desired.go` for policy and the guest-side rules, `converge.go` for mechanics); the host bind address in `internal/cli/publish.go`; the SSH loader in `internal/cli/forwarder.go` |
 | Host directory sharing | `internal/machine/share.go` (record), `internal/cli/share.go` (defaults and CLI), `internal/backend/qemu/argv.go` (9p devices), `guest/provision.sh` (the `jm_shares` rc script) |
 | Name resolution | `internal/resolver` (host resolver, guest push, aliases) |
 | Autostart | `internal/cli/autostart.go`, used by `podman.go` and `docker.go` |

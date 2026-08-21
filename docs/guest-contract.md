@@ -167,6 +167,35 @@ devices attached and mounts nothing, which is otherwise silent, so `jm start`
 warns and `jm doctor` fails its `share parity <name>` check — it writes a
 file on the host and asserts the guest sees it at the same absolute path.
 
+## Published ports with a host address (ADR 0004, amended)
+
+`-p 127.0.0.1:8080:80` and its relatives need one thing from the guest: a pf
+anchor jm can load its own `rdr` rules into. `/etc/pf.conf` must declare
+
+```
+rdr-anchor "rdr/*"
+```
+
+which `provision.sh` already appends (it is bastille's line, and both
+provisioning paths run it), so no image change was needed. The forwarder
+writes its rule set into the sub-anchor `rdr/jm` over SSH:
+
+```
+pfctl -a rdr/jm -f -
+```
+
+The whole anchor is replaced on every change, so it is exactly the current
+container set. A guest whose `pf.conf` lacks the anchor — a hand-built image —
+takes the plain `-p 8080:80` form as before and reports the others as errors
+in `jm ports` rather than failing anything.
+
+Two guest facts that follow from the engine, not from jm:
+
+- inside the guest, a published port is not reachable at `localhost`: the
+  engine's port reservation socket wins the socket lookup ahead of the
+  redirect. Reachability is a host-side question here;
+- the container network is IPv4, so the guest leg of an IPv6 host bind is v4.
+
 ## Clock
 
 A virtual machine's timekeeping stops with its host: after the Mac sleeps

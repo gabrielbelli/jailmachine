@@ -69,6 +69,29 @@ type Capabilities struct {
 	// providers live inside the hypervisor (slirp) and always report
 	// Running, so they can never disagree with a stopped backend.
 	Supervised bool
+	// MTU is the largest IP packet the provider's virtual link carries
+	// between host and guest, 0 when the provider does not say. It is worth
+	// reporting because the link does not fragment: a TCP stream is
+	// segmented to fit and never notices, but a UDP datagram larger than
+	// MTU minus its headers is dropped in silence, with no error at either
+	// end. MaxDatagram turns it into the number a user can act on.
+	MTU int
+}
+
+// IPv4HeaderBytes and UDPHeaderBytes are what a datagram spends on headers
+// before any of the link's MTU is left for payload.
+const (
+	IPv4HeaderBytes = 20
+	UDPHeaderBytes  = 8
+)
+
+// MaxDatagram is the largest UDP payload that survives the provider's link,
+// or 0 when the provider does not publish an MTU.
+func (c Capabilities) MaxDatagram() int {
+	if c.MTU <= IPv4HeaderBytes+UDPHeaderBytes {
+		return 0
+	}
+	return c.MTU - IPv4HeaderBytes - UDPHeaderBytes
 }
 
 // APIForwarder is an optional Provider interface for providers whose
