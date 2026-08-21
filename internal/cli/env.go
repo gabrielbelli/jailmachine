@@ -6,6 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/gabrielbelli/jailmachine/internal/backend"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
 	"github.com/gabrielbelli/jailmachine/internal/netprov"
 )
@@ -31,6 +32,13 @@ func newEnvCmd() *cobra.Command {
 			ep, err := endpointOf(m)
 			if err != nil {
 				return err
+			}
+			// The socket only exists while the machine runs; the exports
+			// are still printed so "eval $(jm env)" in a profile works.
+			if b, prov, cerr := components(m); cerr == nil {
+				if st, serr := stateOf(m, b, prov); serr == nil && st != backend.Running {
+					fmt.Fprintf(stderr, "jm: warning: %s is %s; the socket appears once you run 'jm start%s'\n", m.Name, st, nameHint(m.Name))
+				}
 			}
 			return writeEnv(stdout, m, ep, shell)
 		},

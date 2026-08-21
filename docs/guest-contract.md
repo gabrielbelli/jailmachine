@@ -1,5 +1,14 @@
 # Guest contract (concrete)
 
+> **Still an MVP — a working demo**, but a wider one than v0.1.0: as well as
+> `jm init && jm start`, native FreeBSD and Linux OCI images, published ports
+> and bastille jails, the guest now mounts host directories at identical
+> paths (ADR 0007), resolves names through the Mac's own resolver (ADR 0008)
+> and keeps its clock in step with the host. This page pins the contract the
+> guest image satisfies; the image is published as a `guest-<version>` GitHub
+> release and verified by `jm init` against its `.sha256` sidecar. The image
+> `jm init` fetches by default is named by `image.GuestVersion` in the binary.
+
 ADR 0003 defines the contract abstractly; this page pins the paths and
 behaviour `jm` relies on. Everything here is implemented by
 `guest/provision.sh` (the single source of truth), `guest/seal.sh` (what
@@ -191,7 +200,7 @@ and whether the service is running.
 |---|---|---|---|---|
 | *(default)* / `prebaked` / `prebaked:<ver>` | `Prebaked` | `https://github.com/gabrielbelli/jailmachine/releases/download/guest-<ver>/jailmachine-guest-<ver>-freebsd<rel>-arm64-zfs.raw.zst` | sidecar `<file>.sha256` (`<hash>  <file>`), mandatory | always true |
 | `official` / `official:<release>` | `Official` | `download.freebsd.org/releases/VM-IMAGES/<release>/aarch64/Latest/…BASIC-CLOUDINIT-zfs.raw.xz` | `CHECKSUM.SHA256`, mandatory | always true |
-| path or https URL to `.raw`, `.raw.xz`, `.raw.zst` | `BYO` | as given | sibling `<file>.sha256` if present | false without a sidecar (warning at `init`, shown by `inspect`) |
+| path or http(s) URL to `.raw` (or `.img`), `.raw.xz`, `.raw.zst` | `BYO` | as given | sibling `<file>.sha256` if present | false without a sidecar (warning at `init`, shown by `inspect`) |
 
 `<ver>` defaults to `image.GuestVersion` (a constant, bumped by hand when a
 new guest image is published); `<rel>` is the release without `-RELEASE`
@@ -230,8 +239,9 @@ make image [RELEASE=15.1-RELEASE]   # = ./jm image build --release $(RELEASE) --
 5. `jm rm jm-image-build`; `dist/.work` is deleted unless `--keep`.
 
 The build registers a podman connection named `jm-image-build` while it runs
-and removes it again with `jm rm jm-image-build` at the end. It does not make
-it the default, but podman promotes the first connection it is ever given, so
-the build remembers the previous default and restores it afterwards.
+and removes it again with `jm rm jm-image-build` at the end. A default
+connection you already had is left alone, but podman promotes the first
+connection it is ever given, so the build remembers the previous default and
+restores it afterwards.
 Publish both files as assets of the GitHub release tagged
 `guest-<GuestVersion>`; `jm init` fetches them by default.

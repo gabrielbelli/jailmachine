@@ -1,5 +1,15 @@
 # Contributing
 
+> **Still an MVP — a working demo**, but a wider one than v0.1.0. As well as
+> `jm init && jm start`, native FreeBSD and Linux OCI images, published ports
+> and bastille jails, the tree now carries host directory mounts at identical
+> paths (ADR 0007), name resolution 1:1 with the host (ADR 0008), autostart on
+> demand from `jpodman`/`jdocker`, and a `jdocker` wrapper for the docker CLI.
+> Two known gaps are being worked on right now: `-p 127.0.0.1:PORT:PORT`
+> publishes nothing on the host, and Linux containers cannot bind UDP sockets.
+> There is deliberately **no** autostart-at-login agent — see
+> `docs/tech-choices.md` for why.
+
 ## Ground rules
 
 - British English in prose (colour, licence, behaviour).

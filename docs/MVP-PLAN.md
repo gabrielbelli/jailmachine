@@ -3,8 +3,9 @@
 Goal: `brew install gabrielbelli/tap/jailmachine && jm init && jm start &&
 podman run -p 8080:80 docker.io/busybox httpd -f -p 80` works on an Apple
 Silicon Mac, with both Linux and native FreeBSD images, in under 3 minutes
-from a cold start. (Not `docker.io/nginx`: its workers need Linux AIO, which
-the Linuxulator lacks; see `guest/README.md`.)
+from a cold start. (`docker.io/nginx` works too, with `accept_mutex on;` in
+its `events` block — FreeBSD's `linux_epoll` has no `EPOLLEXCLUSIVE`; see
+`docs/USAGE.md` for the verified Docker Hub matrix.)
 
 Architecture: `docs/adr/`. Tools: `docs/tech-choices.md`. Proof of concept: `bin/jm` (shell, works today).
 
@@ -38,6 +39,7 @@ docs/adr/               decisions
 | M4 | Named machines + UX | `jm list`, `jm set`, `jm console`, progress bars, error messages with fixes | 1–2 days |
 | M5 | Prebaked image pipeline | GitHub Actions builds+signs image; `jm init` defaults to it; `--image official` and BYO paths tested | 2–3 days |
 | M6 | Release | goreleaser, Homebrew tap, README quickstart, `jm doctor` (checks qemu/gvproxy/podman versions) | 1 day |
+| M7 | Docker parity (post-MVP, `docker-parity`) | Host directory shares at identical paths (ADR 0007), name resolution 1:1 with the host (ADR 0008), autostart on demand from `jpodman`/`jdocker`, the `jdocker` wrapper, guest clock resync, and published ports on `0.0.0.0` with `--publish-addr`. Remaining: `-p 127.0.0.1:PORT:PORT` publishes nothing, and Linux containers cannot bind UDP sockets | in progress |
 
 Roughly **two weeks** of focused work; M1–M3 are the critical path.
 

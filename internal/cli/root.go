@@ -125,7 +125,7 @@ func markUsageErrors(cmd *cobra.Command) {
 
 const rootLong = `jailmachine (jm) provisions and manages a FreeBSD virtual machine for running
 jails (bastille) and OCI containers (podman), and connects the host's podman
-client to it.
+and docker clients to it.
 
 Quickstart (three commands):
 
@@ -134,11 +134,28 @@ Quickstart (three commands):
   jpodman run --rm --os=linux docker.io/alpine echo hi
 
 "jm start" registers a podman connection named after the machine but leaves
-your default connection alone; jpodman (a symlink to jm) is podman pointed at
-that connection. "jm start --set-default" opts into repointing plain podman.
+your default connection alone. jpodman is podman aimed at that connection and
+jdocker is the docker CLI aimed at the same engine; both are symlinks to jm,
+both work whatever your default connection is, and both start a stopped
+machine on demand (JM_AUTOSTART=0 or a leading --no-autostart to opt out).
+"jm start --set-default" opts into repointing plain podman.
 
 Linux images run through the Linuxulator and need --os=linux on the host
 podman (or "podman pull --os=linux"); native FreeBSD images need nothing.
+
+Host directories are shared into the guest at the *same* absolute path, so
+"-v /Users/you/src:/app" works from anywhere with no path rewriting. The
+default set is your home tree, /Volumes, /private/tmp and $TMPDIR's root;
+"jm init/set --mount DIR[:ro]", --unmount and --no-mounts change it, and
+"jm inspect" lists it. Every container can read and write everything shared.
+
+Names resolve as they do on the Mac: the host's own resolver answers for the
+guest, so VPN and split-horizon records, /etc/hosts entries and .local names
+all work inside a container, and the host itself is host.docker.internal
+(host.containers.internal).
+
+Published ports bind every host interface by default, as docker does on
+Linux; "jm init/set --publish-addr 127.0.0.1" keeps them on loopback.
 
 Commands that take an optional [name] default to "jailmachine"; when that
 does not exist and exactly one machine does, that one is used. Exit codes:

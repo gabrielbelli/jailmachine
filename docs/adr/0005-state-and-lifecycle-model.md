@@ -41,7 +41,9 @@ host, and run two `jm` commands at once.
 
 ## Addendum (2026-08-20): one socket may live outside the directory
 
-macOS and the BSDs cap a unix socket path at 104 bytes. When
+macOS and the BSDs cap a unix socket path at 104 bytes including the
+terminating NUL, so jm allows 103 (`backend.MaxSocketPath`, the figure
+`jm doctor` reports). When
 `<state-root>/machines/<name>/qmp.sock` would exceed that (deep state
 roots, long names), the QEMU backend places the socket at a short,
 deterministic path under the system temp dir instead (`QMPSocket`). This is
