@@ -187,42 +187,42 @@ all. Each container is run under `timeout 120`.
 
 ## How these are built and published
 
+Publishing is **manual, from a Mac running jailmachine**, because GitHub has no
+FreeBSD runner on any architecture and its hosted runners have no nested
+virtualisation, so a FreeBSD guest in CI could only run under slow emulation:
+
 ```bash
 jm start
-make -C demo build      # builds all five against the running machine
-make -C demo test       # runs each one and checks it behaves
-make -C demo push       # :latest and :YYYYMMDD -> ghcr.io/gabrielbelli
+gh auth token | jpodman login ghcr.io -u <your-github-user> --password-stdin
+make -C demo build test push        # arm64 images, tagged :latest and :YYYYMMDD
 ```
 
-`push` needs a login first:
+Images land as `ghcr.io/gabrielbelli/jm-demo-<name>`; new packages start
+private, so flip each one to Public once under
+`https://github.com/users/<user>/packages/container/<name>/settings`.
 
-```bash
-echo "$(gh auth token)" | podman login ghcr.io -u gabrielbelli --password-stdin
-```
+### What CI does instead
 
-### Architecture, honestly
+`.github/workflows/demo-images.yml` is a signal-only check and pushes nothing:
 
-`.github/workflows/demo-images.yml` publishes the **Linux** images
-(`linux/amd64` + `linux/arm64` manifest list) on every push touching `demo/`.
-That part is fully automatic.
+- the two **Linux** images are built for `linux/amd64` and `linux/arm64` on
+  native runners (`ubuntu-latest`, `ubuntu-24.04-arm`) and smoke-tested —
+  the banner image must exit 0, the nginx image must answer `/healthz`;
+- the three **FreeBSD** images are built and smoke-tested inside
+  `vmactions/freebsd-vm`, an amd64 QEMU guest, in about ninety seconds.
 
-The **FreeBSD** images are not, and cannot easily be. GitHub has no FreeBSD
-runner, so CI builds them inside `vmactions/freebsd-vm`, which is an **amd64**
-QEMU guest — while the jailmachine guest on an Apple Silicon Mac is
-`freebsd/arm64`. So:
+Both are honest about their limits. CI runs on a Linux kernel, not the
+Linuxulator, and its FreeBSD guest is amd64 while your machine is
+`freebsd/arm64`; what CI proves is that the Containerfiles still build and the
+entrypoints still work. `make -C demo test` on a Mac is the real check.
 
-- CI builds and smoke-tests all three FreeBSD images on amd64 and publishes
-  them only as `:freebsd-amd64` and `:YYYYMMDD-freebsd-amd64`. Never `:latest`.
-- `:latest` and the dated tag for FreeBSD images come from
-  `make -C demo push` on a maintainer's Mac. That is the only practical source
-  of `freebsd/arm64`.
-
-The trade-off: every push to `demo/` still proves the FreeBSD Containerfiles
-build, and nobody can accidentally pull an amd64 image onto an arm64 machine —
-but `freebsd/arm64:latest` is a manual step and can lag behind `main`. The
-rejected alternative was running the action's aarch64 image, which is
-full-system TCG emulation on an amd64 host: `pkg install nginx` alone takes
-tens of minutes.
+One thing CI structurally cannot test is `-p` port publishing on FreeBSD:
+podman installs those as pf `rdr` rules in the `cni-rdr` anchor, which only
+match traffic arriving on the egress interface, so the publishing host can
+never reach its own published port over loopback. The FreeBSD job talks to the
+container on the podman bridge instead. On a Mac the path works because jm's
+forwarder dials the guest's `vtnet0` address, and `make -C demo test` exercises
+exactly that.
 
 ## Known limits
 
