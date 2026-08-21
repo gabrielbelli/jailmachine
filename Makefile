@@ -7,7 +7,7 @@ LDFLAGS := -X $(MODULE)/internal/version.Version=$(VERSION) \
            -X $(MODULE)/internal/version.Commit=$(COMMIT) \
            -X $(MODULE)/internal/version.Date=$(DATE)
 
-.PHONY: build test lint e2e release-snapshot image clean
+.PHONY: install build test lint e2e release-snapshot image clean
 
 build:
 	$(GO) build -ldflags "$(LDFLAGS)" -o jm ./cmd/jm
@@ -39,3 +39,7 @@ image: build
 
 clean:
 	rm -rf jm dist
+
+PREFIX ?= /opt/homebrew
+install: ## build and install jm into $(PREFIX)/bin
+	go build -ldflags "$(LDFLAGS)" -o $(PREFIX)/bin/jm ./cmd/jm
