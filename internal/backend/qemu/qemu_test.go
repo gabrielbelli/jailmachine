@@ -554,13 +554,13 @@ func TestArgsShares(t *testing.T) {
 	want := [][2]string{
 		{"-device", "virtio-net-pci,netdev=n0,mac=" + m.MAC},
 		{"-device", "virtio-rng-pci"},
-		{"-fsdev", "local,id=jmconf,path=" + p.GuestConf + ",security_model=none,multidevs=remap,readonly=on"},
+		{"-fsdev", "local,id=jmconf,path=" + p.GuestConf + ",security_model=" + ShareSecurityModel + ",multidevs=remap,readonly=on"},
 		{"-device", "virtio-9p-pci,fsdev=jmconf,mount_tag=" + machine.GuestConfTag + ",addr=0x8"},
-		{"-fsdev", "local,id=jmfs0,path=/Users/belli,security_model=none,multidevs=remap,readonly=on"},
+		{"-fsdev", "local,id=jmfs0,path=/Users/belli,security_model=" + ShareSecurityModel + ",multidevs=remap,readonly=on"},
 		{"-device", "virtio-9p-pci,fsdev=jmfs0,mount_tag=" + m.Shares[0].Tag + ",addr=0x9"},
-		{"-fsdev", "local,id=jmfs1,path=/Volumes,security_model=none,multidevs=remap"},
+		{"-fsdev", "local,id=jmfs1,path=/Volumes,security_model=" + ShareSecurityModel + ",multidevs=remap"},
 		{"-device", "virtio-9p-pci,fsdev=jmfs1,mount_tag=" + m.Shares[1].Tag + ",addr=0xa"},
-		{"-fsdev", "local,id=jmfs2,path=/private/tmp,security_model=none,multidevs=remap"},
+		{"-fsdev", "local,id=jmfs2,path=/private/tmp,security_model=" + ShareSecurityModel + ",multidevs=remap"},
 		{"-device", "virtio-9p-pci,fsdev=jmfs2,mount_tag=" + m.Shares[2].Tag + ",addr=0xb"},
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -618,10 +618,10 @@ func TestArgsSharesEscapeCommas(t *testing.T) {
 	p.GuestConf = "/state/gu,est"
 	m := shareMachine(t, "/we,ird/dir")
 	args := Args(m, backend.NetAttachment{Kind: "user", HostFwdSSH: 2222}, p)
-	if !slices.Contains(args, "local,id=jmfs0,path=/we,,ird/dir,security_model=none,multidevs=remap") {
+	if !slices.Contains(args, "local,id=jmfs0,path=/we,,ird/dir,security_model="+ShareSecurityModel+",multidevs=remap") {
 		t.Fatalf("comma in share path not escaped: %q", args)
 	}
-	if !slices.Contains(args, "local,id=jmconf,path=/state/gu,,est,security_model=none,multidevs=remap,readonly=on") {
+	if !slices.Contains(args, "local,id=jmconf,path=/state/gu,,est,security_model="+ShareSecurityModel+",multidevs=remap,readonly=on") {
 		t.Fatalf("comma in conf path not escaped: %q", args)
 	}
 }
@@ -667,5 +667,20 @@ func TestWriteShareTableSkipsUnusedDir(t *testing.T) {
 	}
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("share table directory created for a machine with no shares: %v", err)
+	}
+}
+
+func TestShareSecurityModelEnv(t *testing.T) {
+	for _, tc := range []struct{ env, want string }{
+		{"", ShareSecurityModel},
+		{"none", "none"},
+		{"mapped-file", "mapped-file"},
+		{"mapped-xattr", "mapped-xattr"},
+		{"nonsense", ShareSecurityModel},
+	} {
+		t.Setenv("JM_9P_SECURITY", tc.env)
+		if got := shareSecurityModel(); got != tc.want {
+			t.Errorf("JM_9P_SECURITY=%q: got %q, want %q", tc.env, got, tc.want)
+		}
 	}
 }

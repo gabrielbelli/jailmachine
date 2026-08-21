@@ -147,10 +147,20 @@ jm inspect | grep -i share
 > `jm set --mount "${P}:ro"` — and the same for a volume argument,
 > `-v "${P}:${P}:ro"`.
 
-> Shares are for source trees and data. Ownership follows the Mac user,
-> `utimes` is a silent no-op and `chown`/`mkfifo` fail, and 9p is far slower
-> than the guest's ZFS (tens of MB/s, roughly 20× slower on metadata) — keep
-> build output in an engine-managed volume.
+> Shares are for source trees and data. `utimes` is a silent no-op, no
+> `inotify` events reach a container (use a polling watcher — see
+> [#4](https://github.com/gabrielbelli/jailmachine/issues/4)), and 9p is far
+> slower than the guest's ZFS (~70 MB/s, and worse on metadata: 1000 small
+> files in 3.6 s against 0.76 s) — keep build output in an engine-managed
+> volume.
+
+> **A file a container creates shows up on the Mac as `0600`**, with its real
+> mode and owner in `user.virtfs.*` xattrs. Shares use the 9p `mapped-xattr`
+> security model, which keeps guest ownership and modes in xattrs instead of
+> on the host file — the only way a container running as root can rewrite a
+> file it has just made read-only, which `git clone` needs and macOS refuses
+> when the modes are host-native. `JM_9P_SECURITY=none` trades it back. See
+> [Modes and ownership on a share](docs/USAGE.md#modes-and-ownership-on-a-share).
 
 ## Name resolution
 
@@ -318,7 +328,7 @@ The full matrix, both workarounds, and the script that produced it
 |---|---|
 | Native FreeBSD OCI images | Works — run and build, e.g. `ghcr.io/freebsd/freebsd-runtime:15.1` |
 | Linux images | Works through the Linuxulator, with `--os=linux` (podman) or the wrapper's default platform (`jdocker`) |
-| Host directory sharing | Works — host paths appear in the guest at the **same absolute path** over 9p; defaults are your home tree, `/Volumes`, `/private/tmp` and `$TMPDIR`'s root. Slow (tens of MB/s), `utimes` is a no-op, `chown`/`mkfifo` fail |
+| Host directory sharing | Works — host paths appear in the guest at the **same absolute path** over 9p; defaults are your home tree, `/Volumes`, `/private/tmp` and `$TMPDIR`'s root. Slow (~70 MB/s), `utimes` is a no-op, no `inotify` events, and guest ownership and modes live in host xattrs |
 | Container DNS matching the host | Works — the host's own resolver answers for the guest, so VPN, split-horizon, `/etc/hosts` and `.local` names all match, and the Mac is `host.docker.internal` |
 | Autostart | Works on demand: `jpodman` and `jdocker` start a stopped machine. There is deliberately **no** login agent — `JM_AUTOSTART=0` opts out |
 | `docker.io/nginx` (Linux) | Works with **one config line**: `accept_mutex on;` in the `events` block. Stock nginx registers its listening socket with `EPOLLEXCLUSIVE` when `worker_processes > 1`, which FreeBSD's `linux_epoll` rejects. A ready-made image is in [demo/](demo/README.md#the-nginx-finding) |
@@ -392,5 +402,5 @@ Tracked, with measurements, in the issue tracker:
 |---|---|---|
 | [#2 UDP datagrams larger than the link MTU are dropped](https://github.com/gabrielbelli/jailmachine/issues/2) | gvproxy does not fragment: the ceiling is 8972 bytes at the default MTU, where Linux delivers 65507. Native FreeBSD containers hit the same wall, so it is the link, not the Linuxulator | `JM_MTU` (576–16384) moves the ceiling; `jm doctor` states it per machine |
 | [#3 Healthchecks never run, restart policies are not enforced](https://github.com/gabrielbelli/jailmachine/issues/3) | A podman-on-FreeBSD gap: no systemd timers, so `--health-interval` never fires and `--restart=always` applies only at boot. A bare-metal FreeBSD container host behaves the same | `jm ssh -- podman healthcheck run <name>`, or a cron entry in the guest |
-| [#4 9p shares deliver no inotify events, and run at ~70 MB/s](https://github.com/gabrielbelli/jailmachine/issues/4) | File watchers do not fire on host-side writes; reads are coherent immediately | Use polling watchers (`CHOKIDAR_USEPOLLING=1`, `nodemon --legacy-watch`, `--watch.usePolling`) |
+| [#4 9p shares deliver no inotify events, and run at ~70 MB/s](https://github.com/gabrielbelli/jailmachine/issues/4) | File watchers do not fire on host-side writes; reads are coherent immediately. Metadata is the bigger cost: 1000 small files take **3.6 s** on a share against **0.76 s** on the guest's own disk | Use polling watchers (`CHOKIDAR_USEPOLLING=1`, `nodemon --legacy-watch`, `--watch.usePolling`); keep build output in an engine-managed volume |
 

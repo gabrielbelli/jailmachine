@@ -170,7 +170,11 @@ any working directory.
   An unmountable share is a logged non-event; boot completes regardless.
 
 9p semantics are best-effort POSIX and the gaps are contractual: `utimes` is
-a silent no-op, `chown`/`mkfifo` fail, and throughput is tens of MB/s. Every
+a silent no-op, no `inotify` events reach a container, and throughput is around
+70 MB/s. Shares are exported with the `mapped-xattr` security model, so guest
+ownership and modes live in host `user.virtfs.*` xattrs rather than on the host
+file — without it the host end, an unprivileged Mac user, cannot honour a
+container running as root (ADR 0007 amendment, `$JM_9P_SECURITY` to override). Every
 container sees everything shared, read-write by default — the posture note
 lives in the README and in `jm init --help`.
 

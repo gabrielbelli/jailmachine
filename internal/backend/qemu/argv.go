@@ -127,8 +127,9 @@ func Args(m *machine.Machine, net backend.NetAttachment, p Paths) []string {
 
 // Host filesystem sharing (ADR 0007): one -fsdev/-device pair per share.
 //
-//   - security_model=none passes the host's own modes and symlinks through
-//     and needs no privilege; the mapped models rewrite both into xattrs.
+//   - security_model= chooses how guest metadata is stored: none applies the
+//     guest's modes to the host file, the mapped models keep them in xattrs
+//     (or a sidecar). See ShareSecurityModel below for why mapped-xattr wins.
 //   - multidevs=remap keeps inode numbers unique when one export spans
 //     several host filesystems (a home directory with a mounted volume
 //     under it), which the 9p protocol otherwise cannot express.
@@ -146,8 +147,24 @@ const (
 	ShareFsdevPrefix = "jmfs"
 	// ConfFsdevID is the -fsdev backend carrying the share table.
 	ConfFsdevID = "jmconf"
-	// ShareSecurityModel is the 9p security model (see above).
-	ShareSecurityModel = "none"
+	// ShareSecurityModel is the 9p security model for the share devices.
+	//
+	// "none" passes the host's modes straight through, which reads nicely
+	// on the Mac but breaks any container that relies on being root: the
+	// host end of the share runs as the unprivileged Mac user, so a file
+	// the container has just made read-only cannot be written again, and
+	// macOS enforces that even for the file's owner. Git does exactly this
+	// with its pack temp files, so "git clone" into a shared directory
+	// fails outright.
+	//
+	// "mapped-xattr" keeps the guest's ownership and modes in xattrs
+	// instead, so root in a container behaves as it does on Linux. The
+	// cost is cosmetic and host-side: a file a container creates shows up
+	// on the Mac as 0600 with user.virtfs.* xattrs, its real mode being
+	// the one the guest sees. Files the Mac creates keep their own modes
+	// and ownership in the guest, and a non-root container reads them.
+	// $JM_9P_SECURITY takes "none" or "mapped-file" for the other trade.
+	ShareSecurityModel = "mapped-xattr"
 )
 
 // shareArgs builds the 9p devices for a machine's shares. The first device
@@ -163,7 +180,7 @@ func shareArgs(m *machine.Machine, p Paths) []string {
 	addr := ShareAddrBase
 	add := func(id, hostPath, tag string, readOnly bool) {
 		fsdev := "local,id=" + id + ",path=" + escapeComma(hostPath) +
-			",security_model=" + ShareSecurityModel + ",multidevs=remap"
+			",security_model=" + shareSecurityModel() + ",multidevs=remap"
 		if readOnly {
 			fsdev += ",readonly=on"
 		}
@@ -237,4 +254,15 @@ func FirmwareDir(bin string) (string, error) {
 
 func shareFor(bin string) string {
 	return filepath.Join(filepath.Dir(filepath.Dir(bin)), "share", "qemu")
+}
+
+// shareSecurityModel returns the 9p security model for the share devices,
+// overridable with $JM_9P_SECURITY ("none", "mapped-xattr", "mapped-file").
+func shareSecurityModel() string {
+	switch v := strings.TrimSpace(os.Getenv("JM_9P_SECURITY")); v {
+	case "none", "mapped-xattr", "mapped-file":
+		return v
+	default:
+		return ShareSecurityModel
+	}
 }

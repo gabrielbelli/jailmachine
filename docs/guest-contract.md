@@ -112,10 +112,12 @@ with nothing rewriting the argument.
 - `seal.sh` stops the service and removes `/var/db/jm` so the builder's
   host tree never reaches a published image.
 
-Semantics are best-effort POSIX. Ownership follows the host user that runs
-the hypervisor; `utimes` is a silent no-op and `chown`/`mkfifo` fail. Shares
-carry source trees; engine-managed volumes stay the fast path for build
-output.
+Semantics are best-effort POSIX. The shares are exported with the 9p
+`mapped-xattr` security model, so guest ownership and modes are kept in host
+`user.virtfs.*` xattrs instead of on the host file — that is what lets a
+container running as root rewrite its own files; `utimes` is still a silent
+no-op and no `inotify` events reach the guest. Shares carry source trees;
+engine-managed volumes stay the fast path for build output.
 
 ## Name resolution (ADR 0008)
 

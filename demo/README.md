@@ -189,10 +189,15 @@ all. Each container is run under `timeout 120`.
 
 - **Bind mounts work, but over 9p.** FreeBSD has no virtiofs driver, so jm
   shares host directories with `virtio-9p` at the *same absolute path* —
-  `-v /Users/you/src:/app` works, from any directory. It is slow (tens of
-  MB/s), `utimes` is a silent no-op and `chown`/`mkfifo` fail, so keep build
-  output in a named volume on the guest's ZFS pool. `jm inspect` lists what
-  is shared; `jm set --mount/--unmount` changes it.
+  `-v /Users/you/src:/app` works, from any directory. It is slow (~70 MB/s,
+  and metadata far worse), `utimes` is a silent no-op and no `inotify` events
+  reach a container, so keep build output in a named volume on the guest's ZFS
+  pool and use a polling watcher (`CHOKIDAR_USEPOLLING=1`,
+  `nodemon --legacy-watch`, `--watch.usePolling`). A file a container creates
+  shows on the Mac as `0600`, its real mode in a `user.virtfs.mode` xattr —
+  the price of the `mapped-xattr` security model that makes root in a
+  container work. `jm inspect` lists what is shared; `jm set --mount/--unmount`
+  changes it.
 - **`--os=linux` on every Linux image**, for `build` and `run` alike.
 - **Not every Linux image works.** The Linuxulator implements most of the
   Linux syscall surface, not all of it — the missing `EPOLLEXCLUSIVE` is

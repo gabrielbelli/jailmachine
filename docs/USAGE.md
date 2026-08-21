@@ -639,6 +639,7 @@ machine record.
 | `JM_NETWORK` | `jm init` (recorded), providers | Network provider to create a machine with: `gvproxy` (default) or `user` (QEMU slirp: no `jm env`, no port publishing). Fixed at init — a machine keeps the networking it was created with |
 | `JM_BACKEND` | `jm init` (recorded), backends | Force a backend name. Needed on Linux, where there is no default backend yet (`JM_BACKEND=qemu`) |
 | `JM_QEMU_ACCEL` | QEMU backend | Accelerator override. Default `hvf` on macOS, `kvm` on Linux; `JM_QEMU_ACCEL=tcg` is pure emulation with `-cpu cortex-a72`, an order of magnitude slower — for building images on machines without a hypervisor, not for using them. Start-stage timeouts are stretched eightfold under TCG |
+| `JM_9P_SECURITY` | `jm start` (QEMU backend) | 9p security model for the share devices: `mapped-xattr` (the default), `none` or `mapped-file`. Anything else falls back to the default. Read from the environment at every `jm start` and **not** stored in the machine record, so a machine uses whatever was set when it was last started. `mapped-xattr` keeps guest ownership and modes in host xattrs, which is what lets a container running as root rewrite its own files; `none` passes the Mac's own modes straight through and breaks that. See [Modes and ownership on a share](#modes-and-ownership-on-a-share) |
 | `JM_IMAGE_BASEURL` | prebaked image source | Fetch the prebaked image and its `.sha256` from `$JM_IMAGE_BASEURL/<file name>` instead of the GitHub release. For testing an image that is not published yet |
 | `JM_GVPROXY` | gvproxy provider | Path to the `gvproxy` binary, instead of `PATH` and then `/opt/homebrew/opt/podman/libexec/podman/gvproxy` |
 | `JM_MTU` | `jm start` (gvproxy provider) | Link size gvproxy and the guest agree on. Default **9000**, the virtio-net jumbo frame; clamped to **576–16384** (a value below 576 or that is not a number falls back to the default, one above 9000 clamps to 9000). It caps published UDP at the MTU less 28 bytes — 8972 by default, 1472 with `JM_MTU=1500`, which is Docker's link size. Read from the environment at every `jm start` and **not** stored in the machine record, so a machine uses whatever was set when it was last started; the guest picks it up over DHCP. See [Datagrams are capped at 8972 bytes](#datagrams-are-capped-at-8972-bytes) |
@@ -892,6 +893,46 @@ disk is dropped at `jm start` with one warning and comes back when it does.
 >
 > bash is unaffected, but quoting is harmless there.
 
+## Modes and ownership on a share
+
+Shares are exported with the 9p **`mapped-xattr`** security model: the guest's
+ownership and modes are kept in host extended attributes rather than applied
+to the host file. The alternative, `none`, passes the Mac's own modes through
+unchanged — which reads better on the Mac, but the host end of the share runs
+as your unprivileged Mac user, so a container running as root cannot write a
+file it has just made read-only. macOS enforces the mode even for the file's
+owner. Git does exactly that with its pack temp files, so under `none` a clone
+into a shared directory fails outright:
+
+```text
+fatal: Unable to create temporary file '.../.git/objects/pack/tmp_pack_XXXXXX': Permission denied
+```
+
+Under `mapped-xattr` the same clone succeeds. What each end sees:
+
+| Created by | Mode | In the container | On the Mac |
+|---|---|---|---|
+| The Mac | `0755` | `-rwxr-xr-x`, owned by uid `501` — and a **non-root** container user can read it | `-rwxr-xr-x`, exactly as written |
+| A container running as root | `0700` | `-rwx------`, owned by uid `0` | `-rw-------`, with the real mode and owner in the `user.virtfs.mode` / `user.virtfs.uid` xattrs |
+
+The cost is therefore cosmetic and host-side: a file a container creates looks
+`0600` in `ls -l` on the Mac, and its executable bit lives in an xattr
+(`ls -l@`, `xattr -p user.virtfs.mode <file>`). Read-only shares stay
+read-only from the guest under either model.
+
+`$JM_9P_SECURITY` picks the model, read at every `jm start` and not stored in
+the machine record:
+
+```bash
+JM_9P_SECURITY=none jm start          # host-native modes; root in a container loses
+JM_9P_SECURITY=mapped-file jm start   # metadata in a sidecar directory instead of xattrs
+jm stop && jm start                   # back to the default, mapped-xattr
+```
+
+Prefer `none` only if host-side modes matter more to you than containers that
+run as root — a `git clone`, `npm install` or any build that chmods its own
+temporary files will fail there.
+
 ## What 9p does not do
 
 The transport is virtio-9p, because the FreeBSD guest has no virtiofs driver.
@@ -899,9 +940,10 @@ Semantics are best-effort POSIX and the gaps are contractual:
 
 | Gap | Effect |
 |---|---|
+| No `inotify`/`kqueue` events ([#4](https://github.com/gabrielbelli/jailmachine/issues/4)) | A file watcher in a container never fires on a host-side write, though reads are coherent straight away. Use a polling watcher: `CHOKIDAR_USEPOLLING=1` (chokidar, and everything built on it), `nodemon --legacy-watch`, `--watch.usePolling` for Vite and Vitest |
 | `utimes` is a silent no-op | Explicitly-set timestamps do not stick; `make` and other mtime-driven tools can misbehave on a shared tree |
-| `chown` and `mkfifo` fail | Ownership follows the Mac user; a build that chowns will error |
-| Throughput ~30–60 MB/s, ~20× slower than ZFS on metadata | Large builds are noticeably slower |
+| Guest ownership and modes live in host xattrs | Under `mapped-xattr` a `chown` in the guest sticks, but it is recorded in `user.virtfs.uid`/`user.virtfs.gid` rather than applied to the host file, and device and fifo nodes are plain host files carrying their real type in `user.virtfs.mode`. See [Modes and ownership on a share](#modes-and-ownership-on-a-share) |
+| Throughput ~70 MB/s, and metadata much slower still — creating 1000 small files takes **3.6 s** on a share against **0.76 s** on the guest's own disk ([#4](https://github.com/gabrielbelli/jailmachine/issues/4)) | Large builds and dependency installs are noticeably slower |
 
 Shares are for source trees and data. **Keep build output, image layers and
 databases in an engine-managed volume** (`-v myvol:/out`), which lives on the
@@ -1442,7 +1484,7 @@ Stated plainly, so you can plan around it.
 | Not here | Why / what instead |
 |---|---|
 | Autostart at login | Deliberate: `jpodman`/`jdocker` start a stopped machine on demand and nothing else does. See [Autostart](#autostart) |
-| Full POSIX semantics on a share | 9p, not virtiofs: `utimes` is a no-op, `chown`/`mkfifo` fail, and it is far slower than ZFS. See [What 9p does not do](#what-9p-does-not-do) |
+| Full POSIX semantics on a share | 9p, not virtiofs: `utimes` is a no-op, guest ownership and modes live in host xattrs, there are no `inotify` events, and it is far slower than ZFS (~70 MB/s). See [What 9p does not do](#what-9p-does-not-do) |
 | `--os=linux` per service under compose | Compose cannot ask for a platform. Under `jdocker` the wrapper's default platform covers it; under a plain `eval "$(jm env)"` shell, pre-pull with `jpodman pull --os=linux <image>` plus `pull_policy: missing` |
 | `docker.io/node` | The one Docker Hub image known not to work under the Linuxulator; see [Docker Hub compatibility](#docker-hub-compatibility-verified) |
 | A routable VM IP | gvproxy is NAT; vmnet/bridged networking is a later step |

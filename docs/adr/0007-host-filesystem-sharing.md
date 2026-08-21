@@ -57,3 +57,24 @@ to rewrite volume arguments — to parse engine flags, which ADR 0001 forbids.
   made once, stated in the README and reversible per machine, not assumed.
 - `jm doctor` gains a parity check: a file written on the host is visible to a
   container at the same absolute path.
+
+## Amendment, 2026-08-21 — shares run with `mapped-xattr`
+
+The QEMU backend exports shares with the 9p `mapped-xattr` security model, not
+`none`. "Best-effort POSIX" above is unchanged; this records which end of the
+trade-off it resolves to.
+
+`none` applies the guest's modes to the host file, and the host end of a share
+runs as the unprivileged Mac user. A container running as root therefore could
+not write a file it had just made read-only — macOS enforces the mode even for
+the owner — so `git clone` into a shared directory failed outright with
+`fatal: Unable to create temporary file '.../.git/objects/pack/tmp_pack_XXXXXX': Permission denied`,
+git creating its pack temp files read-only and then writing to them. Under
+`mapped-xattr` the same clone succeeds (verified end to end, 2026-08-21).
+
+**Guest-root semantics beat host-side cosmetics.** The cost is that a file a
+container creates appears on the Mac as `0600` with its real mode and owner in
+`user.virtfs.*` xattrs; files the Mac creates keep their modes in the guest and
+are readable by a non-root container user, and read-only shares stay read-only.
+`$JM_9P_SECURITY` (`none`, `mapped-xattr`, `mapped-file`), read at `jm start`,
+restores the old behaviour for anyone who prefers host-native modes.

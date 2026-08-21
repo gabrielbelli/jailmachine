@@ -49,6 +49,7 @@ guest, to the same address) — printing a one-line fix per failure. Note that i
 | `docker.io/node` prints `node --version` but nothing from `console.log`, and its servers never accept | Known-bad Linux image in this release | None. Use another image; see [USAGE](USAGE.md#node-the-one-known-bad-image) |
 | `docker compose up` → `no image found in image index for … OS "freebsd"` | Compose cannot ask for a platform, and the guest is FreeBSD | `jpodman pull --os=linux <image>` first, then `pull_policy: missing` on the service |
 | `-v /Users/me/src:/app` mounts an empty directory | The host path is outside the machine's share set, or it is under `/tmp` | `jm inspect` lists the shares; write `/private/tmp/...` not `/tmp/...`; add a root with `jm set --mount`. See *a share is empty* below |
+| `Permission denied` writing inside a shared directory, or `git clone` into one dies with `Unable to create temporary file '….git/objects/pack/tmp_pack_XXXXXX'` | The machine was started with `JM_9P_SECURITY=none`, where the host end of the share acts as your unprivileged Mac user and cannot rewrite a file the container has just made read-only | Drop the override (the default is `mapped-xattr`) and `jm stop && jm start`. See *permission denied writing to a share* below |
 | `zsh: no such file or directory` from `jm set --mount $P:ro` | zsh reads a trailing `:ro` as a history modifier | Quote it: `jm set --mount "${P}:ro"`, and `-v "${P}:${P}:ro"` |
 | A name resolves on the Mac but not in a container | The host resolver is down, or the guest was not pointed at it | `jm doctor`, then `resolver.log`. See *names do not resolve* below |
 | UDP datagrams over 8972 bytes never arrive | The gvproxy link does not fragment, and its MTU is 9000 by default | Keep datagrams under 8972 bytes, or use TCP; `jm doctor` states the limit, and `JM_MTU` at `jm start` moves it. See *UDP in a Linux container* below |
@@ -467,12 +468,49 @@ boots regardless — so `jm doctor` and `jm start`'s warnings are what tell you.
 
 Two more things that look like bugs and are not:
 
-- **`utimes` is a silent no-op and `chown`/`mkfifo` fail** on a 9p share. A
-  build that sets timestamps or ownership will misbehave; keep build output
-  in an engine-managed volume (`-v myvol:/out`) on the guest's ZFS.
+- **`utimes` is a silent no-op** on a 9p share, and guest-side ownership and
+  modes live in host xattrs rather than on the host file. A build that sets
+  timestamps will misbehave; keep build output in an engine-managed volume
+  (`-v myvol:/out`) on the guest's ZFS.
+- **File watchers never fire** on a host-side write: 9p delivers no `inotify`
+  events ([#4](https://github.com/gabrielbelli/jailmachine/issues/4)). Reads
+  are coherent immediately, so a polling watcher works —
+  `CHOKIDAR_USEPOLLING=1`, `nodemon --legacy-watch`, `--watch.usePolling`.
 - **zsh eats a trailing `:ro`.** `jm set --mount $P:ro` and
   `-v $P:$P:ro` fail before the command runs, because zsh reads `:ro` as a
   history modifier. Quote the whole value: `"${P}:ro"`, `"${P}:${P}:ro"`.
+
+## Permission denied writing to a share, or `git clone` fails in one
+
+```text
+fatal: Unable to create temporary file '/Users/me/src/x/.git/objects/pack/tmp_pack_XXXXXX': Permission denied
+```
+
+The host end of a 9p share runs as your ordinary Mac user, with no privilege
+of its own. Under the `none` security model it applies the guest's modes
+directly to the host file, so a process that creates a file read-only and then
+writes to it — which is exactly what git does with its pack temp files — is
+refused: macOS enforces the mode even for the file's owner, and being root in
+the container buys nothing.
+
+jm therefore starts shares with **`mapped-xattr`**, which keeps the guest's
+ownership and modes in host xattrs so root in a container behaves as it does
+on Linux. If you see this error, the machine was started with the override:
+
+| Setting | Behaviour |
+|---|---|
+| `JM_9P_SECURITY` unset, or `mapped-xattr` | **Default.** Root in a container works; a container-created file looks `0600` on the Mac, with its real mode in `user.virtfs.mode` |
+| `JM_9P_SECURITY=none` | Host-native modes on the Mac; a container that chmods its own files, `git clone` included, fails |
+
+The value is read at `jm start` and is not stored in the machine record, so
+one restart is the whole fix:
+
+```bash
+env | grep JM_9P_SECURITY     # is it set in your shell or profile?
+jm stop && jm start           # restart without it
+```
+
+See [Modes and ownership on a share](USAGE.md#modes-and-ownership-on-a-share).
 
 ## Names do not resolve in the guest or in a container
 
