@@ -1,65 +1,7 @@
 name: demo-images
 
-# Builds and publishes the jailmachine demo images (demo/) to GHCR.
-#
-# ---------------------------------------------------------------------------
-# ARCHITECTURE: why FreeBSD images are NOT published to :latest from here
-# ---------------------------------------------------------------------------
-# GitHub has no FreeBSD runner, so the FreeBSD images are built inside
-# vmactions/freebsd-vm -- a QEMU guest on ubuntu-latest, which is amd64. The
-# jailmachine guest on an Apple Silicon Mac is freebsd/arm64, so anything CI
-# produces natively is the wrong architecture for the machine these images
-# exist to demo.
-#
-# Three options were weighed:
-#   1. Build FreeBSD images only on a maintainer's Mac. Correct arch, but no
-#      CI signal at all -- a broken Containerfile ships unnoticed.
-#   2. Publish CI's amd64 to :latest. Fast and automatic, and useless: every
-#      demo audience on a Mac would get an unrunnable image.
-#   3. Run the action's aarch64 image. Right arch, but that is full-system
-#      TCG emulation on an amd64 host -- `pkg install nginx` alone takes tens
-#      of minutes, and the job is fragile.
-#
-# We take a fourth: CI builds all three FreeBSD images on amd64 as a real
-# smoke test and publishes them only under an explicit `-freebsd-amd64` tag
-# suffix, never :latest. The :latest and dated tags for FreeBSD images are
-# pushed by a maintainer from a Mac with `make -C demo push`, which is the
-# only practical source of freebsd/arm64. Trade-off, in three lines:
-#   + every push to demo/ still proves the FreeBSD Containerfiles build;
-#   + nobody can accidentally pull an amd64 image onto an arm64 machine;
-#   - freebsd/arm64 :latest is a manual step, so it can lag behind main.
-#
-# Linux images have no such problem: buildx + QEMU user-mode cross-builds
-# linux/amd64 and linux/arm64 cheaply, so CI publishes a proper manifest
-# list to :latest.
-#
-# ---------------------------------------------------------------------------
-# WHAT THE SMOKE TESTS MAY AND MAY NOT DO
-# ---------------------------------------------------------------------------
-# Nothing in this workflow may run a server in the foreground. The first
-# version did (`docker run --rm <nginx image>` with `daemon off;`), which
-# never returns: the job sat there for six hours and was killed by the
-# platform maximum. Servers are started detached, polled, and removed; every
-# job carries a timeout-minutes, and the long-running steps carry their own.
-#
-# The runner is amd64 with a real Linux kernel, so the honest split is:
-#   * linux/amd64 -- run it properly: start it, fetch /healthz, stop it.
-#   * linux/arm64 -- QEMU *user-mode* emulation, not the Linuxulator and not
-#     a real arm64 kernel. Unimplemented syscalls surface as failures that
-#     say nothing about the image (nginx's workers hit
-#     "io_setup() failed (38: Function not implemented)" there). So arm64 is
-#     checked structurally -- it builds, it loads, its config parses -- and
-#     anything more is a warning, never a failure. The real arm64 check is
-#     `make -C demo test` on a Mac.
-# ---------------------------------------------------------------------------
-
 on:
   workflow_dispatch:
-    inputs:
-      push:
-        description: "Push to ghcr.io (off = build and test only)"
-        type: boolean
-        default: true
   push:
     branches: [main]
     paths:
@@ -68,207 +10,130 @@ on:
 
 permissions:
   contents: read
-  packages: write
-
-env:
-  REGISTRY: ghcr.io
-  OWNER: gabrielbelli
 
 concurrency:
   group: demo-images-${{ github.ref }}
   cancel-in-progress: true
 
-jobs:
-  # --------------------------------------------------------------- prep ----
-  prep:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      date_tag: ${{ steps.t.outputs.date_tag }}
-      push: ${{ steps.t.outputs.push }}
-    steps:
-      - id: t
-        run: |
-          echo "date_tag=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
-          # workflow_dispatch honours the input; a push to main always publishes.
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "push=${{ inputs.push }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "push=true" >> "$GITHUB_OUTPUT"
-          fi
+# ---------------------------------------------------------------------------
+# PUBLISHING IS MANUAL, ON A MAC
+# ---------------------------------------------------------------------------
+# GitHub has no FreeBSD runner on any architecture, and hosted runners have no
+# nested virtualisation, so a FreeBSD guest here can only run under TCG
+# emulation. Rather than publish images this CI cannot properly test, the demo
+# images are built and pushed by a maintainer with jailmachine itself:
+#
+#     make -C demo build test push        # arm64, against the running machine
+#
+# This workflow is a signal-only check. It pushes nothing. When FreeBSD
+# arm64/amd64 runners become available, add a publishing job here and drop the
+# manual step from demo/README.md.
+#
+# ---------------------------------------------------------------------------
+# NO JOB HERE MAY RUN A SERVER IN THE FOREGROUND
+# ---------------------------------------------------------------------------
+# An earlier version smoke-tested the nginx images with `docker run --rm`.
+# Their entrypoint ends in `nginx -g 'daemon off;'`, so the command never
+# returns: the job sat there for six hours and was killed by the platform
+# maximum, and the `|| echo warning` after it never ran. Servers are started
+# detached, polled, and removed. Every job carries a timeout-minutes so no
+# future mistake of that shape can cost six hours again.
+# ---------------------------------------------------------------------------
 
-  # -------------------------------------------------------------- linux ----
-  # linux/amd64 + linux/arm64 manifest list. arm64 is the one the Mac guest
-  # actually runs, through FreeBSD's Linuxulator; amd64 is there for a future
-  # Linux/amd64 jailmachine backend and costs almost nothing to add.
+jobs:
+
   linux:
-    needs: prep
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    name: linux/${{ matrix.arch }} ${{ matrix.image }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
+        image: [linuxulator, nginx-linuxulator]
+        arch: [amd64, arm64]
         include:
-          # kind decides how the image is smoke-tested:
-          #   oneshot -- prints a report and exits; success is exit 0.
-          #   server  -- listens on :80; success is HTTP "ok" from /healthz.
-          - image: linuxulator
-            kind: oneshot
-          - image: nginx-linuxulator
-            kind: server
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
 
-      - uses: docker/setup-qemu-action@v4
-        with:
-          platforms: arm64
-
-      - uses: docker/setup-buildx-action@v4
-
-      - name: log in to ghcr.io
-        if: needs.prep.outputs.push == 'true'
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: build (and push) ${{ matrix.image }}
-        uses: docker/build-push-action@v7
-        timeout-minutes: 20
-        with:
-          context: demo/${{ matrix.image }}
-          file: demo/${{ matrix.image }}/Containerfile
-          platforms: linux/amd64,linux/arm64
-          push: ${{ needs.prep.outputs.push == 'true' }}
-          provenance: false
-          # The smoke-test builds below rebuild the same two platforms with
-          # --load; the registry cache turns that into a metadata lookup
-          # instead of a second (emulated) build.
-          cache-from: type=gha,scope=demo-${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=demo-${{ matrix.image }}
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.OWNER }}/jm-demo-${{ matrix.image }}:latest
-            ${{ env.REGISTRY }}/${{ env.OWNER }}/jm-demo-${{ matrix.image }}:${{ needs.prep.outputs.date_tag }}
-          labels: |
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-
-      # Same builder instance as the step above, so both of these are cache
-      # hits: the emulated arm64 layers are not rebuilt, only exported.
-      - name: load both platforms locally
-        timeout-minutes: 15
-        env:
-          IMAGE: ${{ matrix.image }}
-        run: |
-          set -eu
-          for arch in amd64 arm64; do
-            docker buildx build --platform "linux/$arch" --load \
-              -t "demo-smoke:$arch" \
-              -f "demo/$IMAGE/Containerfile" "demo/$IMAGE"
-          done
-
-      # ---- linux/amd64: the runner's own architecture, so test it for real.
-      - name: smoke test linux/amd64
-        timeout-minutes: 5
-        env:
-          KIND: ${{ matrix.kind }}
-        run: |
-          set -eu
-          case "$KIND" in
-          oneshot)
-            # No server, no --detach: a plain run must print its report and
-            # exit 0. `timeout` is belt and braces -- see the header.
-            timeout 120 docker run --rm --platform linux/amd64 demo-smoke:amd64
-            ;;
-          server)
-            docker rm -f demo-smoke >/dev/null 2>&1 || true
-            docker run -d --name demo-smoke --platform linux/amd64 \
-              -p 18080:80 demo-smoke:amd64
-            ok=0
-            for _ in $(seq 1 30); do
-              sleep 1
-              if [ "$(curl -fsS -m 3 http://127.0.0.1:18080/healthz 2>/dev/null)" = ok ]; then
-                ok=1; break
-              fi
-            done
-            if [ "$ok" = 1 ]; then
-              # The entrypoint writes whoami.txt at start; prove it did.
-              curl -fsS -m 3 -o /dev/null http://127.0.0.1:18080/
-              curl -fsS -m 3 http://127.0.0.1:18080/whoami.txt | head -5
-              echo "ok: /, /healthz and /whoami.txt all answered"
-            else
-              echo "::error::$KIND image did not answer /healthz on linux/amd64"
-            fi
-            docker logs demo-smoke 2>&1 | tail -20
-            docker rm -f demo-smoke >/dev/null 2>&1 || true
-            [ "$ok" = 1 ]
-            ;;
-          esac
-
-      # ---- linux/arm64: QEMU user-mode. Structural checks only; see header.
-      - name: structural check linux/arm64 (emulated, advisory)
+      - name: build ${{ matrix.image }} for linux/${{ matrix.arch }}
         timeout-minutes: 10
+        run: |
+          docker build --pull \
+            -t demo-smoke:${{ matrix.arch }} \
+            -f demo/${{ matrix.image }}/Containerfile \
+            demo/${{ matrix.image }}
+
+      - name: smoke test
+        timeout-minutes: 5
+        # Native architecture on both runners, so no emulation: the entrypoint
+        # really runs. It still runs on a Linux kernel, not the Linuxulator --
+        # the real check is "make -C demo test" on a Mac with jailmachine.
         env:
           IMAGE: ${{ matrix.image }}
-          KIND: ${{ matrix.kind }}
+          ARCH: ${{ matrix.arch }}
         run: |
           set -eu
-          # Always meaningful, emulation or not: the arm64 image loads, the
-          # emulator can start a process in it, and the entrypoint the
-          # Containerfile declares is present and executable.
-          ep=$(docker inspect -f '{{index .Config.Entrypoint 0}}' demo-smoke:arm64)
-          echo "entrypoint: $ep"
-          docker run --rm --platform linux/arm64 --entrypoint /bin/sh \
-            demo-smoke:arm64 -c "test -x '$ep'"
-          echo "ok: arm64 image loads and its entrypoint is executable"
-
-          case "$KIND" in
-          server)
-            # Config syntax only. Serving traffic under qemu-user fails on
-            # unimplemented syscalls (io_setup) and would say nothing about
-            # the image.
-            timeout 300 docker run --rm --platform linux/arm64 \
-              --entrypoint nginx demo-smoke:arm64 -t
-            echo "ok: nginx config parses on arm64"
-            ;;
-          oneshot)
-            timeout 300 docker run --rm --platform linux/arm64 demo-smoke:arm64 \
-              || echo "::warning::${IMAGE} exited non-zero under QEMU user-mode emulation; this is advisory, the real check is 'make -C demo test' on a Mac"
-            ;;
+          case "$IMAGE" in
+            nginx-*)
+              # Detached, polled, removed. Never in the foreground.
+              docker rm -f demo-smoke >/dev/null 2>&1 || true
+              docker run -d --name demo-smoke -p 18080:80 "demo-smoke:$ARCH"
+              ok=0
+              for _ in $(seq 1 30); do
+                sleep 1
+                if [ "$(curl -fsS -m 3 http://127.0.0.1:18080/healthz 2>/dev/null)" = ok ]; then
+                  ok=1; break
+                fi
+              done
+              if [ "$ok" = 1 ]; then
+                # entrypoint.sh writes whoami.txt at start; prove it did.
+                curl -fsS -m 3 -o /dev/null http://127.0.0.1:18080/
+                curl -fsS -m 3 http://127.0.0.1:18080/whoami.txt | head -3
+                echo "ok: /, /healthz and /whoami.txt all answered"
+              else
+                echo "::error::$IMAGE did not answer /healthz on linux/$ARCH"
+              fi
+              docker logs demo-smoke 2>&1 | tail -20
+              docker rm -f demo-smoke >/dev/null 2>&1 || true
+              [ "$ok" = 1 ]
+              ;;
+            *)
+              # A banner image: prints its report and exits 0 on its own.
+              # `timeout` only guards against it one day growing a daemon.
+              timeout 120 docker run --rm "demo-smoke:$ARCH"
+              ;;
           esac
 
-  # ------------------------------------------------------------ freebsd ----
-  # No FreeBSD runner exists, so this is a QEMU guest. Read the header above
-  # before changing what it publishes.
+  # The three FreeBSD images have no native runner anywhere, so this is the
+  # only automated check they get: a QEMU FreeBSD guest that builds all three
+  # and runs them. It publishes nothing (see the header) and it is amd64,
+  # while the machine these images exist for is freebsd/arm64 -- so what it
+  # proves is that the Containerfiles still build and the entrypoints still
+  # work, not that today's arm64 images are good. The arm64 check is
+  # `make -C demo test` on a Mac.
   freebsd:
-    needs: prep
+    name: freebsd/amd64 (build check)
     runs-on: ubuntu-latest
-    # The VM boots in ~2 min and the three builds take ~1 min; 45 leaves room
-    # for a slow pkg mirror without ever approaching the six-hour ceiling.
-    timeout-minutes: 45
+    # Boot + pkg + three builds + the smoke tests came to under two minutes;
+    # 30 leaves room for a slow pkg mirror and can never approach the
+    # six-hour platform ceiling.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
-      - name: build FreeBSD demo images in a FreeBSD VM
+      - name: build and smoke-test the FreeBSD demo images
         uses: vmactions/freebsd-vm@v1.5.3
-        timeout-minutes: 40
-        env:
-          GHCR_USER: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DATE_TAG: ${{ needs.prep.outputs.date_tag }}
-          DO_PUSH: ${{ needs.prep.outputs.push }}
-          OWNER: ${{ env.OWNER }}
+        timeout-minutes: 25
         with:
           # '15' resolves to the newest 15.x image the action publishes.
-          # At the time of writing that is 15.0, while the jailmachine guest
-          # runs 15.1 -- close enough for a build check, and it tracks forward
-          # automatically. Pin to '15.1' once that image exists upstream.
-          release: '15'
           # No `arch:` -- the default is the amd64 image, which is the only
           # one that runs at usable speed on an amd64 runner.
+          release: '15'
           copyback: false
-          envs: 'GHCR_USER GHCR_TOKEN DATE_TAG DO_PUSH OWNER'
           prepare: |
             set -eu
             pkg install -y podman-suite
@@ -289,54 +154,50 @@ jobs:
               /usr/local/etc/containers/pf.conf.sample > /etc/pf.conf
             sysrc pf_enable=YES
             service pf start || service pf reload
-            pfctl -sn || true
           run: |
             set -eu
             cd demo
-            REG=ghcr.io/$OWNER
-            ARCHTAG=freebsd-amd64
             IMAGES='freebsd nginx-native volume'
 
             for i in $IMAGES; do
               echo "=== building jm-demo-$i ==="
-              podman build -t "$REG/jm-demo-$i:$ARCHTAG" \
-                           -t "$REG/jm-demo-$i:$DATE_TAG-$ARCHTAG" "./$i"
+              podman build -t "jm-demo-$i:ci" "./$i"
             done
 
             # Output is captured into a variable rather than piped into
             # `grep -q`: grep -q exits on the first match and SIGPIPEs podman
             # mid-teardown, leaving the --rm container (and its volume) behind.
-            expect() {  # expect <needle> <haystack>
-              case "$2" in *"$1"*) echo "    ok" ;;
-                           *) echo "    FAILED: expected '$1' in:"; echo "$2"; exit 1 ;; esac
+            expect() {  # expect <needle> <output>
+              case "$2" in
+                *"$1"*) echo "    ok" ;;
+                *) echo "    FAILED: expected '$1' in:"; echo "$2"; exit 1 ;;
+              esac
             }
 
-            echo "=== smoke test (banner images must run with no args) ==="
-            expect FreeBSD "$(podman run --rm "$REG/jm-demo-freebsd:$ARCHTAG")"
+            echo "=== banner images must run with no args ==="
+            expect FreeBSD "$(podman run --rm jm-demo-freebsd:ci)"
             podman volume rm -f ci-selftest >/dev/null 2>&1 || true
-            expect 'now 1 line' \
-              "$(podman run --rm -v ci-selftest:/data "$REG/jm-demo-volume:$ARCHTAG")"
-            expect 'now 2 lines' \
-              "$(podman run --rm -v ci-selftest:/data "$REG/jm-demo-volume:$ARCHTAG")"
+            expect 'now 1 line'  "$(podman run --rm -v ci-selftest:/data jm-demo-volume:ci)"
+            expect 'now 2 lines' "$(podman run --rm -v ci-selftest:/data jm-demo-volume:ci)"
             podman volume rm -f ci-selftest >/dev/null 2>&1 || true
 
-            echo "=== smoke test (native nginx must answer /healthz) ==="
-            # NOTE ON WHERE WE FETCH FROM.
+            echo "=== native nginx must answer /healthz ==="
+            # WHERE WE FETCH FROM, AND WHY IT IS NOT THE PUBLISHED PORT.
             # This check used to fetch http://127.0.0.1:18081/healthz through
-            # the published port and always failed -- after thirteen minutes,
-            # because each attempt was a TCP SYN into a black hole retrying
-            # for ~75s. podman on FreeBSD publishes ports with pf rdr rules
+            # `-p 18081:80` and always failed -- after thirteen minutes,
+            # because every attempt was a TCP SYN into a black hole retrying
+            # on the RTO. podman on FreeBSD publishes ports with pf rdr rules
             # in the "cni-rdr" anchor, and those rules match traffic arriving
-            # on the *egress* interface. A connection from the VM to its own
-            # loopback never traverses them, so -p publishing is simply not
-            # testable from inside the same host. (The Mac never hits this:
-            # jm's forwarder dials the guest's vtnet0 address, which does
-            # traverse the rdr rule.) So we talk to the container on the
-            # podman bridge, which tests what this job is here to test --
-            # that native FreeBSD nginx starts and serves -- and leaves port
-            # publishing to the e2e test on a real machine.
+            # on the *egress* interface: a connection from the VM to its own
+            # loopback never traverses them. Port publishing is therefore not
+            # testable from inside the publishing host at all. (A Mac never
+            # hits this: jm's forwarder dials the guest's vtnet0 address,
+            # which does traverse the rdr rule, and `make -C demo test`
+            # covers that path.) So we talk to the container on the podman
+            # bridge, which is what this job is here to check -- that native
+            # FreeBSD nginx builds, starts and serves.
             podman rm -f ci-nginx >/dev/null 2>&1 || true
-            podman run -d --name ci-nginx -p 18081:80 "$REG/jm-demo-nginx-native:$ARCHTAG"
+            podman run -d --name ci-nginx jm-demo-nginx-native:ci
 
             ip=''
             for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -351,7 +212,7 @@ jobs:
             if [ -n "$ip" ]; then
               for _ in 1 2 3 4 5 6 7 8 9 10; do
                 sleep 2
-                # -T 3: never wait on the TCP retransmit timer.
+                # -T 3: never sit on the TCP retransmit timer.
                 if [ "$(fetch -q -T 3 -o - "http://$ip/healthz" 2>/dev/null)" = ok ]; then
                   ok=1; break
                 fi
@@ -360,26 +221,12 @@ jobs:
 
             if [ "$ok" = 1 ]; then
               fetch -q -T 3 -o /dev/null "http://$ip/" && echo "    ok (/ and /healthz answered)"
-              fetch -q -T 3 -o - "http://$ip/whoami.txt" | head -5
+              fetch -q -T 3 -o - "http://$ip/whoami.txt" | head -3
             else
               echo '    FAILED -- diagnostics follow:'
-              podman inspect ci-nginx | head -80 || true
+              podman inspect ci-nginx | head -60 || true
               pfctl -sn 2>&1 | head -20 || true
-              pfctl -a 'cni-rdr/*' -sn 2>&1 | head -20 || true
               podman logs ci-nginx 2>&1 | tail -20 || true
             fi
             podman rm -f ci-nginx >/dev/null 2>&1 || true
             [ "$ok" = 1 ] || { echo 'native nginx did not answer /healthz'; exit 1; }
-
-            if [ "$DO_PUSH" != 'true' ]; then
-              echo 'push disabled for this run; stopping after the build check'
-              exit 0
-            fi
-
-            echo "$GHCR_TOKEN" | podman login ghcr.io -u "$GHCR_USER" --password-stdin
-            for i in $IMAGES; do
-              # Deliberately arch-suffixed. :latest for these images is
-              # freebsd/arm64 and is pushed from a Mac -- see the header.
-              podman push "$REG/jm-demo-$i:$ARCHTAG"
-              podman push "$REG/jm-demo-$i:$DATE_TAG-$ARCHTAG"
-            done

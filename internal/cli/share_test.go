@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -122,6 +123,16 @@ func TestInitOptsShares(t *testing.T) {
 	// ... and the per-user temporary directory, where "mktemp -d" and
 	// os.MkdirTemp put things: without it "-v $(mktemp -d):/app" would
 	// mount an empty guest directory (ADR 0007).
+	//
+	// This half is macOS-shaped, like the feature: userTempRoot only
+	// recognises the /var/folders/<hash> layout, so on a Linux CI runner
+	// $TMPDIR is /tmp, no default root covers it, and there is nothing to
+	// assert. jm has no Linux backend, so that is correct rather than a
+	// gap -- but the assertion has to say so, or "go test ./..." on
+	// ubuntu-latest fails on a platform the feature does not target.
+	if userTempRoot() == "" {
+		t.Skipf("no per-user temp root on %s ($TMPDIR=%s); the default-share set is macOS-shaped", runtime.GOOS, os.TempDir())
+	}
 	tmp, err := machine.CanonicalHostPath(os.TempDir())
 	if err != nil {
 		t.Fatal(err)
