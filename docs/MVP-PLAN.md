@@ -3,8 +3,9 @@
 Goal: `brew install gabrielbelli/tap/jailmachine && jm init && jm start &&
 podman run -p 8080:80 docker.io/busybox httpd -f -p 80` works on an Apple
 Silicon Mac, with both Linux and native FreeBSD images, in under 3 minutes
-from a cold start. (Not `docker.io/nginx`: its workers need Linux AIO, which
-the Linuxulator lacks; see `guest/README.md`.)
+from a cold start. (`docker.io/nginx` works too, with `accept_mutex on;` in
+its `events` block — FreeBSD's `linux_epoll` has no `EPOLLEXCLUSIVE`; see
+`docs/USAGE.md` for the verified Docker Hub matrix.)
 
 Architecture: `docs/adr/`. Tools: `docs/tech-choices.md`. Proof of concept: `bin/jm` (shell, works today).
 

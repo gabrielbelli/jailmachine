@@ -13,14 +13,17 @@ prebaked release images are produced by running the very same script.
 
 Known kernel limits: no virtiofs (no host bind-mounts), no vsock (API over SSH).
 
-Known Linuxulator limits: Linux AIO (`io_setup`) returns `ENOSYS`, so Linux
-images whose servers rely on it do not work. `docker.io/nginx` (all current
-`alpine` tags tested: 1.27, 1.29, 1.31) is the notable case: its workers die
-with `io_setup() failed (38: Function not implemented)` while the master keeps
-the listening socket open, so connections are accepted but never answered
-(`curl` hangs, even from inside the guest). There is no `--os=linux`
-workaround; it needs an AIO implementation in `compat.linux`. Use `busybox
-httpd`, a native FreeBSD image, or another server (e.g. Caddy, Python `http.server`)
-instead. Ports published with a loopback `host_ip` (`-p 127.0.0.1:8080:80`)
+Known Linuxulator limits (the verified Docker Hub matrix is in
+`docs/USAGE.md`): `linux_epoll` does not implement `EPOLLEXCLUSIVE` and
+returns `EINVAL`, which is what kills stock `docker.io/nginx` — with
+`worker_processes > 1` nginx registers its listening socket with that flag
+and every worker dies with `epoll_ctl(1, 6) failed (22: Invalid argument)`.
+`accept_mutex on;` in the `events` block (or `worker_processes 1;`, or
+`reuseport`) makes it work; a ready-made image is `demo/nginx-linuxulator`.
+Linux AIO is absent too (`io_setup` returns `ENOSYS`), but that one is
+benign: nginx logs `io_setup() failed (38: Function not implemented)` once,
+disables file AIO and serves normally. `redis-server` needs
+`--ignore-warnings ARM64-COW-BUG`, and `docker.io/node` does not work at
+all. Ports published with a loopback `host_ip` (`-p 127.0.0.1:8080:80`)
 bind the guest's loopback, not the host's; `jm ports` reports them with a
 reason instead of forwarding them.

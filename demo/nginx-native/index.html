@@ -1,0 +1,40 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>jailmachine demo &middot; Native FreeBSD</title>
+<style>
+  :root { color-scheme: dark light; }
+  body { margin:0; min-height:100vh; display:grid; place-items:center;
+         background:#0d1117; color:#e6edf3;
+         font:16px/1.6 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  .card { width:min(46rem,92vw); padding:2.5rem; border-radius:14px;
+          background:#161b22; border:1px solid #30363d; }
+  .badge { display:inline-block; padding:.35rem .9rem; border-radius:999px;
+           font:600 .8rem/1 ui-monospace,monospace; letter-spacing:.08em;
+           text-transform:uppercase; }
+  .linux   { background:#3b1d5e; color:#d8b4fe; border:1px solid #7c3aed; }
+  .freebsd { background:#4a1414; color:#fca5a5; border:1px solid #c62828; }
+  h1 { margin:.9rem 0 .3rem; font-size:1.9rem; }
+  p.sub { margin:0 0 1.6rem; color:#8b949e; }
+  dl { display:grid; grid-template-columns:max-content 1fr; gap:.45rem 1.2rem;
+       margin:0; font:14px/1.5 ui-monospace,monospace; }
+  dt { color:#8b949e; } dd { margin:0; color:#e6edf3; }
+  a { color:#58a6ff; }
+  footer { margin-top:1.8rem; padding-top:1.2rem; border-top:1px solid #30363d;
+           color:#8b949e; font-size:.85rem; }
+</style>
+<div class="card">
+  <span class="badge freebsd">Native FreeBSD</span>
+  <h1>Same page. Same kernel.</h1>
+  <p class="sub">FreeBSD 15.1 userland, nginx from the FreeBSD ports tree. No emulation.</p>
+  <dl>
+    <dt>served by</dt><dd>nginx</dd>
+    <dt>runtime</dt><dd>Native FreeBSD</dd>
+    <dt>live facts</dt><dd><a href="/whoami.txt">/whoami.txt</a></dd>
+    <dt>health</dt><dd><a href="/healthz">/healthz</a></dd>
+  </dl>
+  <footer>
+    Both halves of this demo run on the <strong>same FreeBSD 15.1 kernel</strong>
+    inside one <code>jailmachine</code> VM. Only the userland differs.
+  </footer>
+</div>

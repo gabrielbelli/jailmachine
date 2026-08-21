@@ -1,5 +1,13 @@
 # Contributing
 
+> **This release is an MVP — a working demo.** It proves the whole idea end
+> to end and is usable day to day: `jm init && jm start`, then native
+> FreeBSD and Linux OCI images, published ports and bastille jails. Four
+> things are deliberately not in it — host directory mounts at identical
+> paths, DNS 1:1 with the host, autostart on login, and full `docker` CLI
+> parity (including a `jdocker` wrapper). They are being built on the
+> `docker-parity` branch; please raise them there rather than here.
+
 ## Ground rules
 
 - British English in prose (colour, licence, behaviour).

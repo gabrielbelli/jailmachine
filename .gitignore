@@ -4,4 +4,8 @@
 *.iso
 efistore
 /jm
+/jpodman
 /dist
+
+# Personal Claude Code instructions, not part of the project
+CLAUDE.md

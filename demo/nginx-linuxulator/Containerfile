@@ -1,0 +1,25 @@
+# jm-demo-nginx-linuxulator -- a real Docker Hub server image, working.
+#
+# Stock nginx:alpine, unmodified binaries, plus a config file whose only
+# functional change is `accept_mutex on;`. See nginx.conf for the full
+# story and the exact error it avoids.
+#
+# linux/arm64 image -- run it with --os=linux on the jailmachine guest.
+FROM docker.io/library/nginx:1.31-alpine
+
+LABEL org.opencontainers.image.title="jm-demo-nginx-linuxulator" \
+      org.opencontainers.image.description="Upstream nginx:alpine serving traffic under FreeBSD's Linuxulator (accept_mutex on)." \
+      org.opencontainers.image.source="https://github.com/gabrielbelli/jailmachine" \
+      org.opencontainers.image.licenses="BSD-2-Clause"
+
+COPY nginx.conf    /etc/nginx/nginx.conf
+COPY index.html    /usr/share/nginx/html/index.html
+COPY entrypoint.sh /usr/local/bin/entrypoint
+
+# The upstream image's /docker-entrypoint.d/ scripts rewrite worker_processes
+# and probe IPv6; we bypass them so the config above is exactly what runs.
+RUN chmod 0755 /usr/local/bin/entrypoint \
+ && rm -f /usr/share/nginx/html/50x.html
+
+EXPOSE 80
+ENTRYPOINT ["/usr/local/bin/entrypoint"]

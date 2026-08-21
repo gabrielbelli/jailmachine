@@ -1,0 +1,32 @@
+# jm-demo-nginx-native -- the same site, served by native FreeBSD nginx.
+#
+# Pair this with jm-demo-nginx-linuxulator on a second port and you can show
+# a Linux binary and a FreeBSD binary serving identical pages, side by side,
+# on one kernel:
+#
+#   jpodman run -d --name nginx-linux  --os=linux -p 8080:80 ghcr.io/gabrielbelli/jm-demo-nginx-linuxulator
+#   jpodman run -d --name nginx-native            -p 8081:80 ghcr.io/gabrielbelli/jm-demo-nginx-native
+#
+# Native image: no --os flag, because freebsd/<arch> is the guest's own
+# platform.
+FROM ghcr.io/freebsd/freebsd-runtime:15.1
+
+LABEL org.opencontainers.image.title="jm-demo-nginx-native" \
+      org.opencontainers.image.description="Native FreeBSD nginx serving the same page as the Linuxulator twin, for side-by-side demos." \
+      org.opencontainers.image.source="https://github.com/gabrielbelli/jailmachine" \
+      org.opencontainers.image.licenses="BSD-2-Clause"
+
+# pkg(8) works inside a container exactly as it does on a host.
+# Clean the repo metadata and package cache or the image doubles in size.
+RUN pkg install -y nginx \
+ && pkg clean -ay \
+ && rm -rf /var/cache/pkg /var/db/pkg/repos /usr/local/share/doc \
+ && mkdir -p /var/tmp/nginx /var/run
+
+COPY nginx.conf    /usr/local/etc/nginx/nginx.conf
+COPY index.html    /usr/local/www/nginx/index.html
+COPY entrypoint.sh /usr/local/bin/entrypoint
+RUN chmod 0755 /usr/local/bin/entrypoint
+
+EXPOSE 80
+ENTRYPOINT ["/usr/local/bin/entrypoint"]

@@ -120,10 +120,12 @@ Quickstart (three commands):
 
   jm init                      # download the FreeBSD image, write the seed
   jm start                     # boot, provision on first boot, connect podman
-  podman run --rm --os=linux docker.io/alpine echo hi
+  jpodman run --rm --os=linux docker.io/alpine echo hi
 
-Linux images run through the Linuxulator and need --os=linux on the host
-podman (or "podman pull --os=linux"); native FreeBSD images need nothing.
+jpodman is podman aimed at the machine ("podman --connection <name> ..."),
+so it works whatever your default connection is. Linux images run through
+the Linuxulator and need --os=linux on the host podman (or "podman pull
+--os=linux"); native FreeBSD images need nothing.
 
 Commands that take an optional [name] default to "jailmachine"; when that
 does not exist and exactly one machine does, that one is used. Exit codes:

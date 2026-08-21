@@ -1,5 +1,15 @@
 # Guest contract (concrete)
 
+> **This release is an MVP — a working demo.** It proves the whole idea end
+> to end and is usable day to day: `jm init && jm start`, then native
+> FreeBSD and Linux OCI images, published ports and bastille jails. The
+> polished behaviour — host directory mounts at identical paths, DNS 1:1
+> with the host, autostart on login, full `docker` CLI parity — is being
+> built on the `docker-parity` branch and is **not** in this release. This
+> page pins the contract that MVP guest image satisfies; the image itself is
+> published as the `guest-15.1.0` GitHub release and verified by `jm init`
+> against its `.sha256` sidecar.
+
 ADR 0003 defines the contract abstractly; this page pins the paths and
 behaviour `jm` relies on. Everything here is implemented by
 `guest/provision.sh` (the single source of truth), `guest/seal.sh` (what
@@ -81,7 +91,7 @@ can never diverge from it.
 |---|---|---|---|---|
 | *(default)* / `prebaked` / `prebaked:<ver>` | `Prebaked` | `https://github.com/gabrielbelli/jailmachine/releases/download/guest-<ver>/jailmachine-guest-<ver>-freebsd<rel>-arm64-zfs.raw.zst` | sidecar `<file>.sha256` (`<hash>  <file>`), mandatory | always true |
 | `official` / `official:<release>` | `Official` | `download.freebsd.org/releases/VM-IMAGES/<release>/aarch64/Latest/…BASIC-CLOUDINIT-zfs.raw.xz` | `CHECKSUM.SHA256`, mandatory | always true |
-| path or https URL to `.raw`, `.raw.xz`, `.raw.zst` | `BYO` | as given | sibling `<file>.sha256` if present | false without a sidecar (warning at `init`, shown by `inspect`) |
+| path or http(s) URL to `.raw` (or `.img`), `.raw.xz`, `.raw.zst` | `BYO` | as given | sibling `<file>.sha256` if present | false without a sidecar (warning at `init`, shown by `inspect`) |
 
 `<ver>` defaults to `image.GuestVersion` (a constant, bumped by hand when a
 new guest image is published); `<rel>` is the release without `-RELEASE`
@@ -119,7 +129,8 @@ make image [RELEASE=15.1-RELEASE]   # = ./jm image build --release $(RELEASE) --
    and a `.sha256` sidecar in `sha256sum` format.
 5. `jm rm jm-image-build`; `dist/.work` is deleted unless `--keep`.
 
-The build registers a podman connection named `jm-image-build` as the
-default while it runs and restores the previous default afterwards.
+The build registers a podman connection named `jm-image-build` while it
+runs and removes it again with `jm rm jm-image-build` at the end; a default
+connection you already had is left alone.
 Publish both files as assets of the GitHub release tagged
 `guest-<GuestVersion>`; `jm init` fetches them by default.

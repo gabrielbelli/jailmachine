@@ -1,0 +1,20 @@
+# jm-demo-freebsd -- "this really is FreeBSD"
+#
+# Native FreeBSD image: no --os flag needed, because the jailmachine guest is
+# a FreeBSD host and freebsd/arm64 is its native platform.
+#
+# freebsd-runtime is the small FreeBSD base (~32 MB): full base userland minus
+# the toolchain, docs and /boot. It is what you would build a FreeBSD service
+# image on top of.
+FROM ghcr.io/freebsd/freebsd-runtime:15.1
+
+LABEL org.opencontainers.image.title="jm-demo-freebsd" \
+      org.opencontainers.image.description="Proves the container's kernel and userland are FreeBSD, not Linux." \
+      org.opencontainers.image.source="https://github.com/gabrielbelli/jailmachine" \
+      org.opencontainers.image.licenses="BSD-2-Clause"
+
+COPY banner.sh /usr/local/bin/banner
+RUN chmod 0755 /usr/local/bin/banner
+
+# Runs with no arguments and exits 0.
+ENTRYPOINT ["/usr/local/bin/banner"]

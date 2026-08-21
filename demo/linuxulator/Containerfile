@@ -1,0 +1,20 @@
+# jm-demo-linuxulator -- "a Linux userland on a FreeBSD kernel"
+#
+# Stock Alpine, plus one shell script. Nothing here is patched or recompiled:
+# the point of the image is that an *unmodified* Linux distro runs as-is.
+#
+# This is a linux/arm64 image, so on the jailmachine guest you must ask for it
+# explicitly -- podman there defaults to freebsd/arm64:
+#
+#     jpodman run --rm --os=linux ghcr.io/gabrielbelli/jm-demo-linuxulator
+FROM docker.io/library/alpine:3.24
+
+LABEL org.opencontainers.image.title="jm-demo-linuxulator" \
+      org.opencontainers.image.description="Shows a stock Alpine userland running on FreeBSD's Linux ABI, with the evidence annotated." \
+      org.opencontainers.image.source="https://github.com/gabrielbelli/jailmachine" \
+      org.opencontainers.image.licenses="BSD-2-Clause"
+
+COPY probe.sh /usr/local/bin/probe
+RUN chmod 0755 /usr/local/bin/probe
+
+ENTRYPOINT ["/usr/local/bin/probe"]

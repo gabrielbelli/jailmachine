@@ -1,0 +1,23 @@
+# jm-demo-volume -- "your data lives in the guest, not on your Mac"
+#
+# Teaches the single biggest jailmachine gotcha: no virtiofs on FreeBSD means
+# no macOS host bind-mounts. Named volumes work; they live on the guest's
+# ZFS pool.
+#
+#   jpodman run --rm -v jm-demo-data:/data ghcr.io/gabrielbelli/jm-demo-volume
+#
+# Run it twice to watch the log grow. Native FreeBSD image -- no --os flag.
+FROM ghcr.io/freebsd/freebsd-runtime:15.1
+
+LABEL org.opencontainers.image.title="jm-demo-volume" \
+      org.opencontainers.image.description="Shows that container volumes live on the guest's ZFS pool, and why macOS bind-mounts do not work." \
+      org.opencontainers.image.source="https://github.com/gabrielbelli/jailmachine" \
+      org.opencontainers.image.licenses="BSD-2-Clause"
+
+COPY volume.sh /usr/local/bin/volume-demo
+RUN chmod 0755 /usr/local/bin/volume-demo
+
+# Deliberately NO `VOLUME /data`: without an explicit -v the image should
+# show you that /data is only an image directory, so the difference between
+# "a volume" and "not a volume" is visible in the demo.
+ENTRYPOINT ["/usr/local/bin/volume-demo"]

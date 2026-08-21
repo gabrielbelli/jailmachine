@@ -183,7 +183,7 @@ func runStart(ctx context.Context, args []string) error {
 	if err := startForwarder(m, p, ep); err != nil {
 		return err
 	}
-	logf(stdout, "ready: try 'podman run --rm --os=linux docker.io/alpine echo hi'")
+	logf(stdout, "ready: try 'jpodman run --rm --os=linux docker.io/alpine echo hi'")
 	return nil
 }
 

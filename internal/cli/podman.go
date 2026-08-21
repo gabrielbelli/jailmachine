@@ -19,7 +19,7 @@ const WrapperName = "jpodman"
 // clients an endpoint). Machine selection: $JM_MACHINE, else the default
 // resolution (the "jailmachine" machine, or the only one that exists).
 func newPodmanCmd() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "podman [podman args...]",
 		Short: "Run podman against a machine (also available as the jpodman binary)",
 		Long: "Execs the host podman with --connection <machine> prepended, leaving the\n" +
@@ -27,12 +27,16 @@ func newPodmanCmd() *cobra.Command {
 		Example: `  jm podman run --rm --os=linux docker.io/alpine echo hi
   jpodman build -t myapp .
   JM_MACHINE=dev jpodman ps`,
-		DisableFlagParsing: true,
-		SilenceUsage:       true,
+		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return execPodman(args)
 		},
 	}
+	// Stop parsing at the first positional ("run", "build", ...) so podman's
+	// own flags reach podman, while jm's global flags before the subcommand
+	// (jm --state-root DIR podman ps) are still honoured.
+	cmd.Flags().SetInterspersed(false)
+	return cmd
 }
 
 func execPodman(args []string) error {

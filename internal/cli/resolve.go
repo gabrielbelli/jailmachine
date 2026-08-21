@@ -32,6 +32,12 @@ func resolveDefault(existing []string) (name, note string, err error) {
 	}
 	names := append([]string(nil), existing...)
 	sort.Strings(names)
+	// The passthrough commands take no machine argument; they select with
+	// $JM_MACHINE instead, so suggesting "jm podman <name>" would loop.
+	if activeCommand == "podman" {
+		return "", "", usagef("no machine named %q and several exist: %s (choose one, e.g. 'JM_MACHINE=%s %s')",
+			machine.DefaultName, strings.Join(names, ", "), names[0], WrapperName)
+	}
 	return "", "", usagef("no machine named %q and several exist: %s (name one, e.g. 'jm %s %s')",
 		machine.DefaultName, strings.Join(names, ", "), activeCommand, names[0])
 }
