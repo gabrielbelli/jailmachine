@@ -185,45 +185,6 @@ the two workarounds and one known-bad image documented in
 `--ignore-warnings ARM64-COW-BUG`, and `node:22-alpine` does not work at
 all. Each container is run under `timeout 120`.
 
-## How these are built and published
-
-```bash
-jm start
-make -C demo build      # builds all five against the running machine
-make -C demo test       # runs each one and checks it behaves
-make -C demo push       # :latest and :YYYYMMDD -> ghcr.io/gabrielbelli
-```
-
-`push` needs a login first:
-
-```bash
-echo "$(gh auth token)" | podman login ghcr.io -u gabrielbelli --password-stdin
-```
-
-### Architecture, honestly
-
-`.github/workflows/demo-images.yml` publishes the **Linux** images
-(`linux/amd64` + `linux/arm64` manifest list) on every push touching `demo/`.
-That part is fully automatic.
-
-The **FreeBSD** images are not, and cannot easily be. GitHub has no FreeBSD
-runner, so CI builds them inside `vmactions/freebsd-vm`, which is an **amd64**
-QEMU guest — while the jailmachine guest on an Apple Silicon Mac is
-`freebsd/arm64`. So:
-
-- CI builds and smoke-tests all three FreeBSD images on amd64 and publishes
-  them only as `:freebsd-amd64` and `:YYYYMMDD-freebsd-amd64`. Never `:latest`.
-- `:latest` and the dated tag for FreeBSD images come from
-  `make -C demo push` on a maintainer's Mac. That is the only practical source
-  of `freebsd/arm64`.
-
-The trade-off: every push to `demo/` still proves the FreeBSD Containerfiles
-build, and nobody can accidentally pull an amd64 image onto an arm64 machine —
-but `freebsd/arm64:latest` is a manual step and can lag behind `main`. The
-rejected alternative was running the action's aarch64 image, which is
-full-system TCG emulation on an amd64 host: `pkg install nginx` alone takes
-tens of minutes.
-
 ## Known limits
 
 - **No macOS bind mounts.** FreeBSD has no virtiofs driver, so
