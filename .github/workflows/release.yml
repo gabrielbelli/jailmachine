@@ -1,8 +1,47 @@
 name: release
 
+# Cutting a release
+# -----------------
+# Push a tag ("v1.2.3") and this workflow builds, tests and publishes it:
+# the GitHub release, the archives and checksums, and the Homebrew cask in
+# gabrielbelli/homebrew-tap. CONTRIBUTING.md ("Cutting a release") is the
+# prose version, including the local `goreleaser release` fallback.
+#
+# The workflow degrades instead of going red:
+#
+#   * No HOMEBREW_TAP_GITHUB_TOKEN secret -> everything else is published and
+#     the cask is skipped with a notice naming the secret and the
+#     CONTRIBUTING.md section. The default GITHUB_TOKEN cannot push to
+#     another repository, so a missing PAT can only ever cost the cask; it
+#     must not cost the release.
+#   * A release already exists for the tag (a maintainer used the local
+#     fallback first) -> the assets are replaced instead of re-uploaded.
+#     Re-uploading is what used to fail the whole release with
+#     "422 Validation Failed [{Resource:ReleaseAsset ... Code:already_exists}]".
+#     See release.replace_existing_artifacts in .goreleaser.yaml.
+#
+# Two ways to exercise it without cutting a tag, both of which run this very
+# file rather than a copy of it:
+#   * workflow_dispatch, "Dry run" left on;
+#   * the release-dry-run job in ci.yml, which calls this workflow on every
+#     branch push and pull request.
+
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: build and check everything, publish nothing"
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      dry_run:
+        description: "Dry run: build and check everything, publish nothing"
+        type: boolean
+        default: true
+        required: false
 
 permissions:
   contents: write
@@ -10,23 +49,90 @@ permissions:
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # changelog needs the full history
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
       - name: unit tests
         run: go vet ./... && go test ./...
-      - uses: goreleaser/goreleaser-action@v6
+
+      # Work out what this run is allowed to do *before* goreleaser starts,
+      # so a missing secret is a notice at the top of the log rather than an
+      # empty-token failure two minutes in.
+      - name: plan the release
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Secrets cannot be used in `if:` conditions; test it in the shell.
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          # Empty for a tag push; "true"/"false" for workflow_dispatch and
+          # for the reusable-workflow call from ci.yml.
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -eu
+          skips=''
+          add_skip() { skips="${skips:+$skips,}$1"; }
+
+          # --- Homebrew cask: needs a cross-repository PAT ------------------
+          if [ -z "${TAP_TOKEN:-}" ]; then
+            add_skip homebrew
+            echo "::notice title=Homebrew cask skipped::the repository secret HOMEBREW_TAP_GITHUB_TOKEN is not set, so the cask is not pushed to gabrielbelli/homebrew-tap. Everything else still publishes. To enable it see CONTRIBUTING.md, 'Cutting a release' -> 'The Homebrew tap token'."
+            {
+              echo '### Homebrew cask skipped'
+              echo
+              echo 'The repository secret `HOMEBREW_TAP_GITHUB_TOKEN` is not set, so the'
+              echo 'cask was **not** pushed to `gabrielbelli/homebrew-tap`. Everything else'
+              echo 'in this release was published normally.'
+              echo
+              echo 'To enable it, follow **Cutting a release -> The Homebrew tap token** in'
+              echo 'CONTRIBUTING.md: create a fine-grained PAT with `contents: write` on'
+              echo '`homebrew-tap` and add it as the repository secret'
+              echo '`HOMEBREW_TAP_GITHUB_TOKEN`, then re-run this workflow.'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # --- an existing release for this tag is not an error -------------
+          # A maintainer may have cut it locally already (the documented
+          # fallback). release.replace_existing_artifacts in .goreleaser.yaml
+          # makes goreleaser replace the assets rather than POST duplicates;
+          # say so here so the log explains itself.
+          if [ "$REF_TYPE" = tag ]; then
+            tag="${GITHUB_REF#refs/tags/}"
+            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "::notice title=Release already exists::a release for $tag is already published (most likely a local 'goreleaser release'); its assets are replaced, not duplicated."
+            fi
+          fi
+
+          # --- dry run ------------------------------------------------------
+          # --skip=publish uploads nothing and pushes no cask; --skip=validate
+          # drops the "must be on a clean tag" check so a branch can run it.
+          # Everything else -- builds, archives, checksums, changelog and the
+          # skip decisions above -- happens for real.
+          if [ "${DRY_RUN_INPUT:-}" = true ]; then
+            add_skip publish
+            add_skip announce
+            add_skip validate
+            echo "::notice title=Dry run::building and checking everything, publishing nothing."
+          fi
+
+          args="release --clean${skips:+ --skip=$skips}"
+          echo "args=$args" >> "$GITHUB_OUTPUT"
+          echo "goreleaser $args"
+
+      - uses: goreleaser/goreleaser-action@v7
         with:
           version: "~> v2"
-          args: release --clean
+          args: ${{ steps.plan.outputs.args }}
         env:
           # Creates the GitHub release and uploads archives + checksums.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Pushes the formula to gabrielbelli/homebrew-tap; GITHUB_TOKEN is
-          # scoped to this repository only. See CONTRIBUTING.md.
+          # Pushes the cask to gabrielbelli/homebrew-tap; GITHUB_TOKEN is
+          # scoped to this repository only. When it is absent the step above
+          # added --skip=homebrew, so this empty value is never read.
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}

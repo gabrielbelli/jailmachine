@@ -113,6 +113,14 @@ release:
     name: jailmachine
   draft: false
   prerelease: auto
+  # A release for the tag may already exist: the documented fallback when CI
+  # cannot publish is for a maintainer to run "goreleaser release" from a Mac
+  # (CONTRIBUTING.md, "Cutting a release"). Without this, re-running the tag
+  # in CI dies with "422 Validation Failed ... Code:already_exists" on the
+  # first asset. Replacing the assets is safe: they are rebuilt from the same
+  # tag, and mod_timestamp/-trimpath keep the builds reproducible.
+  replace_existing_artifacts: true
+  replace_existing_draft: true
   footer: |
     ## Install
 

@@ -1,12 +1,22 @@
 name: ci
 
 on:
+  # Every branch, not just main: a branch is where a workflow change can be
+  # proved before it is merged, and where the release dry run below is
+  # actually useful.
   push:
-    branches: [main]
+    branches: ["**"]
+    tags-ignore: ["**"]
   pull_request:
 
 permissions:
   contents: read
+
+# A push and its pull_request event share a group (head_ref falls back to
+# ref), so a PR branch does not run the whole matrix twice.
+concurrency:
+  group: ci-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   unit:
@@ -20,9 +30,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-15]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -58,12 +69,26 @@ jobs:
 
   goreleaser-check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - uses: goreleaser/goreleaser-action@v6
+      - uses: goreleaser/goreleaser-action@v7
         with:
           version: "~> v2"
           args: check
+
+  # Runs .github/workflows/release.yml itself, in dry-run mode: real builds,
+  # real archives, real changelog, real "is the Homebrew secret there?"
+  # decision -- but --skip=publish, so nothing is uploaded and no tag is
+  # needed. This is what stops a release.yml change from being discovered
+  # only when a tag is pushed, which is how the v0.1.0 release broke.
+  release-dry-run:
+    uses: ./.github/workflows/release.yml
+    permissions:
+      contents: read
+    with:
+      dry_run: true
+    secrets: inherit
