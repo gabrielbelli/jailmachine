@@ -80,7 +80,7 @@ _jm_fstab()
 		printf '%s\t%s\tp9fs\t%s,late,failok\t0\t0\n' "$_tag" "$_dir" "$_mode" >> $_tmp
 	done < $_tab
 	printf '%s\n' "$_jm_end" >> $_tmp
-	chmod 644 $_tmp && mv $_tmp /etc/fstab
+	chmod 644 $_tmp && mv -f $_tmp /etc/fstab
 	return 0
 }
 
@@ -231,7 +231,9 @@ main(int argc, char **argv)
 }
 CSRC
 if cc -O2 -pipe -o /usr/local/sbin/jm-rtcsync.new /usr/local/etc/jm-rtcsync.c 2>/dev/null; then
-  mv /usr/local/sbin/jm-rtcsync.new /usr/local/sbin/jm-rtcsync
+  # -f: on a prebaked image the binary is already there, and mv would stop to
+  # ask whether to override a read-only file with no stdin to answer from.
+  mv -f /usr/local/sbin/jm-rtcsync.new /usr/local/sbin/jm-rtcsync
 else
   rm -f /usr/local/sbin/jm-rtcsync.new
   echo "jm-provision: no C compiler in this image; the guest clock will not resync after a host sleep"
