@@ -384,3 +384,13 @@ the Go binary is the product.
 ## Licence
 
 BSD-2-Clause. See [LICENSE](LICENSE).
+## Known issues
+
+Tracked, with measurements, in the issue tracker:
+
+| Issue | Effect | Workaround today |
+|---|---|---|
+| [#2 UDP datagrams larger than the link MTU are dropped](https://github.com/gabrielbelli/jailmachine/issues/2) | gvproxy does not fragment: the ceiling is 8972 bytes at the default MTU, where Linux delivers 65507. Native FreeBSD containers hit the same wall, so it is the link, not the Linuxulator | `JM_MTU` (576–16384) moves the ceiling; `jm doctor` states it per machine |
+| [#3 Healthchecks never run, restart policies are not enforced](https://github.com/gabrielbelli/jailmachine/issues/3) | A podman-on-FreeBSD gap: no systemd timers, so `--health-interval` never fires and `--restart=always` applies only at boot. A bare-metal FreeBSD container host behaves the same | `jm ssh -- podman healthcheck run <name>`, or a cron entry in the guest |
+| [#4 9p shares deliver no inotify events, and run at ~70 MB/s](https://github.com/gabrielbelli/jailmachine/issues/4) | File watchers do not fire on host-side writes; reads are coherent immediately | Use polling watchers (`CHOKIDAR_USEPOLLING=1`, `nodemon --legacy-watch`, `--watch.usePolling`) |
+
