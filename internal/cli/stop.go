@@ -47,8 +47,10 @@ func stopMachine(ctx context.Context, m *machine.Machine, graceful bool) error {
 	}
 	// The forwarder goes first, whatever the machine's state: while the
 	// provider is still up it can unexpose the mappings it owns, and a
-	// forwarder left over from a dead machine is tidied away.
+	// forwarder left over from a dead machine is tidied away. The host
+	// resolver goes with it: it exists only to answer this guest.
 	stopForwarder(ctx, m, p)
+	stopResolver(ctx, m)
 	st, err := stateOf(m, b, p)
 	if err != nil {
 		return err

@@ -119,7 +119,7 @@ func TestEndpointAndAttachment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := netprov.Endpoint{GuestIP: "192.168.127.2", SSHHost: "127.0.0.1", SSHPort: 2222, APISocket: dir + "/podman.sock", DNS: "192.168.127.1"}
+	want := netprov.Endpoint{GuestIP: "192.168.127.2", SSHHost: "127.0.0.1", SSHPort: 2222, APISocket: dir + "/podman.sock", DNS: "192.168.127.2", Gateway: "192.168.127.1", HostAlias: "192.168.127.254"}
 	if ep != want {
 		t.Fatalf("endpoint = %+v, want %+v", ep, want)
 	}

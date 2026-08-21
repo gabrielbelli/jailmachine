@@ -340,7 +340,7 @@ func TestInspectGvproxyShowsSocketConnection(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &i); err != nil {
 		t.Fatal(err)
 	}
-	if i.State != "stopped" || i.Network != "gvproxy" || i.APISocket != sock || i.PodmanSock != "unix://"+sock || i.DNS != gvproxy.Gateway {
+	if i.State != "stopped" || i.Network != "gvproxy" || i.APISocket != sock || i.PodmanSock != "unix://"+sock || i.DNS != gvproxy.GuestIP {
 		t.Errorf("unexpected inspect: %s", out)
 	}
 	text, err := run(t, root, "inspect", "gv")

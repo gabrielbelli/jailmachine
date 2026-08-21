@@ -19,10 +19,16 @@ type Result struct {
 	// External are desired mappings that already exist in the provider but
 	// were not created by us; they are left alone and not adopted.
 	External []netprov.Mapping
+	// Skipped are published ports that cannot be reached from the host at
+	// all (see Plan), seen for the first time. They are recorded in the
+	// state so that "jm ports" can explain them, and reported here so the
+	// forwarder says so once when it happens rather than leaving the user
+	// to discover a dead port with curl.
+	Skipped []Entry
 }
 
 func (r Result) changed() bool {
-	return len(r.Exposed)+len(r.Unexposed)+len(r.Failed) > 0
+	return len(r.Exposed)+len(r.Unexposed)+len(r.Failed)+len(r.Skipped) > 0
 }
 
 func (r Result) String() string {
@@ -35,6 +41,10 @@ func (r Result) String() string {
 	}
 	if len(r.Failed) > 0 {
 		parts = append(parts, fmt.Sprintf("failed %v", r.Failed))
+	}
+	for _, e := range r.Skipped {
+		parts = append(parts, fmt.Sprintf("warning: %s %s is published in the guest but not on the host: %s",
+			e.Proto, e.Local, e.Error))
 	}
 	if len(r.External) > 0 {
 		parts = append(parts, fmt.Sprintf("left alone (not ours) %v", r.External))
@@ -118,6 +128,7 @@ func ConvergeWith(ctx context.Context, p netprov.Provider, m *machine.Machine, d
 		s := skip[k]
 		s.Since = now
 		keep = append(keep, s)
+		res.Skipped = append(res.Skipped, s)
 		dirty = true
 	}
 	st.Owned = keep

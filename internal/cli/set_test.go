@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gabrielbelli/jailmachine/internal/forwarder"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
 )
 
@@ -47,6 +48,14 @@ func TestSetValidate(t *testing.T) {
 		{"disk zero", setOpts{disk: 0, diskSet: true}, "--disk must"},
 		{"port ok", setOpts{sshPort: 2223, sshPortSet: true}, ""},
 		{"port bad", setOpts{sshPort: 70000, sshPortSet: true}, "--ssh-port"},
+		// The publish address is validated where it is typed, so a typo
+		// is a usage error rather than a per-mapping expose failure once
+		// a container is running (ADR 0004).
+		{"publish ok", setOpts{publishAddr: "127.0.0.1", publishAddrSet: true}, ""},
+		{"publish wildcard", setOpts{publishAddr: "0.0.0.0", publishAddrSet: true}, ""},
+		{"publish default", setOpts{publishAddr: "", publishAddrSet: true}, ""},
+		{"publish junk", setOpts{publishAddr: "loclahost", publishAddrSet: true}, "--publish-addr"},
+		{"publish with port", setOpts{publishAddr: "127.0.0.1:8080", publishAddrSet: true}, "--publish-addr"},
 	}
 	for _, tc := range cases {
 		c, err := tc.o.validate(&m)
@@ -116,4 +125,49 @@ func TestFinishPendingGrowNoop(t *testing.T) {
 	m := machine.Defaults()
 	// No flag: must not touch the (nil) client.
 	finishPendingGrow(context.Background(), &m, nil)
+}
+
+// $JM_PUBLISH_ADDR is an override read once, at start, and written onto the
+// record: the forwarder runs detached, so an address left in the
+// environment of whichever shell booted the machine would be invisible to
+// "jm inspect" and would be lost the next time anyone ran a plain
+// "jm start" (ADR 0004).
+func TestApplyPublishAddrEnv(t *testing.T) {
+	old := stateRoot
+	defer func() { stateRoot = old }()
+	stateRoot = t.TempDir()
+
+	m := machine.Defaults()
+	m.Name = "pub"
+	if err := store().Save(&m); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unset: the record stands.
+	t.Setenv(forwarder.PublishAddrEnv, "")
+	os.Unsetenv(forwarder.PublishAddrEnv)
+	if err := applyPublishAddrEnv(&m); err != nil || m.PublishAddr != "" {
+		t.Fatalf("no variable: %q, %v", m.PublishAddr, err)
+	}
+
+	t.Setenv(forwarder.PublishAddrEnv, "127.0.0.1")
+	if err := applyPublishAddrEnv(&m); err != nil {
+		t.Fatal(err)
+	}
+	if m.PublishAddr != "127.0.0.1" {
+		t.Errorf("PublishAddr = %q", m.PublishAddr)
+	}
+	// It is persisted, not just held in memory.
+	reloaded, err := store().Load("pub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.PublishAddr != "127.0.0.1" {
+		t.Errorf("saved PublishAddr = %q", reloaded.PublishAddr)
+	}
+
+	t.Setenv(forwarder.PublishAddrEnv, "not-an-ip")
+	if err := applyPublishAddrEnv(reloaded); err == nil {
+		t.Error("a bad address was accepted")
+	}
 }

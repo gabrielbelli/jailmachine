@@ -34,7 +34,11 @@ const (
 // Capabilities are queried, never assumed: the CLI degrades features
 // instead of failing obscurely.
 type Capabilities struct {
-	SerialConsole   bool
+	SerialConsole bool
+	// FileSharing is whether the backend can export a machine's
+	// machine.Share set to the guest, each at its own absolute path
+	// (ADR 0007). Without it the CLI says the shares are ignored rather
+	// than letting a mount fail inside a container.
 	FileSharing     bool
 	RoutableNetwork bool
 }

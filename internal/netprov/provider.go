@@ -36,6 +36,16 @@ type Endpoint struct {
 	APISocket string
 	// DNS is the resolver the guest is handed, "" if unknown.
 	DNS string
+	// Gateway is the provider's own address on the guest network
+	// (gvproxy: 192.168.127.1), "" when the provider has none.
+	Gateway string
+	// HostAlias is the address, on the provider's network, that reaches
+	// the host itself (gvproxy translates 192.168.127.254 to the host's
+	// loopback, port for port). It is what host.containers.internal
+	// answers, and the address the guest sends DNS to when jm runs a host
+	// resolver for name-resolution parity (ADR 0008). "" when the provider
+	// offers no route back to the host.
+	HostAlias string
 }
 
 // Mapping is one host<->guest port forward. Local and Remote are

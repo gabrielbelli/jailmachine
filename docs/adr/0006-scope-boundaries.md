@@ -26,3 +26,14 @@
 
 New work enters scope only if it fits an existing interface without widening
 it, or comes with a new ADR that widens the interface deliberately.
+
+## Addendum (2026-08-21): host directory sharing is in scope
+
+Host directory sharing moves from "out of scope" to in scope, per **ADR
+0007**: the guest-side filesystem driver it was waiting for exists, so it
+fits the rule above by widening ADR 0002's Capabilities (a `FileSharing`
+capability with share descriptors) and ADR 0003's guest contract (shares
+mounted at the identity path before the engine starts), rather than adding a
+network filesystem with its own lifecycle. Name resolution parity (**ADR
+0008**) is likewise in scope as a property of the existing NetworkProvider.
+Both are optional per backend/provider and degrade with a stated reason.

@@ -10,6 +10,7 @@ require (
 	github.com/spf13/cobra v1.10.2
 	github.com/ulikunitz/xz v0.5.16
 	golang.org/x/crypto v0.55.0
+	golang.org/x/net v0.58.0
 )
 
 require (

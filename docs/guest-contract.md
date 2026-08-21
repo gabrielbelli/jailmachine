@@ -15,6 +15,10 @@ behaviour `jm` relies on. Everything here is implemented by
 | Engine API socket | `/var/run/podman/podman.sock` | our `podman_service` rc script (`/usr/local/etc/rc.d/podman_service`) |
 | SSH | `sshd`, root, `PermitRootLogin prohibit-password`, key from the seed | `provision.sh` |
 | Container storage | `zroot/containers` mounted at `/var/db/containers` | `provision.sh` |
+| Share mount script | `/usr/local/etc/rc.d/jm_shares` (`jm_shares_enable=YES`) | `provision.sh`, on both paths |
+| Share table (guest) | `/var/db/jm/conf/shares.tab`, a read-only 9p share tagged `jmconf` | the backend, at every start |
+| Clock resync | `/usr/local/sbin/jm-rtcsync` + `/usr/local/etc/rc.d/jm_rtcsync` (`jm_rtcsync_enable=YES`) | `provision.sh`, on both paths |
+| Clock resync log | `/var/log/jm-rtcsync.log` | `jm_rtcsync` via `daemon(8)` |
 | Seed mount (transient) | `/media/nuageinit` | `nuageinit` rc script |
 | Seed cache | `/var/cache/nuageinit/user_data` (+ `runcmds`) | `nuageinit` |
 | First-boot sentinel | `/firstboot` | the image; removed by `rc(8)` at the end of every boot that had it |
@@ -75,6 +79,112 @@ Consequences:
 The prebaked image is produced by running path 3 and sealing, so path 2
 can never diverge from it.
 
+## Host filesystem sharing (ADR 0007)
+
+The host exports one virtio-9p device per shared directory, plus one more,
+tagged `jmconf`, carrying the table that says which mount tag belongs at
+which path. `jm_shares` reads that table at boot and mounts every share at
+its **identity path** — the same absolute path it has on the host — so
+`-v /work/src:/app` and `-v /work/src:/work/src` both resolve in the guest
+with nothing rewriting the argument.
+
+- `# REQUIRE: FILESYSTEMS`, `# BEFORE: LOGIN`: the shares are in place
+  before `podman_service` (which requires `LOGIN`) starts.
+- The table is re-read on every boot, so `jm set --mount/--unmount` needs
+  only a restart; nothing is pushed into the guest over SSH.
+- The jm-managed block of `/etc/fstab` is regenerated from the table with
+  `late,failok`, so the mounts are declared where an administrator looks
+  for them. A mountpoint containing whitespace cannot be spelt in fstab and
+  is written as a comment; `jm_shares` mounts it regardless.
+- **Nothing here can stop the boot.** A share whose device is not attached
+  (an unplugged disk, an older `jm`) is logged and skipped; a guest with no
+  `p9fs` mounts nothing at all and boots normally. `KEYWORD: shutdown`
+  force-unmounts on the way down.
+- `seal.sh` stops the service and removes `/var/db/jm` so the builder's
+  host tree never reaches a published image.
+
+Semantics are best-effort POSIX. Ownership follows the host user that runs
+the hypervisor; `utimes` is a silent no-op and `chown`/`mkfifo` fail. Shares
+carry source trees; engine-managed volumes stay the fast path for build
+output.
+
+## Name resolution (ADR 0008)
+
+The guest resolves names the way the host does, because the host answers.
+`jm start` runs one host-side resolver per machine (`jm _resolver <name>`,
+detached, `resolver.pid` / `resolver.log` / `resolver.addr` in the machine
+directory) that answers DNS queries through **the host operating system's
+own resolution API**: `getaddrinfo(3)` through libSystem, so scoped and
+per-domain resolvers (VPN split horizon), `/etc/hosts` and `.local`
+multicast names all apply without `jm` modelling any of them.
+
+The host resolver cannot bind port 53 — that needs root — so the guest runs
+the one hop that turns "port 53, as libc insists" into the port it did bind:
+
+- `/var/unbound/unbound.conf`: `local_unbound` from the base system as a
+  pure forwarder to `<host alias>@<port>`, no cache, no validator, bound to
+  `127.0.0.1` and the guest's own address (a reply must come from the
+  address the query went to, or a container drops it as a spoof). unbound's
+  built-in blackhole zones for `local.`, `254.169.in-addr.arpa.` and the
+  RFC 6761 special-use TLDs (`test.`, `invalid.`, `home.arpa.`, `onion.`)
+  are disabled with `nodefault`, or a `.test` name in the host's
+  `/etc/hosts` would be NXDOMAIN in a container. `localhost.` is left
+  alone: its built-in loopback answer must stand.
+- `/etc/resolv.conf`: the host's search list and **exactly one** nameserver,
+  the guest's own address, so a container's copy of the file works from its
+  own network namespace. `resolv_conf="/dev/null"` in `/etc/resolvconf.conf`
+  keeps DHCP from putting the provider's nameserver back.
+- `/usr/local/etc/containers/containers.conf.d/50-jailmachine-dns.conf`:
+  `host_containers_internal_ip`, so the `host.containers.internal` and
+  `host.docker.internal` entries the engine writes into every container's
+  hosts file name the user's computer rather than the guest.
+
+All three are rewritten only when their contents change, and nothing is
+restarted otherwise, so a `jm start` on a running machine does not disturb
+name resolution for containers that are already up. `/etc/resolv.conf` is
+only taken over once the forwarder answers, so a failure leaves the guest
+with the resolution it already had. The port is remembered across restarts
+(`resolver.port`), so a rebooted guest resolves before `jm start` reaches it.
+
+A guest that meets this contract but has no working `local_unbound` — a
+bring-your-own image, or a transient failure — does not stop `jm start`: it
+warns, leaves the guest with the resolution it booted with and carries on,
+and `jm doctor`'s `guest resolver <name>` check reports the loss afterwards.
+The one hard failure is a guest whose `/etc/resolv.conf` jm already owns and
+which now points at a dead resolver: there is nothing to fall back to.
+
+The same applies to the shares: a guest with no `jm_shares` script has the
+devices attached and mounts nothing, which is otherwise silent, so `jm start`
+warns and `jm doctor` fails its `share parity <name>` check — it writes a
+file on the host and asserts the guest sees it at the same absolute path.
+
+## Clock
+
+A virtual machine's timekeeping stops with its host: after the Mac sleeps
+the guest wakes minutes or hours behind, and certificates, builds, package
+signatures and container ages are all wrong until something corrects it.
+The hypervisor's RTC keeps host wall time, so the correction is the guest's
+own and needs neither an NTP server nor anything pushed over SSH:
+
+- `/usr/local/sbin/jm-rtcsync`, compiled by `provision.sh` from a C source
+  it writes to `/usr/local/etc/jm-rtcsync.c` (the base system's `cc`; an
+  image without a compiler logs the fact and goes without). It reads the
+  RTC through `/dev/efi` (`EFIIOC_GET_TIME`) every 10 s and steps the clock
+  with `settimeofday` past a 2 s difference.
+- `/usr/local/etc/rc.d/jm_rtcsync` (`jm_rtcsync_enable=YES`), installed on
+  both provisioning paths, so a prebaked image that predates it picks it up
+  on the first boot of a new machine. `REQUIRE: FILESYSTEMS`, `BEFORE:
+  LOGIN`: the clock is right before the engine and any container start.
+- `machdep.disable_rtc_set=1` (`/etc/sysctl.conf`) is **mandatory**:
+  without it the kernel writes the guest's own skew back into the RTC and
+  the reference is gone.
+
+`jm start` measures the guest clock against the host's once sshd answers
+and steps it when they differ by more than five seconds, so a machine that
+was already running through a host sleep, or a guest too old to carry the
+service, is right before anything runs in it. `jm doctor` reports the skew
+and whether the service is running.
+
 ## Image sources (`internal/image`)
 
 | `--image` | Source | Fetched from | Verified by | `image_trusted` |
@@ -119,7 +229,9 @@ make image [RELEASE=15.1-RELEASE]   # = ./jm image build --release $(RELEASE) --
    and a `.sha256` sidecar in `sha256sum` format.
 5. `jm rm jm-image-build`; `dist/.work` is deleted unless `--keep`.
 
-The build registers a podman connection named `jm-image-build` as the
-default while it runs and restores the previous default afterwards.
+The build registers a podman connection named `jm-image-build` while it runs
+and removes it again with `jm rm jm-image-build` at the end. It does not make
+it the default, but podman promotes the first connection it is ever given, so
+the build remembers the previous default and restores it afterwards.
 Publish both files as assets of the GitHub release tagged
 `guest-<GuestVersion>`; `jm init` fetches them by default.

@@ -6,13 +6,50 @@ import (
 	"net"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/gabrielbelli/jailmachine/internal/netprov"
 )
 
-// DefaultHostIP is the host address a mapping binds to when podman reports
-// an empty host_ip (plain "-p 8080:80").
-const DefaultHostIP = "127.0.0.1"
+// DefaultHostIP is the host address a published port binds to: every
+// interface, as "docker run -p 8080:80" does on Linux. The provider's
+// listener is dual-stack, so 127.0.0.1, ::1, "localhost" and the machine's
+// LAN address all reach the container.
+const DefaultHostIP = "0.0.0.0"
+
+// PublishAddrEnv overrides that address for people who do not want
+// containers on the LAN: JM_PUBLISH_ADDR=127.0.0.1 keeps published ports on
+// the host's loopback. It is a host-side choice; the guest is unaffected.
+// "jm start" reads it and writes it onto the machine record, so that the
+// address a detached forwarder is really binding is the one "jm inspect"
+// and "jm ports" show, rather than ambient state of the shell that
+// happened to boot the machine.
+const PublishAddrEnv = "JM_PUBLISH_ADDR"
+
+// ParsePublishAddr validates a publish address, returning its canonical
+// form. An empty value means the default. A typo must be a usage error
+// where it is typed, not a per-mapping expose failure minutes later.
+func ParsePublishAddr(v string) (string, error) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "", nil
+	}
+	ip := net.ParseIP(v)
+	if ip == nil {
+		return "", fmt.Errorf("%q is not an IP address (%s publishes on every interface, %s on the loopback only)",
+			v, DefaultHostIP, "127.0.0.1")
+	}
+	return ip.String(), nil
+}
+
+// HostIP resolves a machine's configured publish address, falling back to
+// the default.
+func HostIP(configured string) string {
+	if v := strings.TrimSpace(configured); v != "" {
+		return v
+	}
+	return DefaultHostIP
+}
 
 // psContainer is the subset of one "podman ps --format json" entry we use
 // (podman 5.x/6.x shape).
@@ -38,8 +75,8 @@ type psPort struct {
 // port is mapped to the same port on the guest (podman in the guest already
 // maps it to the container port). Containers that are not running (ps -a
 // output, exited entries) contribute nothing.
-func Desired(psJSON []byte, guestIP string) ([]netprov.Mapping, error) {
-	out, _, err := Plan(psJSON, guestIP)
+func Desired(psJSON []byte, guestIP, hostIP string) ([]netprov.Mapping, error) {
+	out, _, err := Plan(psJSON, guestIP, hostIP)
 	return out, err
 }
 
@@ -50,7 +87,8 @@ func Desired(psJSON []byte, guestIP string) ([]netprov.Mapping, error) {
 // the port. Those come back as entries with Error set and no Remote, so
 // "jm ports" can say why they are unreachable instead of listing them as
 // ok.
-func Plan(psJSON []byte, guestIP string) ([]netprov.Mapping, []Entry, error) {
+func Plan(psJSON []byte, guestIP, hostIP string) ([]netprov.Mapping, []Entry, error) {
+	hostIP = HostIP(hostIP)
 	var cs []psContainer
 	if len(psJSON) > 0 {
 		if err := json.Unmarshal(psJSON, &cs); err != nil {
@@ -68,7 +106,7 @@ func Plan(psJSON []byte, guestIP string) ([]netprov.Mapping, []Entry, error) {
 			if p.HostPort == 0 {
 				continue
 			}
-			for _, mp := range expand(p, guestIP) {
+			for _, mp := range expand(p, guestIP, hostIP) {
 				k := key(mp)
 				if seen[k] {
 					continue
@@ -88,36 +126,65 @@ func Plan(psJSON []byte, guestIP string) ([]netprov.Mapping, []Entry, error) {
 	return out, skipped, nil
 }
 
-// publishable reports whether a host_ip podman bound in the guest is
-// reachable from outside the guest: empty, a wildcard, or the guest's own
-// address.
+// publishable reports whether a port published in the guest can be reached
+// at the guest's own address, which is the only way into it from the host.
+//
+// The engine in the guest turns "-p 8080:80" into redirect rules for each
+// of the guest's addresses, so an unqualified publish is reachable. Every
+// form that names a host address is not: an address the guest does not have
+// (the host's loopback, a host LAN address) makes it bind that address
+// inside the guest, and the literal wildcard 0.0.0.0 makes it write a
+// redirect rule whose destination is 0.0.0.0 itself, which no packet ever
+// matches. Both are guest-side facts; nothing the forwarder does on the
+// host can reach such a container.
 func publishable(hostIP, guestIP string) bool {
-	switch hostIP {
-	case "", "0.0.0.0", "::", guestIP:
-		return true
-	}
-	return false
+	return hostIP == "" || hostIP == guestIP
 }
 
+// unpublishableReason explains, in the words of the command the user typed,
+// why a published port cannot be reached and what to type instead.
 func unpublishableReason(p psPort) string {
-	return fmt.Sprintf("guest binds %s only; publish with -p %d:%d (or 0.0.0.0)",
-		p.HostIP, p.HostPort, p.ContainerPort)
+	target := fmt.Sprintf("-p %d:%d", p.HostPort, p.ContainerPort)
+	if p.Protocol != "" && p.Protocol != "tcp" {
+		target += "/" + p.Protocol
+	}
+	if p.HostIP == "0.0.0.0" || p.HostIP == "::" {
+		return "the guest engine redirects to " + p.HostIP + " itself, which never matches; publish with " + target + " (no host address)"
+	}
+	// The remedy has two halves and needs both: dropping the host address
+	// is what makes the port reachable at all, and the machine's publish
+	// address is what keeps the host side where the user asked for it.
+	// Naming only the first would turn "keep this on the loopback" into
+	// "put this on the LAN".
+	return fmt.Sprintf("%s binds the guest's own %s, not the host's; publish with %s and bind the host side with 'jm set --publish-addr %s'",
+		p.HostIP, addressWord(p.HostIP), target, p.HostIP)
+}
+
+// addressWord names the kind of address a host_ip is, so the message reads
+// as an explanation rather than an echo.
+func addressWord(ip string) string {
+	if a := net.ParseIP(ip); a != nil && a.IsLoopback() {
+		return "loopback"
+	}
+	return "address"
 }
 
 // expand turns one port mapping (with its range) into one Mapping per host
 // port. Mappings whose host_ip is not publishable (see publishable) have an
 // empty Remote.
-func expand(p psPort, guestIP string) []netprov.Mapping {
+func expand(p psPort, guestIP, hostIP string) []netprov.Mapping {
 	proto := p.Protocol
 	if proto == "" {
 		proto = "tcp"
 	}
-	hostIP := p.HostIP
-	if hostIP == "" {
-		hostIP = DefaultHostIP
-	}
+	// A publishable port binds the host's chosen publish address; an
+	// unpublishable one keeps the address the user asked for, so that
+	// "jm ports" shows what they typed next to why it cannot work.
+	local := p.HostIP
 	remoteIP := guestIP
-	if !publishable(p.HostIP, guestIP) {
+	if publishable(p.HostIP, guestIP) {
+		local = hostIP
+	} else {
 		remoteIP = ""
 	}
 	n := int(p.Range)
@@ -136,7 +203,7 @@ func expand(p psPort, guestIP string) []netprov.Mapping {
 		}
 		out = append(out, netprov.Mapping{
 			Proto:  proto,
-			Local:  net.JoinHostPort(hostIP, strconv.Itoa(port)),
+			Local:  net.JoinHostPort(local, strconv.Itoa(port)),
 			Remote: remote,
 		})
 	}

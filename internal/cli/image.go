@@ -102,8 +102,9 @@ func runImageBuild(ctx context.Context, o imageBuildOpts) error {
 	logf(stdout, "image: building %s", target)
 	logf(stdout, "image: build machine %q under %s (ssh port %d)", imageBuildName, work, imageBuildSSHPort)
 
-	// The build machine's podman connection is registered as the default
-	// by "jm start"; remember the user's and put it back afterwards.
+	// podman promotes the first connection it is ever given to the default,
+	// so on a host with no connections at all the build machine's would
+	// become it. Remember the user's default and put it back afterwards.
 	prevDefault := podmanDefaultConnection(ctx)
 	defer restorePodmanDefault(ctx, prevDefault)
 

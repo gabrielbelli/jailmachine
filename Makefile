@@ -41,6 +41,7 @@ clean:
 	rm -rf jm dist
 
 PREFIX ?= /opt/homebrew
-install: ## build and install jm into $(PREFIX)/bin
+install: ## build and install jm, jpodman and jdocker into $(PREFIX)/bin
 	go build -ldflags "$(LDFLAGS)" -o $(PREFIX)/bin/jm ./cmd/jm
 	ln -sf jm $(PREFIX)/bin/jpodman
+	ln -sf jm $(PREFIX)/bin/jdocker

@@ -23,6 +23,7 @@ import (
 	"github.com/gabrielbelli/jailmachine/internal/machine"
 	"github.com/gabrielbelli/jailmachine/internal/netprov"
 	"github.com/gabrielbelli/jailmachine/internal/netprov/gvproxy"
+	"github.com/gabrielbelli/jailmachine/internal/resolver"
 )
 
 // Status is the outcome of one check.
@@ -105,6 +106,7 @@ func Run(ctx context.Context, o Options) Report {
 	add := func(res ...Result) { r.Results = append(r.Results, res...) }
 
 	add(checkHost())
+	add(checkHostResolver())
 	add(checkQEMU(ctx, o.Run)...)
 	add(checkGvproxy(ctx, o.Run))
 	add(checkPodman(ctx, o.Run))
@@ -117,6 +119,23 @@ func Run(ctx context.Context, o Options) Report {
 		add(o.Machines(ctx)...)
 	}
 	return r
+}
+
+// checkHostResolver reports whether this build can reach the host operating
+// system's resolver. Without it jm answers guest queries from Go's own DNS
+// client, which sees neither scoped (VPN) resolvers nor /etc/hosts nor
+// .local: public names keep working and everything private stops, which is
+// exactly the invisible regression ADR 0008 refuses to allow.
+func checkHostResolver() Result {
+	res := Result{Name: "host resolver"}
+	if resolver.HostResolver {
+		res.Status, res.Detail = OK, "queries go through the host resolver (getaddrinfo)"
+		return res
+	}
+	res.Status = Fail
+	res.Detail = "built with the netgo build tag: name resolution in the guest would miss VPN, /etc/hosts and .local names"
+	res.Fix = "rebuild jm without '-tags netgo' (CGO_ENABLED does not matter on darwin), and do not set GODEBUG=netdns=go"
+	return res
 }
 
 func execRun(ctx context.Context, bin string, args ...string) (string, error) {

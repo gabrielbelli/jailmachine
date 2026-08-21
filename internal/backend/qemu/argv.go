@@ -53,6 +53,10 @@ type Paths struct {
 	QMP     string // qmp.sock
 	PID     string // qemu.pid
 	Log     string // qemu.log (not passed to qemu; captured from its stderr)
+	// GuestConf is the host directory exported read-only to the guest
+	// under machine.GuestConfTag; it carries the share table (ADR 0007).
+	// Empty means the machine shares nothing.
+	GuestConf string
 }
 
 // AccelEnv overrides the accelerator, e.g. JM_QEMU_ACCEL=tcg to run the
@@ -109,14 +113,70 @@ func Args(m *machine.Machine, net backend.NetAttachment, p Paths) []string {
 		"-drive", "file=" + escapeComma(p.Seed) + ",format=raw,if=virtio,readonly=on",
 	}
 	args = append(args, netdevArgs(net, mac)...)
+	args = append(args, "-device", "virtio-rng-pci")
+	args = append(args, shareArgs(m, p)...)
 	args = append(args,
-		"-device", "virtio-rng-pci",
 		"-display", "none",
 		"-serial", "file:"+escapeComma(p.Console),
 		"-qmp", "unix:"+escapeComma(p.QMP)+",server,nowait",
 		"-daemonize",
 		"-pidfile", p.PID,
 	)
+	return args
+}
+
+// Host filesystem sharing (ADR 0007): one -fsdev/-device pair per share.
+//
+//   - security_model=none passes the host's own modes and symlinks through
+//     and needs no privilege; the mapped models rewrite both into xattrs.
+//   - multidevs=remap keeps inode numbers unique when one export spans
+//     several host filesystems (a home directory with a mounted volume
+//     under it), which the 9p protocol otherwise cannot express.
+//   - addr= is pinned, and this is not cosmetic. QEMU hands the slots on
+//     the PCIe root bus to explicit -device arguments before the drives
+//     created by -drive if=virtio, so an unpinned 9p device moves the root
+//     disk to a different slot, the EFI boot entry recorded in efivars.fd
+//     no longer resolves and the firmware deletes it: the machine never
+//     boots again. Pinning the share devices above every automatic slot
+//     leaves the disks exactly where the firmware last saw them.
+const (
+	// ShareAddrBase is the first PCI slot reserved for share devices.
+	ShareAddrBase = 0x8
+	// ShareFsdevPrefix names the -fsdev backends.
+	ShareFsdevPrefix = "jmfs"
+	// ConfFsdevID is the -fsdev backend carrying the share table.
+	ConfFsdevID = "jmconf"
+	// ShareSecurityModel is the 9p security model (see above).
+	ShareSecurityModel = "none"
+)
+
+// shareArgs builds the 9p devices for a machine's shares. The first device
+// is always the read-only configuration share: it carries the share table
+// that tells the guest which mount tag belongs at which path, so the guest
+// mounts everything itself at boot rather than waiting for jm to push a
+// script over SSH. A machine with no shares gets no 9p hardware at all.
+func shareArgs(m *machine.Machine, p Paths) []string {
+	if len(m.Shares) == 0 || p.GuestConf == "" {
+		return nil
+	}
+	var args []string
+	addr := ShareAddrBase
+	add := func(id, hostPath, tag string, readOnly bool) {
+		fsdev := "local,id=" + id + ",path=" + escapeComma(hostPath) +
+			",security_model=" + ShareSecurityModel + ",multidevs=remap"
+		if readOnly {
+			fsdev += ",readonly=on"
+		}
+		args = append(args,
+			"-fsdev", fsdev,
+			"-device", fmt.Sprintf("virtio-9p-pci,fsdev=%s,mount_tag=%s,addr=0x%x", id, tag, addr),
+		)
+		addr++
+	}
+	add(ConfFsdevID, p.GuestConf, machine.GuestConfTag, true)
+	for i, s := range m.Shares {
+		add(fmt.Sprintf("%s%d", ShareFsdevPrefix, i), s.HostPath, s.Tag, s.ReadOnly)
+	}
 	return args
 }
 

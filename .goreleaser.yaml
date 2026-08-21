@@ -23,6 +23,13 @@ builds:
     main: ./cmd/jm
     binary: jm
     env:
+      # Pure Go: on darwin the standard library compiles the libSystem
+      # resolver path whatever CGO_ENABLED says, so name resolution parity
+      # (ADR 0008) survives a CGO_ENABLED=0 build. What must never be added
+      # here is "-tags netgo" (or GODEBUG=netdns=go at run time): that is
+      # the flag that drops jm to Go's own DNS client, losing scoped VPN
+      # resolvers, /etc/hosts and .local while public names keep working —
+      # the invisible regression "jm doctor" refuses to pass.
       - CGO_ENABLED=0
     flags:
       - -trimpath
@@ -151,13 +158,17 @@ homebrew_casks:
           if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
             system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/jm"]
           end
-          # jpodman: podman pointed at the machine, without touching the default connection
+          # jpodman / jdocker: the podman and docker clients pointed at the
+          # machine, without touching the default podman connection or the
+          # user's docker contexts.
           FileUtils.ln_sf "#{HOMEBREW_PREFIX}/bin/jm", "#{HOMEBREW_PREFIX}/bin/jpodman"
+          FileUtils.ln_sf "#{HOMEBREW_PREFIX}/bin/jm", "#{HOMEBREW_PREFIX}/bin/jdocker"
     # goreleaser's cask hooks have no uninstall phase; the symlink is removed by
     # brew's zap/uninstall stanza below.
     zap:
       trash:
         - "#{HOMEBREW_PREFIX}/bin/jpodman"
+        - "#{HOMEBREW_PREFIX}/bin/jdocker"
     caveats: |
       Quickstart (macOS on Apple Silicon):
 
@@ -165,8 +176,10 @@ homebrew_casks:
         jm start       # first boot in seconds with the default image (~2 min with --image official)
         jpodman run --rm --os=linux docker.io/alpine echo hi
 
-      jpodman is podman pointed at the machine; your default podman
-      connection is left alone (opt in with: jm start --set-default).
+      jpodman is podman pointed at the machine, jdocker the docker CLI
+      (brew install docker) pointed at the same engine; both start the
+      machine if it is not running. Your default podman connection and
+      your docker contexts are left alone (opt in with: jm start --set-default).
       The guest is FreeBSD, so podman pulls FreeBSD variants by default.
       Linux images run through the Linuxulator and need --os=linux
       (or "podman pull --os=linux"); native FreeBSD images need nothing.

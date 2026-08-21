@@ -50,7 +50,12 @@ const BinaryEnv = "JM_GVPROXY"
 const (
 	GuestIP = "192.168.127.2"
 	Gateway = "192.168.127.1"
-	MTU     = 1500
+	// HostAlias is gvproxy's last usable subnet address, which its TCP and
+	// UDP forwarders translate to the host's 127.0.0.1 port for port. It
+	// is how the guest reaches a host service bound to the loopback, the
+	// host resolver of ADR 0008 included.
+	HostAlias = "192.168.127.254"
+	MTU       = 1500
 )
 
 // Files this provider keeps in the machine directory. Sockets go through
@@ -175,7 +180,9 @@ func (Provider) Endpoint(m *machine.Machine) (netprov.Endpoint, error) {
 		SSHHost:   machine.SSHHost,
 		SSHPort:   m.SSHPort,
 		APISocket: PathsFor(m.Dir).Podman,
-		DNS:       Gateway,
+		DNS:       GuestIP,
+		Gateway:   Gateway,
+		HostAlias: HostAlias,
 	}, nil
 }
 

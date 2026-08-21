@@ -60,7 +60,16 @@ func NewRootCmd() *cobra.Command {
 		// Unknown subcommands are usage errors (exit 2), not failures: a
 		// root without Run would print help and exit 0 instead.
 		Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error { return cmd.Help() },
+		// Parse the root's persistent flags before dispatching to a child.
+		// The client wrappers ("podman", "docker") set DisableFlagParsing so
+		// that podman's and docker's own flags reach them untouched, and
+		// cobra's default dispatch parses a command's flags only in the
+		// command itself — which would leave --state-root/--json/--quiet
+		// unparsed and pass them on to the client, resolving (and, with
+		// autostart, booting) a machine in the state root the user did not
+		// name. Traversal parses them on the way down instead.
+		TraverseChildren: true,
+		RunE:             func(cmd *cobra.Command, _ []string) error { return cmd.Help() },
 		// Backends and podman receive paths from the state root; make it
 		// absolute once so they do not depend on the working directory.
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
@@ -89,8 +98,10 @@ func NewRootCmd() *cobra.Command {
 		newListCmd(),
 		newEnvCmd(),
 		newPodmanCmd(),
+		newDockerCmd(),
 		newPortsCmd(),
 		newForwarderCmd(),
+		newResolverCmd(),
 		newDoctorCmd(),
 		newSetCmd(),
 		newConsoleCmd(),
@@ -120,7 +131,11 @@ Quickstart (three commands):
 
   jm init                      # download the FreeBSD image, write the seed
   jm start                     # boot, provision on first boot, connect podman
-  podman run --rm --os=linux docker.io/alpine echo hi
+  jpodman run --rm --os=linux docker.io/alpine echo hi
+
+"jm start" registers a podman connection named after the machine but leaves
+your default connection alone; jpodman (a symlink to jm) is podman pointed at
+that connection. "jm start --set-default" opts into repointing plain podman.
 
 Linux images run through the Linuxulator and need --os=linux on the host
 podman (or "podman pull --os=linux"); native FreeBSD images need nothing.
@@ -141,7 +156,7 @@ func Execute() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	root := NewRootCmd()
-	root.SetArgs(wrapperArgs(os.Args)[1:])
+	root.SetArgs(wrapperArgs(root, os.Args)[1:])
 	cmd, err := root.ExecuteContextC(ctx)
 	if err != nil {
 		command := ""

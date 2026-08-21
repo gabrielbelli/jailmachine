@@ -126,6 +126,7 @@ func stateOf(m *machine.Machine, b backend.Backend, p netprov.Provider) (backend
 // pulled; only a dead or stale hypervisor is torn down forcibly.
 func repairBroken(ctx context.Context, m *machine.Machine, b backend.Backend, p netprov.Provider, graceful bool) error {
 	stopForwarder(ctx, m, p)
+	stopResolver(ctx, m)
 	bs, err := b.State(m)
 	if err != nil {
 		return err

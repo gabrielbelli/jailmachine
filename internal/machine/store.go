@@ -1,6 +1,7 @@
 package machine
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"regexp"
 	"sort"
 	"syscall"
+	"time"
 
 	"github.com/gofrs/flock"
 )
@@ -194,3 +196,29 @@ func (s *Store) Lock(name string) (unlock func(), err error) {
 	}
 	return func() { _ = fl.Unlock() }, nil
 }
+
+// LockWait is Lock, but waits for the holder to let go instead of failing
+// with ErrLocked: two "jpodman" invocations racing to start the same
+// stopped machine must queue, not fall over. It gives up when ctx is done
+// (returning ctx.Err()) so a wedged holder cannot block forever.
+func (s *Store) LockWait(ctx context.Context, name string) (unlock func(), err error) {
+	if err := ValidateName(name); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(s.Dir(name), 0o700); err != nil {
+		return nil, err
+	}
+	fl := flock.New(s.Path(name, LockFile))
+	ok, err := fl.TryLockContext(ctx, lockRetry)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrLocked, name)
+	}
+	return func() { _ = fl.Unlock() }, nil
+}
+
+// lockRetry is how often LockWait re-tries the lock while another process
+// holds it.
+const lockRetry = 200 * time.Millisecond

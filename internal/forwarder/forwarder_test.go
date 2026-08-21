@@ -48,39 +48,56 @@ const psJSON = `[
 ]`
 
 func TestDesired(t *testing.T) {
-	got, err := Desired([]byte(psJSON), guest)
+	got, err := Desired([]byte(psJSON), guest, "")
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Every reachable port binds every host interface, as docker does on
+	// Linux: "-p 8080:80" is reachable at 127.0.0.1, ::1 and the host's
+	// LAN address. The range becomes one mapping per port, udp keeps its
+	// protocol, and the duplicate host port is published once.
 	want := []netprov.Mapping{
-		{Proto: "tcp", Local: "0.0.0.0:8443", Remote: guest + ":8443"},
-		{Proto: "tcp", Local: "127.0.0.1:8080", Remote: guest + ":8080"},
-		{Proto: "tcp", Local: guest + ":7071", Remote: guest + ":7071"},
-		{Proto: "udp", Local: "127.0.0.1:6000", Remote: guest + ":6000"},
-		{Proto: "udp", Local: "127.0.0.1:6001", Remote: guest + ":6001"},
-		{Proto: "udp", Local: "127.0.0.1:6002", Remote: guest + ":6002"},
+		{Proto: "tcp", Local: "0.0.0.0:7071", Remote: guest + ":7071"},
+		{Proto: "tcp", Local: "0.0.0.0:8080", Remote: guest + ":8080"},
+		{Proto: "udp", Local: "0.0.0.0:6000", Remote: guest + ":6000"},
+		{Proto: "udp", Local: "0.0.0.0:6001", Remote: guest + ":6001"},
+		{Proto: "udp", Local: "0.0.0.0:6002", Remote: guest + ":6002"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("Desired =\n%v\nwant\n%v", got, want)
 	}
-	// A loopback host_ip is bound on the guest's loopback only: not
-	// exposed, reported with a reason instead.
-	_, skipped, err := Plan([]byte(psJSON), guest)
+	// A published port that names a host address is bound inside the guest
+	// (or, for the literal wildcard, redirected to an address no packet
+	// carries): not exposed, reported with a reason instead.
+	_, skipped, err := Plan([]byte(psJSON), guest, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(skipped) != 1 || skipped[0].Local != "127.0.0.1:7070" || skipped[0].Remote != "" ||
-		!strings.Contains(skipped[0].Error, "guest binds 127.0.0.1 only") ||
-		!strings.Contains(skipped[0].Error, "-p 7070:80") {
-		t.Errorf("Plan skipped = %+v", skipped)
+	if len(skipped) != 2 {
+		t.Fatalf("Plan skipped = %+v", skipped)
+	}
+	if skipped[0].Local != "0.0.0.0:8443" || skipped[0].Remote != "" ||
+		!strings.Contains(skipped[0].Error, "never matches") ||
+		!strings.Contains(skipped[0].Error, "-p 8443:443") {
+		t.Errorf("Plan skipped wildcard = %+v", skipped[0])
+	}
+	// The remedy must name the machine's publish address as well as the
+	// bare "-p": "-p 7070:80" on its own publishes on every interface, so
+	// advising it alone answers "keep this off the LAN" with "put it on
+	// the LAN".
+	if skipped[1].Local != "127.0.0.1:7070" || skipped[1].Remote != "" ||
+		!strings.Contains(skipped[1].Error, "guest's own loopback") ||
+		!strings.Contains(skipped[1].Error, "-p 7070:80") ||
+		!strings.Contains(skipped[1].Error, "--publish-addr 127.0.0.1") {
+		t.Errorf("Plan skipped loopback = %+v", skipped[1])
 	}
 	// Empty and "[]" outputs are empty sets; garbage is an error.
 	for _, in := range []string{"", "[]", "null"} {
-		if got, err := Desired([]byte(in), guest); err != nil || len(got) != 0 {
+		if got, err := Desired([]byte(in), guest, ""); err != nil || len(got) != 0 {
 			t.Errorf("Desired(%q) = %v, %v", in, got, err)
 		}
 	}
-	if _, err := Desired([]byte("{not json"), guest); err == nil {
+	if _, err := Desired([]byte("{not json"), guest, ""); err == nil {
 		t.Error("garbage accepted")
 	}
 }
@@ -424,12 +441,12 @@ func TestRunReactsToEvents(t *testing.T) {
 	if _, err := io.WriteString(w, `{"Name":"web","Status":"start","Type":"container"}`+"\n"); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, func() bool { exposed, _ := p.calls(); return len(exposed) == 6 })
+	waitFor(t, func() bool { exposed, _ := p.calls(); return len(exposed) == 5 })
 
 	// Stream drops: the forwarder resyncs (container gone) and reconnects.
 	eng.setPS([]byte("[]"))
 	_ = w.Close()
-	waitFor(t, func() bool { _, un := p.calls(); return len(un) == 6 })
+	waitFor(t, func() bool { _, un := p.calls(); return len(un) == 5 })
 
 	cancel()
 	if err := <-done; err != nil {
@@ -583,5 +600,40 @@ func TestRunLogsLeakedMappings(t *testing.T) {
 	}
 	if _, unexposed := p.calls(); len(unexposed) != 0 {
 		t.Errorf("adopted and unexposed %v", unexposed)
+	}
+}
+
+// A port published in the guest but unreachable from the host is reported
+// once, when the forwarder first sees it, so it appears in the log rather
+// than only in "jm ports" — which nobody runs before assuming a published
+// port works. Later resyncs say nothing: it is not news any more.
+func TestConvergeReportsUnpublishableOnce(t *testing.T) {
+	ctx := context.Background()
+	m := &machine.Machine{Name: "t"}
+	path := filepath.Join(t.TempDir(), StateFile)
+	p := newFake()
+	st := &State{}
+	skipped := []Entry{{Proto: "tcp", Local: "127.0.0.1:8091", Error: "binds the guest's own loopback"}}
+
+	res, err := ConvergeWith(ctx, p, m, nil, skipped, st, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Skipped) != 1 || res.Skipped[0].Local != "127.0.0.1:8091" {
+		t.Fatalf("first sight: skipped = %+v", res.Skipped)
+	}
+	if !res.changed() || !strings.Contains(res.String(), "warning: tcp 127.0.0.1:8091") {
+		t.Errorf("first sight: %q", res)
+	}
+
+	res, err = ConvergeWith(ctx, p, m, nil, skipped, st, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Skipped) != 0 || res.String() != "no change" {
+		t.Errorf("second sight: %q", res)
+	}
+	if exposed, unexposed := p.calls(); len(exposed) != 0 || len(unexposed) != 0 {
+		t.Errorf("the provider was touched: %v %v", exposed, unexposed)
 	}
 }

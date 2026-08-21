@@ -62,6 +62,7 @@ func newRmCmd() *cobra.Command {
 				if p, perr := providerFor(m); perr == nil {
 					stopForwarder(ctx, m, p)
 				}
+				stopResolver(ctx, m)
 				if b, berr := backendFor(m); berr == nil {
 					if serr := b.Stop(ctx, m, false); serr != nil {
 						fmt.Fprintf(stderr, "jm: %v; continuing\n", serr)
@@ -83,6 +84,7 @@ func newRmCmd() *cobra.Command {
 					if p, perr := providerFor(m); perr == nil {
 						stopForwarder(ctx, m, p)
 					}
+					stopResolver(ctx, m)
 				}
 				podmanConnectionRemove(ctx, m)
 				forgetHostKey(m)

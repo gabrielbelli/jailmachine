@@ -3,6 +3,7 @@ package qemu
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -495,5 +496,176 @@ func TestAccelOverrideTCG(t *testing.T) {
 		if strings.Contains(joined, reject) {
 			t.Errorf("args still carry %q: %s", reject, joined)
 		}
+	}
+}
+
+// shareMachine returns a machine sharing the given host paths (read-only
+// when the path is followed by ":ro"), already normalised.
+func shareMachine(t *testing.T, paths ...string) *machine.Machine {
+	t.Helper()
+	m := sampleMachine()
+	var in []machine.Share
+	for _, p := range paths {
+		ro := strings.HasSuffix(p, ":ro")
+		in = append(in, machine.Share{HostPath: strings.TrimSuffix(p, ":ro"), ReadOnly: ro})
+	}
+	list, err := machine.NormaliseShares(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Shares = list
+	return m
+}
+
+// pairs collapses an argv into flag/value pairs for the flags named.
+func pairs(args []string, flags ...string) [][2]string {
+	want := map[string]bool{}
+	for _, f := range flags {
+		want[f] = true
+	}
+	var out [][2]string
+	for i := 0; i < len(args)-1; i++ {
+		if want[args[i]] {
+			out = append(out, [2]string{args[i], args[i+1]})
+			i++
+		}
+	}
+	return out
+}
+
+func TestArgsNoSharesNoNineP(t *testing.T) {
+	p := samplePaths("/state/machines/test")
+	p.GuestConf = "/state/machines/test/guest"
+	args := Args(sampleMachine(), backend.NetAttachment{Kind: "user", HostFwdSSH: 2222}, p)
+	for _, a := range args {
+		if strings.Contains(a, "9p") || a == "-fsdev" {
+			t.Fatalf("machine without shares got 9p hardware: %q", args)
+		}
+	}
+}
+
+func TestArgsShares(t *testing.T) {
+	p := samplePaths("/state/machines/test")
+	p.GuestConf = "/state/machines/test/guest"
+	m := shareMachine(t, "/Volumes", "/private/tmp", "/Users/belli:ro")
+	args := Args(m, backend.NetAttachment{Kind: "user", HostFwdSSH: 2222}, p)
+
+	got := pairs(args, "-fsdev", "-device")
+	want := [][2]string{
+		{"-device", "virtio-net-pci,netdev=n0,mac=" + m.MAC},
+		{"-device", "virtio-rng-pci"},
+		{"-fsdev", "local,id=jmconf,path=" + p.GuestConf + ",security_model=none,multidevs=remap,readonly=on"},
+		{"-device", "virtio-9p-pci,fsdev=jmconf,mount_tag=" + machine.GuestConfTag + ",addr=0x8"},
+		{"-fsdev", "local,id=jmfs0,path=/Users/belli,security_model=none,multidevs=remap,readonly=on"},
+		{"-device", "virtio-9p-pci,fsdev=jmfs0,mount_tag=" + m.Shares[0].Tag + ",addr=0x9"},
+		{"-fsdev", "local,id=jmfs1,path=/Volumes,security_model=none,multidevs=remap"},
+		{"-device", "virtio-9p-pci,fsdev=jmfs1,mount_tag=" + m.Shares[1].Tag + ",addr=0xa"},
+		{"-fsdev", "local,id=jmfs2,path=/private/tmp,security_model=none,multidevs=remap"},
+		{"-device", "virtio-9p-pci,fsdev=jmfs2,mount_tag=" + m.Shares[2].Tag + ",addr=0xb"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("share argv mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// The disks are attached by -drive if=virtio and take their PCI slot from
+// QEMU's automatic allocator; a share device that landed in that range
+// would move the root disk and invalidate the EFI boot entry recorded in
+// efivars.fd (a one-way door). Share devices are therefore pinned, above
+// every automatic slot, and stay pinned as the set grows.
+func TestArgsSharesPinAddressesAboveAutomaticSlots(t *testing.T) {
+	p := samplePaths("/state/machines/test")
+	p.GuestConf = "/conf"
+	var paths []string
+	for i := 0; i < machine.MaxShares-1; i++ {
+		paths = append(paths, fmt.Sprintf("/m/d%02d", i))
+	}
+	m := shareMachine(t, paths...)
+	args := Args(m, backend.NetAttachment{Kind: "user", HostFwdSSH: 2222}, p)
+
+	seen := map[string]bool{}
+	n := 0
+	for _, a := range args {
+		if !strings.HasPrefix(a, "virtio-9p-pci,") {
+			continue
+		}
+		addr := a[strings.LastIndex(a, "addr=")+len("addr="):]
+		var slot int
+		if _, err := fmt.Sscanf(addr, "0x%x", &slot); err != nil {
+			t.Fatalf("unparseable addr in %q", a)
+		}
+		if slot < ShareAddrBase || slot > 0x1f {
+			t.Fatalf("share device outside the reserved slots: %q", a)
+		}
+		if seen[addr] {
+			t.Fatalf("two share devices at %s", addr)
+		}
+		seen[addr] = true
+		n++
+	}
+	if n != machine.MaxShares {
+		t.Fatalf("got %d share devices, want %d (conf + %d shares)", n, machine.MaxShares, machine.MaxShares-1)
+	}
+	// Growing the set must not move the devices already there.
+	fewer := Args(shareMachine(t, paths[:3]...), backend.NetAttachment{Kind: "user", HostFwdSSH: 2222}, p)
+	if !slices.Contains(fewer, "virtio-9p-pci,fsdev=jmconf,mount_tag="+machine.GuestConfTag+",addr=0x8") {
+		t.Fatalf("conf share moved: %q", fewer)
+	}
+}
+
+func TestArgsSharesEscapeCommas(t *testing.T) {
+	p := samplePaths("/state/machines/test")
+	p.GuestConf = "/state/gu,est"
+	m := shareMachine(t, "/we,ird/dir")
+	args := Args(m, backend.NetAttachment{Kind: "user", HostFwdSSH: 2222}, p)
+	if !slices.Contains(args, "local,id=jmfs0,path=/we,,ird/dir,security_model=none,multidevs=remap") {
+		t.Fatalf("comma in share path not escaped: %q", args)
+	}
+	if !slices.Contains(args, "local,id=jmconf,path=/state/gu,,est,security_model=none,multidevs=remap,readonly=on") {
+		t.Fatalf("comma in conf path not escaped: %q", args)
+	}
+}
+
+func TestArgsSharesNeedGuestConf(t *testing.T) {
+	p := samplePaths("/state/machines/test") // GuestConf empty
+	args := Args(shareMachine(t, "/Volumes"), backend.NetAttachment{Kind: "user", HostFwdSSH: 2222}, p)
+	if slices.Contains(args, "-fsdev") {
+		t.Fatalf("shares exported without a share table: %q", args)
+	}
+}
+
+func TestWriteShareTable(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "guest")
+	m := shareMachine(t, "/Volumes", "/private/tmp:ro")
+	if err := writeShareTable(dir, m.Shares); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, machine.SharesTabFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != machine.SharesTab(m.Shares) {
+		t.Fatalf("table = %q", data)
+	}
+	// An empty set clears the table rather than leaving the old one.
+	if err := writeShareTable(dir, nil); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(filepath.Join(dir, machine.SharesTabFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "/Volumes") {
+		t.Fatalf("stale table left behind: %q", data)
+	}
+}
+
+func TestWriteShareTableSkipsUnusedDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "guest")
+	if err := writeShareTable(dir, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("share table directory created for a machine with no shares: %v", err)
 	}
 }

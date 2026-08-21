@@ -102,6 +102,20 @@ func (c *Client) Run(ctx context.Context, cmd string) (stdout, stderr string, er
 	}
 }
 
+// RunScript is Run for a multi-line program. A non-zero exit is reported by
+// status alone: Run names the command it ran, which for a generated script
+// means the whole program ends up in the error message and buries what
+// actually went wrong. Callers pass what the script was for and print its
+// captured output themselves.
+func (c *Client) RunScript(ctx context.Context, what, script string) (stdout, stderr string, err error) {
+	out, errOut, err := c.Run(ctx, script)
+	var exit *ssh.ExitError
+	if errors.As(err, &exit) {
+		err = fmt.Errorf("sshx: %s exited %d", what, exit.ExitStatus())
+	}
+	return out, errOut, err
+}
+
 // FileExists reports whether path is a regular file on the guest, using
 // "test -f". Only a transport failure is an error; a missing file is
 // (false, nil).
@@ -115,7 +129,13 @@ func (c *Client) SocketExists(ctx context.Context, path string) (bool, error) {
 }
 
 func (c *Client) test(ctx context.Context, flag, path string) (bool, error) {
-	_, _, err := c.Run(ctx, "test "+flag+" "+shellQuote(path))
+	return c.Succeeds(ctx, "test "+flag+" "+shellQuote(path))
+}
+
+// Succeeds runs cmd and reports whether it exited zero. A non-zero exit is
+// an answer, not an error; only a transport failure is returned as one.
+func (c *Client) Succeeds(ctx context.Context, cmd string) (bool, error) {
+	_, _, err := c.Run(ctx, cmd)
 	if err == nil {
 		return true, nil
 	}

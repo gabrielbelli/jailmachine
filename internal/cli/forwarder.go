@@ -45,12 +45,14 @@ func newForwarderCmd() *cobra.Command {
 				return err
 			}
 			logger := log.New(stdout, "forwarder: ", log.LstdFlags)
-			logger.Printf("starting for %s (guest %s, pid %d)", m.Name, ep.GuestIP, os.Getpid())
+			logger.Printf("starting for %s (guest %s, publishing on %s, pid %d)",
+				m.Name, ep.GuestIP, forwarder.HostIP(m.PublishAddr), os.Getpid())
 			defer logger.Printf("stopped")
 			return forwarder.Run(cmd.Context(), forwarder.Config{
 				Provider:  p,
 				Machine:   m,
 				GuestIP:   ep.GuestIP,
+				HostIP:    m.PublishAddr,
 				Engine:    podmanEngine{connection: m.Name},
 				StatePath: forwarder.StatePath(m.Dir),
 				SSHLocal:  net.JoinHostPort(ep.SSHHost, strconv.Itoa(ep.SSHPort)),
@@ -150,7 +152,7 @@ func startForwarder(m *machine.Machine, p netprov.Provider, ep netprov.Endpoint)
 		logf(stdout, "%s: %s networking cannot publish container ports; skipping", machine.StageForwarder, p.Name())
 		return nil
 	}
-	exe, err := os.Executable()
+	exe, err := jmBinary()
 	if err != nil {
 		return machine.NewStageError(machine.StageForwarder, "", fmt.Errorf("locating the jm binary: %w", err))
 	}
@@ -159,7 +161,8 @@ func startForwarder(m *machine.Machine, p netprov.Provider, ep netprov.Endpoint)
 		logf(stdout, "%s: port forwarder already running", machine.StageForwarder)
 		return nil
 	}
-	logf(stdout, "%s: starting the port forwarder (log: %s)", machine.StageForwarder, pr.LogPath())
+	logf(stdout, "%s: starting the port forwarder, publishing on %s (log: %s)",
+		machine.StageForwarder, forwarder.HostIP(m.PublishAddr), pr.LogPath())
 	if err := pr.Start(exe); err != nil {
 		return machine.NewStageError(machine.StageForwarder, "see "+pr.LogPath(), err)
 	}

@@ -1,0 +1,277 @@
+[
+  {
+    "AutoRemove": false,
+    "Command": [
+      "httpd",
+      "-f",
+      "-p",
+      "80"
+    ],
+    "CreatedAt": "18 seconds ago",
+    "CIDFile": "",
+    "Exited": false,
+    "ExitedAt": -62135596800,
+    "ExitCode": 0,
+    "ExposedPorts": null,
+    "Id": "708fbceaf60a49fc594fe71fb962043bb97000d6db065a2e9de6d020fc93a614",
+    "Image": "docker.io/library/busybox:latest",
+    "ImageID": "e0e8b3cbfed68a90084781e2962f9c0deead51c5a3f11a488eef0283a4284bc2",
+    "IsInfra": false,
+    "Labels": null,
+    "Mounts": [],
+    "Names": [
+      "w-plain"
+    ],
+    "Namespaces": {},
+    "Networks": [
+      "podman"
+    ],
+    "Pid": 3689,
+    "Pod": "",
+    "PodName": "",
+    "Ports": [
+      {
+        "host_ip": "",
+        "container_port": 80,
+        "host_port": 8080,
+        "range": 1,
+        "protocol": "tcp"
+      }
+    ],
+    "Restarts": 0,
+    "Size": null,
+    "StartedAt": 1787285768,
+    "State": "running",
+    "Status": "Up 18 seconds",
+    "Created": 1787285768
+  },
+  {
+    "AutoRemove": false,
+    "Command": [
+      "httpd",
+      "-f",
+      "-p",
+      "80"
+    ],
+    "CreatedAt": "17 seconds ago",
+    "CIDFile": "",
+    "Exited": false,
+    "ExitedAt": -62135596800,
+    "ExitCode": 0,
+    "ExposedPorts": null,
+    "Id": "b77257e45a77ba2d4449b3e88d823b2f072d94586145f6a7925793594b7c31e2",
+    "Image": "docker.io/library/busybox:latest",
+    "ImageID": "e0e8b3cbfed68a90084781e2962f9c0deead51c5a3f11a488eef0283a4284bc2",
+    "IsInfra": false,
+    "Labels": null,
+    "Mounts": [],
+    "Names": [
+      "w-wild"
+    ],
+    "Namespaces": {},
+    "Networks": [
+      "podman"
+    ],
+    "Pid": 3788,
+    "Pod": "",
+    "PodName": "",
+    "Ports": [
+      {
+        "host_ip": "0.0.0.0",
+        "container_port": 80,
+        "host_port": 8081,
+        "range": 1,
+        "protocol": "tcp"
+      }
+    ],
+    "Restarts": 0,
+    "Size": null,
+    "StartedAt": 1787285768,
+    "State": "running",
+    "Status": "Up 18 seconds",
+    "Created": 1787285768
+  },
+  {
+    "AutoRemove": false,
+    "Command": [
+      "httpd",
+      "-f",
+      "-p",
+      "80"
+    ],
+    "CreatedAt": "17 seconds ago",
+    "CIDFile": "",
+    "Exited": false,
+    "ExitedAt": -62135596800,
+    "ExitCode": 0,
+    "ExposedPorts": null,
+    "Id": "04df36ec8eadb4b5e529887c41a6741778d8c33f9398f34332f769cf4c65383e",
+    "Image": "docker.io/library/busybox:latest",
+    "ImageID": "e0e8b3cbfed68a90084781e2962f9c0deead51c5a3f11a488eef0283a4284bc2",
+    "IsInfra": false,
+    "Labels": null,
+    "Mounts": [],
+    "Names": [
+      "w-lo"
+    ],
+    "Namespaces": {},
+    "Networks": [
+      "podman"
+    ],
+    "Pid": 3864,
+    "Pod": "",
+    "PodName": "",
+    "Ports": [
+      {
+        "host_ip": "127.0.0.1",
+        "container_port": 80,
+        "host_port": 8082,
+        "range": 1,
+        "protocol": "tcp"
+      }
+    ],
+    "Restarts": 0,
+    "Size": null,
+    "StartedAt": 1787285768,
+    "State": "running",
+    "Status": "Up 18 seconds",
+    "Created": 1787285768
+  },
+  {
+    "AutoRemove": false,
+    "Command": [
+      "httpd",
+      "-f",
+      "-p",
+      "80"
+    ],
+    "CreatedAt": "17 seconds ago",
+    "CIDFile": "",
+    "Exited": false,
+    "ExitedAt": -62135596800,
+    "ExitCode": 0,
+    "ExposedPorts": null,
+    "Id": "2eb2007dc9d3be823f9d2ef411e473afda80f24f6243acb41afdafdc78f1b241",
+    "Image": "docker.io/library/busybox:latest",
+    "ImageID": "e0e8b3cbfed68a90084781e2962f9c0deead51c5a3f11a488eef0283a4284bc2",
+    "IsInfra": false,
+    "Labels": null,
+    "Mounts": [],
+    "Names": [
+      "w-range"
+    ],
+    "Namespaces": {},
+    "Networks": [
+      "podman"
+    ],
+    "Pid": 3940,
+    "Pod": "",
+    "PodName": "",
+    "Ports": [
+      {
+        "host_ip": "",
+        "container_port": 80,
+        "host_port": 8083,
+        "range": 3,
+        "protocol": "tcp"
+      }
+    ],
+    "Restarts": 0,
+    "Size": null,
+    "StartedAt": 1787285769,
+    "State": "running",
+    "Status": "Up 17 seconds",
+    "Created": 1787285768
+  },
+  {
+    "AutoRemove": false,
+    "Command": [
+      "httpd",
+      "-f",
+      "-p",
+      "80"
+    ],
+    "CreatedAt": "17 seconds ago",
+    "CIDFile": "",
+    "Exited": false,
+    "ExitedAt": -62135596800,
+    "ExitCode": 0,
+    "ExposedPorts": null,
+    "Id": "fc7c3b760eb6a84b0b056152689a973b3e94dbd2b5d489388e3136f0e270687d",
+    "Image": "docker.io/library/busybox:latest",
+    "ImageID": "e0e8b3cbfed68a90084781e2962f9c0deead51c5a3f11a488eef0283a4284bc2",
+    "IsInfra": false,
+    "Labels": null,
+    "Mounts": [],
+    "Names": [
+      "w-v6lo"
+    ],
+    "Namespaces": {},
+    "Networks": [
+      "podman"
+    ],
+    "Pid": 4016,
+    "Pod": "",
+    "PodName": "",
+    "Ports": [
+      {
+        "host_ip": "::1",
+        "container_port": 80,
+        "host_port": 8087,
+        "range": 1,
+        "protocol": "tcp"
+      }
+    ],
+    "Restarts": 0,
+    "Size": null,
+    "StartedAt": 1787285769,
+    "State": "running",
+    "Status": "Up 17 seconds",
+    "Created": 1787285769
+  },
+  {
+    "AutoRemove": false,
+    "Command": [
+      "sh",
+      "-c",
+      "while true; do nc -u -l -p 8086 -e /bin/cat; done"
+    ],
+    "CreatedAt": "2 seconds ago",
+    "CIDFile": "",
+    "Exited": false,
+    "ExitedAt": -62135596800,
+    "ExitCode": 0,
+    "ExposedPorts": null,
+    "Id": "f1631f76323f8c92bc563f8b0c4cfc735789a2ffb3ca3cc4dc9466cf2c7ce8d2",
+    "Image": "docker.io/library/busybox:latest",
+    "ImageID": "e0e8b3cbfed68a90084781e2962f9c0deead51c5a3f11a488eef0283a4284bc2",
+    "IsInfra": false,
+    "Labels": null,
+    "Mounts": [],
+    "Names": [
+      "w-udp"
+    ],
+    "Namespaces": {},
+    "Networks": [
+      "podman"
+    ],
+    "Pid": 4101,
+    "Pod": "",
+    "PodName": "",
+    "Ports": [
+      {
+        "host_ip": "",
+        "container_port": 8086,
+        "host_port": 8086,
+        "range": 1,
+        "protocol": "udp"
+      }
+    ],
+    "Restarts": 0,
+    "Size": null,
+    "StartedAt": 1787285783,
+    "State": "running",
+    "Status": "Up 3 seconds",
+    "Created": 1787285783
+  }
+]

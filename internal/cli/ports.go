@@ -17,7 +17,14 @@ func newPortsCmd() *cobra.Command {
 		Long: "List the host->guest port mappings the forwarder owns for a machine, with\n" +
 			"the outcome of the last attempt (a host port already in use shows as an\n" +
 			"error and is retried on the next resync). Reads the machine's forwards.json;\n" +
-			"it never blocks on the machine.",
+			"it never blocks on the machine.\n\n" +
+			"\"-p 8080:80\" publishes on every host interface, as docker does on Linux:\n" +
+			"127.0.0.1, ::1, \"localhost\" and the host's LAN address all reach the\n" +
+			"container — including from other machines on your network. 'jm set\n" +
+			"--publish-addr 127.0.0.1' (or $" + forwarder.PublishAddrEnv + " at start time) keeps them on\n" +
+			"the host's loopback instead. A published port that names a host address\n" +
+			"(\"-p 127.0.0.1:8080:80\", \"-p 0.0.0.0:8080:80\") is bound inside the guest\n" +
+			"and cannot be reached from here; it is listed with the reason.",
 		Example: `  jm ports
   jm ports --json dev`,
 		Args: cobra.MaximumNArgs(1),
@@ -38,6 +45,7 @@ func newPortsCmd() *cobra.Command {
 			if _, alive := forwarderProcess(m).Alive(); !alive {
 				fmt.Fprintf(stdout, "# port forwarder for %s is not running (jm start%s)\n", m.Name, nameHint(m.Name))
 			}
+			fmt.Fprintf(stdout, "# publishing on %s\n", forwarder.HostIP(m.PublishAddr))
 			tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
 			fmt.Fprintln(tw, "LOCAL\tREMOTE\tPROTO\tSTATUS")
 			for _, e := range entries {

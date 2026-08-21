@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -29,9 +30,25 @@ type info struct {
 	NetworkLogs  []string      `json:"network_logs,omitempty"`
 	// Ports is the forwarder's owned mapping table with per-mapping errors
 	// (ADR 0004); Forwarder is whether the loop is running.
-	Ports         []forwarder.Entry `json:"ports"`
-	Forwarder     backend.State     `json:"forwarder_state"`
-	ForwarderLog  string            `json:"forwarder_log,omitempty"`
+	Ports        []forwarder.Entry `json:"ports"`
+	Forwarder    backend.State     `json:"forwarder_state"`
+	ForwarderLog string            `json:"forwarder_log,omitempty"`
+	// PublishAddr is the host address published ports bind to, resolved
+	// (the record's value or the default); the record's own publish_addr
+	// is omitted when unset.
+	PublishAddr string `json:"publish_addr_effective"`
+	// FileSharing is whether the backend can export the machine's Shares
+	// (ADR 0007); false with shares configured means they are ignored.
+	FileSharing bool `json:"file_sharing"`
+	// Resolver is the host-side name-resolution helper of ADR 0008 and
+	// ResolverAddr the host address it answers the guest's queries on.
+	Resolver     backend.State `json:"resolver_state"`
+	ResolverAddr string        `json:"resolver_addr,omitempty"`
+	ResolverLog  string        `json:"resolver_log,omitempty"`
+	// Autostart is whether "jpodman"/"jdocker" would boot this machine on
+	// demand; DockerHost is what they point the docker CLI at.
+	Autostart     bool   `json:"autostart"`
+	DockerHost    string `json:"docker_host,omitempty"`
 	networkString string
 }
 
@@ -43,21 +60,27 @@ func describe(m *machine.Machine) info {
 		networkString: m.NetworkName(),
 		Ports:         []forwarder.Entry{},
 		Forwarder:     backend.Stopped,
+		Resolver:      backend.Stopped,
 	}
 	if fw := forwards(m); fw != nil {
 		i.Ports = fw
 	}
+	i.PublishAddr = forwarder.HostIP(m.PublishAddr)
+	i.Autostart = autostartEnabled()
 	if m.Dir != "" {
 		pr := forwarderProcess(m)
 		i.ForwarderLog = pr.LogPath()
 		if _, ok := pr.Alive(); ok {
 			i.Forwarder = backend.Running
 		}
+		rp := resolverProcess(m)
+		i.ResolverLog, i.ResolverAddr, i.Resolver = rp.LogPath(), rp.Addr(), resolverState(m)
 	}
 	b, p, err := components(m)
 	if err != nil {
 		return i
 	}
+	i.FileSharing = b.Capabilities().FileSharing
 	if st, err := b.State(m); err == nil {
 		i.BackendState = st
 	}
@@ -71,6 +94,7 @@ func describe(m *machine.Machine) info {
 		i.SSH = fmt.Sprintf("%s:%d", ep.SSHHost, ep.SSHPort)
 		i.APISocket = ep.APISocket
 		i.PodmanSock = machine.SocketURI(ep.APISocket)
+		i.DockerHost = i.PodmanSock
 		i.DNS = ep.DNS
 	}
 	return i
@@ -88,9 +112,11 @@ state is read from the hypervisor and the network provider on every call.
   ssh_user, guest_ip, ssh (host:port), ssh_key, podman_uri,
   podman_sock_uri, api_socket, dns, console, network_logs, dir,
   provisioned, image_trusted (false for a BYO image without a .sha256 sidecar),
-  created, version, backend_opts,
+  created, version, backend_opts, file_sharing, autostart, docker_host,
+  shares (array of {host_path, guest_path, read_only, tag}),
   ports (array of {proto, local, remote, since, error}), forwarder_state,
-  forwarder_log.
+  forwarder_log, publish_addr (only when set) and publish_addr_effective,
+  resolver_state, resolver_addr, resolver_log.
 
 Keys whose value is empty are omitted.`
 
@@ -142,18 +168,39 @@ func newInspectCmd() *cobra.Command {
 			if i.PodmanSock != "" {
 				row("Podman socket", fmt.Sprintf("%s (%s)", i.PodmanSock, i.SocketConnectionName()))
 			}
+			if i.DockerHost != "" {
+				row("Docker host", fmt.Sprintf("%s (%s)", i.DockerHost, DockerWrapperName))
+			}
+			row("Autostart", autostartWord(i.Autostart))
 			if i.Console != "" {
 				row("Console", i.Console)
 			}
 			for _, l := range i.NetworkLogs {
 				row("Network log", l)
 			}
+			row("Resolver", i.Resolver)
+			if i.ResolverAddr != "" {
+				row("Resolver address", i.ResolverAddr)
+			}
+			if i.ResolverLog != "" {
+				row("Resolver log", i.ResolverLog)
+			}
+			row("Publish address", i.PublishAddr)
 			row("Forwarder", i.Forwarder)
 			if i.ForwarderLog != "" {
 				row("Forwarder log", i.ForwarderLog)
 			}
 			for _, e := range i.Ports {
 				row("Port", fmt.Sprintf("%s -> %s %s (%s)", e.Local, remoteOrDash(e.Remote), e.Proto, e.Status()))
+			}
+			for _, sh := range i.Shares {
+				v := sh.String()
+				if !i.FileSharing {
+					v += fmt.Sprintf(" — ignored: backend %q cannot share host directories", i.Backend)
+				} else if _, err := os.Stat(sh.HostPath); err != nil {
+					v += " — missing on the host, not shared"
+				}
+				row("Share", v)
 			}
 			row("Dir", i.Dir)
 			row("Provisioned", i.Provisioned)

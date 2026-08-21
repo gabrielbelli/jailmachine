@@ -66,7 +66,10 @@ type Config struct {
 	Machine  *machine.Machine
 	// GuestIP is the address the guest publishes on (Endpoint.GuestIP).
 	GuestIP string
-	Engine  Engine
+	// HostIP is the host address published ports bind to (the machine's
+	// PublishAddr); empty means DefaultHostIP.
+	HostIP string
+	Engine Engine
 	// StatePath is where forwards.json lives (StatePath(m.Dir) normally).
 	StatePath string
 	// SSHLocal is the host side of the provider's own SSH forward
@@ -81,6 +84,7 @@ type Config struct {
 }
 
 func (c *Config) defaults() {
+	c.HostIP = HostIP(c.HostIP)
 	if c.Resync <= 0 {
 		c.Resync = DefaultResync
 	}
@@ -175,7 +179,7 @@ func Run(ctx context.Context, cfg Config) error {
 			cfg.Log.Printf("resync (%s): listing containers: %v", why, err)
 			return nil
 		}
-		desired, skipped, err := Plan(data, cfg.GuestIP)
+		desired, skipped, err := Plan(data, cfg.GuestIP, cfg.HostIP)
 		if err != nil {
 			cfg.Log.Printf("resync (%s): %v", why, err)
 			return nil
