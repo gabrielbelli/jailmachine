@@ -126,7 +126,7 @@ homebrew_casks:
     repository:
       owner: gabrielbelli
       name: homebrew-tap
-      branch: main
+      branch: master   # the tap's default branch
       # A fine-grained PAT with contents:write on homebrew-tap; the default
       # GITHUB_TOKEN cannot push to another repository. See CONTRIBUTING.md.
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
