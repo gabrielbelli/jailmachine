@@ -151,13 +151,19 @@ homebrew_casks:
           if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
             system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/jm"]
           end
+          # jpodman: podman pointed at the machine, without touching the default connection
+          FileUtils.ln_sf "#{HOMEBREW_PREFIX}/bin/jm", "#{HOMEBREW_PREFIX}/bin/jpodman"
+      uninstall: |
+        FileUtils.rm_f "#{HOMEBREW_PREFIX}/bin/jpodman"
     caveats: |
       Quickstart (macOS on Apple Silicon):
 
         jm init        # download the prebaked FreeBSD guest image, write the seed
         jm start       # first boot in seconds with the default image (~2 min with --image official)
-        podman run --rm --os=linux docker.io/alpine echo hi
+        jpodman run --rm --os=linux docker.io/alpine echo hi
 
+      jpodman is podman pointed at the machine; your default podman
+      connection is left alone (opt in with: jm start --set-default).
       The guest is FreeBSD, so podman pulls FreeBSD variants by default.
       Linux images run through the Linuxulator and need --os=linux
       (or "podman pull --os=linux"); native FreeBSD images need nothing.

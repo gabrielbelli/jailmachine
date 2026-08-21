@@ -99,6 +99,31 @@ State lives in `~/.jailmachine/machines/<name>/` (`disk.raw`, `seed.iso`,
 `efivars.fd`, `ssh/`, `machine.json`, logs and sockets); `rm -rf` of that
 directory is a complete uninstall. `JM_HOME` or `--state-root` move it.
 
+## Using `jpodman` instead of touching your podman setup
+
+`jm start` registers a podman connection named after the machine but does
+**not** change your default connection. Use the `jpodman` wrapper (a symlink
+to `jm`) exactly like `podman`:
+
+```bash
+jpodman run --rm --os=linux docker.io/alpine echo hi
+jpodman build -t myapp .            # Containerfile, native FreeBSD or Linux base
+JM_MACHINE=dev jpodman ps           # pick another machine
+jm start --set-default              # opt in: make plain 'podman' use the machine
+```
+
+### Building native FreeBSD images
+
+Use the FreeBSD project's images as a base; `freebsd15-minimal` is for static
+binaries and has no `pkg` runtime libraries:
+
+```Dockerfile
+FROM ghcr.io/freebsd/freebsd-runtime:15.1
+RUN env ASSUME_ALWAYS_YES=yes pkg bootstrap && pkg install -y curl && pkg clean -ay
+COPY hello.sh /usr/local/bin/hello
+CMD ["/usr/local/bin/hello"]
+```
+
 ## Jails
 
 `bastille` is installed and configured (ZFS, `bastille0` loopback, NAT via pf):

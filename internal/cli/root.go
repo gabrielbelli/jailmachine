@@ -88,6 +88,7 @@ func NewRootCmd() *cobra.Command {
 		newRmCmd(),
 		newListCmd(),
 		newEnvCmd(),
+		newPodmanCmd(),
 		newPortsCmd(),
 		newForwarderCmd(),
 		newDoctorCmd(),
@@ -140,6 +141,7 @@ func Execute() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	root := NewRootCmd()
+	root.SetArgs(wrapperArgs(os.Args)[1:])
 	cmd, err := root.ExecuteContextC(ctx)
 	if err != nil {
 		command := ""

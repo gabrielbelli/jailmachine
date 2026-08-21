@@ -186,9 +186,14 @@ func podmanConnectionRemove(ctx context.Context, m *machine.Machine) {
 	_, _ = podman(ctx, "system", "connection", "remove", m.SocketConnectionName())
 }
 
+// setDefaultConnection is set by "jm start --set-default"; by default jm
+// leaves the user's default podman connection alone (use jpodman / jm podman).
+var setDefaultConnection bool
+
 // podmanConnectionAdd registers the SSH connection under the machine's
-// name (and makes it the default) and, when the provider proxies the
-// guest API to a host socket, a second "<name>-sock" connection for it.
+// name and, when the provider proxies the guest API to a host socket, a
+// second "<name>-sock" connection for it. The default connection is only
+// changed with --set-default.
 func podmanConnectionAdd(ctx context.Context, m *machine.Machine, ep netprov.Endpoint) error {
 	add := func(args ...string) error {
 		out, err := podman(ctx, append([]string{"system", "connection", "add"}, args...)...)
@@ -200,8 +205,13 @@ func podmanConnectionAdd(ctx context.Context, m *machine.Machine, ep netprov.End
 		}
 		return nil
 	}
-	if err := add("--identity", sshKey(m), "--default", m.Name, m.PodmanURI()); err != nil {
+	if err := add("--identity", sshKey(m), m.Name, m.PodmanURI()); err != nil {
 		return err
+	}
+	if setDefaultConnection {
+		if out, err := podman(ctx, "system", "connection", "default", m.Name); err != nil {
+			return fmt.Errorf("podman system connection default: %w: %s", err, out)
+		}
 	}
 	if ep.APISocket != "" {
 		if err := add(m.SocketConnectionName(), machine.SocketURI(ep.APISocket)); err != nil {

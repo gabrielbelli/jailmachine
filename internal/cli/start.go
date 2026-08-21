@@ -41,7 +41,7 @@ func stageTimeout(d time.Duration) time.Duration {
 }
 
 func newStartCmd() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "start [name]",
 		Short: "Boot a machine and connect podman to it",
 		Long: "Boot a machine in stages: network provider, hypervisor, SSH, first-boot\n" +
@@ -53,12 +53,15 @@ func newStartCmd() *cobra.Command {
 			"forwarder.log (port publishing), or /var/log/jm-provision.log in the guest.",
 		Example: `  jm start
   jm start dev
-  jm -q start && podman run --rm --os=linux docker.io/alpine echo hi`,
+  jm -q start && jpodman run --rm --os=linux docker.io/alpine echo hi
+  jm start --set-default   # make plain 'podman' use this machine`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runStart(cmd.Context(), args)
 		},
 	}
+	cmd.Flags().BoolVar(&setDefaultConnection, "set-default", false, "make this machine the default podman connection (otherwise use jpodman / jm podman)")
+	return cmd
 }
 
 func runStart(ctx context.Context, args []string) error {

@@ -43,3 +43,4 @@ clean:
 PREFIX ?= /opt/homebrew
 install: ## build and install jm into $(PREFIX)/bin
 	go build -ldflags "$(LDFLAGS)" -o $(PREFIX)/bin/jm ./cmd/jm
+	ln -sf jm $(PREFIX)/bin/jpodman
