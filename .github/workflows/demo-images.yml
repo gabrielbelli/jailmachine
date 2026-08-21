@@ -126,3 +126,39 @@ jobs:
           echo "$TOKEN" | buildah login -u '${{ github.actor }}' --password-stdin ghcr.io
           buildah manifest push --all "$img:ci" "docker://$img:latest"
           buildah manifest push --all "$img:ci" "docker://$img:$(date -u +%Y%m%d)"
+
+  # ------------------------------------------------- freebsd (bootstrap) ----
+  # jm-demo-nginx-native runs "pkg install" and cannot be built without a
+  # FreeBSD kernel, so a maintainer pushes it from a Mac. A package first
+  # created by a personal token is private and unconnected, and an unconnected
+  # package cannot be made public. Pushing a placeholder :bootstrap tag from
+  # Actions creates the package with GITHUB_TOKEN instead: that connects it to
+  # this repository and gives it the repository's visibility. The manual push
+  # then only adds tags to a package that is already public.
+  freebsd-bootstrap:
+    name: bootstrap ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [nginx-native]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: push the :bootstrap placeholder
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STORAGE_DRIVER: vfs
+        run: |
+          set -eux
+          img=ghcr.io/${{ github.repository_owner }}/jm-demo-${{ matrix.image }}
+          buildah manifest create "$img:ci"
+          for arch in amd64 arm64; do
+            buildah bud --os freebsd --arch "$arch" \
+              --build-arg IMAGE=${{ matrix.image }} \
+              --manifest "$img:ci" demo/bootstrap
+          done
+          echo "$TOKEN" | buildah login -u '${{ github.actor }}' --password-stdin ghcr.io
+          buildah manifest push --all "$img:ci" "docker://$img:bootstrap"
