@@ -239,3 +239,24 @@ tens of minutes.
   reaches deep into `/sys`, cgroups, or `io_uring`.
 - **FreeBSD `:latest` tags are arm64.** On an amd64 FreeBSD host, pull the
   `:freebsd-amd64` tag instead.
+
+## How these images are published
+
+Publishing is **manual, from a Mac running jailmachine**, because GitHub has no
+FreeBSD runner on any architecture and its hosted runners have no nested
+virtualisation, so a FreeBSD guest in CI could only run under slow emulation:
+
+```bash
+jm start
+gh auth token | jpodman login ghcr.io -u <your-github-user> --password-stdin
+make -C demo build test push        # arm64 images, tagged :latest and :YYYYMMDD
+```
+
+Images land as `ghcr.io/gabrielbelli/jm-demo-<name>`; new packages start
+private, so flip each one to Public once under
+`https://github.com/users/<user>/packages/container/<name>/settings`.
+
+CI (`.github/workflows/demo-images.yml`) is a signal-only check: it builds the
+two Linux images for `linux/amd64` and `linux/arm64` on native runners and
+smoke-tests them, and pushes nothing. When FreeBSD arm64/amd64 runners become
+available, publishing can move there.

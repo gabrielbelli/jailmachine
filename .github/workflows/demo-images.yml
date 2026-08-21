@@ -1,46 +1,7 @@
 name: demo-images
 
-# Builds and publishes the jailmachine demo images (demo/) to GHCR.
-#
-# ---------------------------------------------------------------------------
-# ARCHITECTURE: why FreeBSD images are NOT published to :latest from here
-# ---------------------------------------------------------------------------
-# GitHub has no FreeBSD runner, so the FreeBSD images are built inside
-# vmactions/freebsd-vm -- a QEMU guest on ubuntu-latest, which is amd64. The
-# jailmachine guest on an Apple Silicon Mac is freebsd/arm64, so anything CI
-# produces natively is the wrong architecture for the machine these images
-# exist to demo.
-#
-# Three options were weighed:
-#   1. Build FreeBSD images only on a maintainer's Mac. Correct arch, but no
-#      CI signal at all -- a broken Containerfile ships unnoticed.
-#   2. Publish CI's amd64 to :latest. Fast and automatic, and useless: every
-#      demo audience on a Mac would get an unrunnable image.
-#   3. Run the action's aarch64 image. Right arch, but that is full-system
-#      TCG emulation on an amd64 host -- `pkg install nginx` alone takes tens
-#      of minutes, and the job is fragile.
-#
-# We take a fourth: CI builds all three FreeBSD images on amd64 as a real
-# smoke test and publishes them only under an explicit `-freebsd-amd64` tag
-# suffix, never :latest. The :latest and dated tags for FreeBSD images are
-# pushed by a maintainer from a Mac with `make -C demo push`, which is the
-# only practical source of freebsd/arm64. Trade-off, in three lines:
-#   + every push to demo/ still proves the FreeBSD Containerfiles build;
-#   + nobody can accidentally pull an amd64 image onto an arm64 machine;
-#   - freebsd/arm64 :latest is a manual step, so it can lag behind main.
-#
-# Linux images have no such problem: buildx + QEMU user-mode cross-builds
-# linux/amd64 and linux/arm64 cheaply, so CI publishes a proper manifest
-# list to :latest.
-# ---------------------------------------------------------------------------
-
 on:
   workflow_dispatch:
-    inputs:
-      push:
-        description: "Push to ghcr.io (off = build and test only)"
-        type: boolean
-        default: true
   push:
     branches: [main]
     paths:
@@ -49,180 +10,65 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
-env:
-  REGISTRY: ghcr.io
-  OWNER: gabrielbelli
-
-concurrency:
-  group: demo-images-${{ github.ref }}
-  cancel-in-progress: true
+# ---------------------------------------------------------------------------
+# PUBLISHING IS MANUAL, ON A MAC
+# ---------------------------------------------------------------------------
+# GitHub has no FreeBSD runner on any architecture, and hosted runners have no
+# nested virtualisation, so a FreeBSD guest here can only run under TCG
+# emulation. Rather than publish images this CI cannot properly test, the demo
+# images are built and pushed by a maintainer with jailmachine itself:
+#
+#     make -C demo build test push        # arm64, against the running machine
+#
+# This workflow is a signal-only check: it builds the two Linux images for
+# both architectures (arm64 natively on ubuntu-24.04-arm) and smoke-tests
+# them. It pushes nothing. When FreeBSD arm64/amd64 runners become available,
+# add a publishing job here and drop the manual step from demo/README.md.
+# ---------------------------------------------------------------------------
 
 jobs:
-  # --------------------------------------------------------------- prep ----
-  prep:
-    runs-on: ubuntu-latest
-    outputs:
-      date_tag: ${{ steps.t.outputs.date_tag }}
-      push: ${{ steps.t.outputs.push }}
-    steps:
-      - id: t
-        run: |
-          echo "date_tag=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
-          # workflow_dispatch honours the input; a push to main always publishes.
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "push=${{ inputs.push }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "push=true" >> "$GITHUB_OUTPUT"
-          fi
 
-  # -------------------------------------------------------------- linux ----
-  # linux/amd64 + linux/arm64 manifest list. arm64 is the one the Mac guest
-  # actually runs, through FreeBSD's Linuxulator; amd64 is there for a future
-  # Linux/amd64 jailmachine backend and costs almost nothing to add.
   linux:
-    needs: prep
-    runs-on: ubuntu-latest
+    name: linux/${{ matrix.arch }} ${{ matrix.image }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         image: [linuxulator, nginx-linuxulator]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-
-      - uses: docker/setup-buildx-action@v3
-
-      - name: log in to ghcr.io
-        if: needs.prep.outputs.push == 'true'
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: build (and push) ${{ matrix.image }}
-        uses: docker/build-push-action@v6
-        with:
-          context: demo/${{ matrix.image }}
-          file: demo/${{ matrix.image }}/Containerfile
-          platforms: linux/amd64,linux/arm64
-          push: ${{ needs.prep.outputs.push == 'true' }}
-          provenance: false
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.OWNER }}/jm-demo-${{ matrix.image }}:latest
-            ${{ env.REGISTRY }}/${{ env.OWNER }}/jm-demo-${{ matrix.image }}:${{ needs.prep.outputs.date_tag }}
-          labels: |
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-
-      - name: smoke test the arm64 image
-        # The runner is amd64; binfmt (registered by setup-qemu-action above)
-        # runs the arm64 image under QEMU user-mode emulation. This is not the
-        # Linuxulator -- it only proves the image is well-formed and its
-        # entrypoint exits 0. The real check is `make -C demo test` on a Mac.
+      - name: build ${{ matrix.image }} for linux/${{ matrix.arch }}
         run: |
-          docker buildx build --platform linux/arm64 --load \
-            -t demo-smoke:arm64 -f demo/${{ matrix.image }}/Containerfile \
+          docker build --pull \
+            -t demo-smoke:${{ matrix.arch }} \
+            -f demo/${{ matrix.image }}/Containerfile \
             demo/${{ matrix.image }}
-          docker run --rm --platform linux/arm64 demo-smoke:arm64 || \
-            { echo "::warning::${{ matrix.image }} entrypoint exited non-zero under QEMU user-mode; this can be an emulation artefact"; }
 
-  # ------------------------------------------------------------ freebsd ----
-  # No FreeBSD runner exists, so this is a QEMU guest. Read the header above
-  # before changing what it publishes.
-  freebsd:
-    needs: prep
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: build FreeBSD demo images in a FreeBSD VM
-        uses: vmactions/freebsd-vm@v1.5.3
-        env:
-          GHCR_USER: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DATE_TAG: ${{ needs.prep.outputs.date_tag }}
-          DO_PUSH: ${{ needs.prep.outputs.push }}
-          OWNER: ${{ env.OWNER }}
-        with:
-          # '15' resolves to the newest 15.x image the action publishes.
-          # At the time of writing that is 15.0, while the jailmachine guest
-          # runs 15.1 -- close enough for a build check, and it tracks forward
-          # automatically. Pin to '15.1' once that image exists upstream.
-          release: '15'
-          # No `arch:` -- the default is the amd64 image, which is the only
-          # one that runs at usable speed on an amd64 runner.
-          copyback: false
-          envs: 'GHCR_USER GHCR_TOKEN DATE_TAG DO_PUSH OWNER'
-          prepare: |
-            set -eu
-            pkg install -y podman-suite
-
-            # Storage. This VM's root is UFS, not ZFS, so podman's FreeBSD
-            # default (the zfs driver) has nothing to work with. vfs is slow
-            # but correct, and these images are tiny.
-            mkdir -p /usr/local/etc/containers
-            if ! zpool list >/dev/null 2>&1; then
-              printf '[storage]\ndriver = "vfs"\n' > /usr/local/etc/containers/storage.conf
-            fi
-
-            # Networking. `RUN pkg install` inside a build needs the container
-            # to reach the internet, which on FreeBSD means pf NAT. Same recipe
-            # as guest/provision.sh, which is the reference for this project.
-            ext_if=$(route -n get default | awk '/interface:/ {print $2}')
-            sed -E "s/^(v[46]egress_if) = \"[^\"]*\"/\1 = \"$ext_if\"/" \
-              /usr/local/etc/containers/pf.conf.sample > /etc/pf.conf
-            sysrc pf_enable=YES
-            service pf start || service pf reload
-          run: |
-            set -eu
-            cd demo
-            REG=ghcr.io/$OWNER
-            ARCHTAG=freebsd-amd64
-            IMAGES='freebsd nginx-native volume'
-
-            for i in $IMAGES; do
-              echo "=== building jm-demo-$i ==="
-              podman build -t "$REG/jm-demo-$i:$ARCHTAG" \
-                           -t "$REG/jm-demo-$i:$DATE_TAG-$ARCHTAG" "./$i"
-            done
-
-            echo "=== smoke test (banner images must run with no args) ==="
-            podman run --rm "$REG/jm-demo-freebsd:$ARCHTAG" | grep -q FreeBSD
-            podman volume rm -f ci-selftest >/dev/null 2>&1 || true
-            podman run --rm -v ci-selftest:/data "$REG/jm-demo-volume:$ARCHTAG" \
-              | grep -q 'now 1 line'
-            podman run --rm -v ci-selftest:/data "$REG/jm-demo-volume:$ARCHTAG" \
-              | grep -q 'now 2 lines'
-
-            echo "=== smoke test (native nginx must answer /healthz) ==="
-            podman rm -f ci-nginx >/dev/null 2>&1 || true
-            podman run -d --name ci-nginx -p 18081:80 "$REG/jm-demo-nginx-native:$ARCHTAG"
-            ok=0
-            for _ in 1 2 3 4 5 6 7 8 9 10; do
-              sleep 2
-              if [ "$(fetch -qo - http://127.0.0.1:18081/healthz 2>/dev/null)" = ok ]; then
-                ok=1; break
-              fi
-            done
-            podman logs ci-nginx 2>&1 | tail -20
-            podman rm -f ci-nginx >/dev/null 2>&1 || true
-            [ "$ok" = 1 ] || { echo 'native nginx did not answer /healthz'; exit 1; }
-
-            if [ "$DO_PUSH" != 'true' ]; then
-              echo 'push disabled for this run; stopping after the build check'
-              exit 0
-            fi
-
-            echo "$GHCR_TOKEN" | podman login ghcr.io -u "$GHCR_USER" --password-stdin
-            for i in $IMAGES; do
-              # Deliberately arch-suffixed. :latest for these images is
-              # freebsd/arm64 and is pushed from a Mac -- see the header.
-              podman push "$REG/jm-demo-$i:$ARCHTAG"
-              podman push "$REG/jm-demo-$i:$DATE_TAG-$ARCHTAG"
-            done
+      - name: smoke test
+        # Native architecture on both runners, so no emulation: the entrypoint
+        # really runs. It still runs on a Linux kernel, not the Linuxulator --
+        # the real check is "make -C demo test" on a Mac with jailmachine.
+        run: |
+          case "${{ matrix.image }}" in
+            nginx-*)
+              id=$(docker run -d -p 8080:80 demo-smoke:${{ matrix.arch }})
+              for _ in $(seq 1 30); do
+                curl -fsS http://127.0.0.1:8080/healthz >/dev/null && ok=1 && break
+                sleep 1
+              done
+              docker logs "$id" | tail -20
+              docker rm -f "$id" >/dev/null
+              [ "${ok:-0}" = 1 ] || { echo "::error::${{ matrix.image }} did not answer /healthz"; exit 1; }
+              ;;
+            *)
+              docker run --rm demo-smoke:${{ matrix.arch }}
+              ;;
+          esac
