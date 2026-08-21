@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 # ---------------------------------------------------------------------------
 # PUBLISHING IS MANUAL, ON A MAC
@@ -73,3 +74,47 @@ jobs:
               docker run --rm demo-smoke:${{ matrix.arch }}
               ;;
           esac
+
+  # -------------------------------------------------------- freebsd (cross) --
+  # No FreeBSD runner exists, but these two images have no RUN steps (they are
+  # FROM + COPY --chmod + ENTRYPOINT), so buildah on Linux can assemble them
+  # for freebsd/amd64 and freebsd/arm64 without executing anything. Pushing
+  # from Actions with GITHUB_TOKEN links the package to this repository, which
+  # is also what makes it inherit the repository's public visibility.
+  #
+  # jm-demo-nginx-native runs "pkg install" and therefore still needs a real
+  # FreeBSD userland: it is published by hand with "make -C demo push".
+  freebsd-crossbuild:
+    name: freebsd ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [freebsd, volume]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: build freebsd/amd64 and freebsd/arm64
+        run: |
+          set -eux
+          img=ghcr.io/${{ github.repository_owner }}/jm-demo-${{ matrix.image }}
+          buildah manifest create "$img:ci"
+          for arch in amd64 arm64; do
+            buildah bud --os freebsd --arch "$arch" \
+              --manifest "$img:ci" \
+              -f demo/${{ matrix.image }}/Containerfile \
+              demo/${{ matrix.image }}
+          done
+          buildah manifest inspect "$img:ci" | head -40
+
+      - name: push
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          img=ghcr.io/${{ github.repository_owner }}/jm-demo-${{ matrix.image }}
+          echo "$TOKEN" | buildah login -u '${{ github.actor }}' --password-stdin ghcr.io
+          buildah manifest push --all "$img:ci" "docker://$img:latest"
+          buildah manifest push --all "$img:ci" "docker://$img:$(date -u +%Y%m%d)"

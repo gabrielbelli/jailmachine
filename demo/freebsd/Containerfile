@@ -13,8 +13,8 @@ LABEL org.opencontainers.image.title="jm-demo-freebsd" \
       org.opencontainers.image.source="https://github.com/gabrielbelli/jailmachine" \
       org.opencontainers.image.licenses="BSD-2-Clause"
 
-COPY banner.sh /usr/local/bin/banner
-RUN chmod 0755 /usr/local/bin/banner
+# --chmod keeps the image free of RUN steps, so it cross-builds on Linux CI.
+COPY --chmod=0755 banner.sh /usr/local/bin/banner
 
 # Runs with no arguments and exits 0.
 ENTRYPOINT ["/usr/local/bin/banner"]

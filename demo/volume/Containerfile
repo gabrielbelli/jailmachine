@@ -14,8 +14,8 @@ LABEL org.opencontainers.image.title="jm-demo-volume" \
       org.opencontainers.image.source="https://github.com/gabrielbelli/jailmachine" \
       org.opencontainers.image.licenses="BSD-2-Clause"
 
-COPY volume.sh /usr/local/bin/volume-demo
-RUN chmod 0755 /usr/local/bin/volume-demo
+# --chmod keeps the image free of RUN steps, so it cross-builds on Linux CI.
+COPY --chmod=0755 volume.sh /usr/local/bin/volume-demo
 
 # Deliberately NO `VOLUME /data`: without an explicit -v the image should
 # show you that /data is only an image directory, so the difference between
