@@ -13,6 +13,7 @@ import (
 	"github.com/gabrielbelli/jailmachine/internal/backend"
 	"github.com/gabrielbelli/jailmachine/internal/doctor"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
+	"github.com/gabrielbelli/jailmachine/internal/netprov"
 	"github.com/gabrielbelli/jailmachine/internal/version"
 )
 
@@ -170,9 +171,9 @@ func checkMachine(name string) doctor.Result {
 // nothing is wrong: it is a number to design against, and a pasted report
 // should carry it.
 //
-// The number comes from the provider's declared MTU rather than a probe: it
-// is a fixed property of the virtual link, and "jm doctor" must not have to
-// reach the guest to state a constant.
+// The number comes from the machine's record when it has one, so a machine
+// started with a different $JM_MTU is reported as it actually runs; a machine
+// that has never started falls back to what this environment would give it.
 func datagramLimitCheck(m *machine.Machine) (doctor.Result, bool) {
 	res := doctor.Result{Name: "datagram limit " + m.Name}
 	p, err := providerFor(m)
@@ -180,12 +181,17 @@ func datagramLimitCheck(m *machine.Machine) (doctor.Result, bool) {
 		return res, false // checkMachine already reports an unknown provider
 	}
 	caps := p.Capabilities()
-	max := caps.MaxDatagram()
+	mtu, max := m.MTU, 0
+	if mtu > 0 {
+		max = netprov.Capabilities{MTU: mtu}.MaxDatagram()
+	} else {
+		mtu, max = caps.MTU, caps.MaxDatagram()
+	}
 	if max == 0 {
 		return res, false // the provider does not say; do not invent one
 	}
 	res.Status = doctor.OK
-	res.Detail = fmt.Sprintf("published udp carries payloads up to %d bytes (%s MTU %d); larger datagrams are dropped, not fragmented",
-		max, p.Name(), caps.MTU)
+	res.Detail = fmt.Sprintf("published udp carries payloads up to %d bytes (%s MTU %d); larger datagrams are dropped, not fragmented. $JM_MTU changes the link size (576..16384; JM_MTU=1500 matches Docker)",
+		max, p.Name(), mtu)
 	return res, true
 }

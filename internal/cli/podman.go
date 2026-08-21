@@ -6,9 +6,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
+
+	"github.com/gabrielbelli/jailmachine/internal/machine"
 )
 
 // MachineEnv names the machine the client wrappers talk to, overriding the
@@ -53,8 +56,25 @@ func execPodman(ctx context.Context, args []string) error {
 	if err != nil {
 		return withHint(errors.New("podman not found on PATH"), "brew install podman")
 	}
-	argv := append([]string{bin, "--connection", name}, rest...)
-	return syscall.Exec(bin, argv, os.Environ())
+	env := os.Environ()
+	conn := name
+	// "podman compose" hands the work to an external provider (Docker
+	// Compose or podman-compose) and passes it the connection's URI. The
+	// ssh:// URI podman uses would send the provider looking for a docker
+	// daemon in the guest, so point it at the socket connection instead,
+	// which is a plain unix:// path on this Mac (ADR 0004: the provider
+	// proxies the guest API to a host socket).
+	if isComposeCall(rest) {
+		if m, err := store().Load(name); err == nil {
+			if ep, err := endpointOf(m); err == nil && ep.APISocket != "" {
+				conn = m.SocketConnectionName()
+				uri := machine.SocketURI(ep.APISocket)
+				env = append(env, "DOCKER_HOST="+uri, "CONTAINER_HOST="+uri)
+			}
+		}
+	}
+	argv := append([]string{bin, "--connection", conn}, rest...)
+	return syscall.Exec(bin, argv, env)
 }
 
 // wrapperTarget is the shared preamble of the client wrappers: pick the
@@ -138,4 +158,16 @@ func jmBinary() (string, error) {
 		return real, nil
 	}
 	return exe, nil
+}
+
+// isComposeCall reports whether these wrapper arguments invoke the compose
+// shim, i.e. whether the first non-flag argument is "compose".
+func isComposeCall(args []string) bool {
+	for _, a := range args {
+		if strings.HasPrefix(a, "-") {
+			continue
+		}
+		return a == "compose"
+	}
+	return false
 }

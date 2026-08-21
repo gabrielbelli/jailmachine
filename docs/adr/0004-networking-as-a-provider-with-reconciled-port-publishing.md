@@ -1,7 +1,8 @@
 # ADR 0004 — Networking is a separate provider; published ports are reconciled, not requested
 
-- Status: accepted (2026-08-20), amended (2026-08-21) — see
-  [Amendment](#amendment-2026-08-21-the-guest-side-of-a-host-bound-publish)
+- Status: accepted (2026-08-20), amended twice (2026-08-21) — see
+  [the guest side of a host-bound publish](#amendment-2026-08-21-the-guest-side-of-a-host-bound-publish)
+  and [the default link size](#amendment-2026-08-21-the-default-link-size-is-the-jumbo-frame)
 
 ## Context
 
@@ -90,3 +91,25 @@ recomputed every reconcile because a restarted container gets a new one.
   the clash rather than silently pointing at the first container.
 - A killed forwarder leaves rules in the anchor until the next one starts,
   which rewrites it; they also die with the guest.
+
+## Amendment (2026-08-21): the default link size is the jumbo frame
+
+The provider's MTU was left at 1500 for docker-like behaviour, but gvproxy
+**drops** rather than fragments an oversized datagram, so 1500 was not
+docker-like at all: it capped published UDP at 1472 bytes where Linux would
+fragment and deliver. The link size is therefore chosen for the ceiling it
+buys, not for familiarity.
+
+**Amendment.** The default MTU is **9000**, virtio-net's jumbo frame, which
+the guest NIC already advertises (`JUMBO_MTU`) and gvproxy hands out over
+DHCP — no guest change was needed. Measured on an Apple Silicon Mac, that
+lifts the published-UDP ceiling from 1472 to **8972 bytes** (every size from
+1400 to 8972 echoed back byte-exact through a published `-p …/udp` mapping)
+at no cost to TCP, which segments to fit: 10 MB in 2.4–2.8 s at 9000 against
+2.9–3.8 s at 1500. `$JM_MTU`, read from the environment at `jm start` and
+clamped to 576–9000, overrides it; `JM_MTU=1500` restores Docker's exact link
+size. `jm doctor` names the knob alongside the limit it reports.
+
+This does not make the link fragment. There is still a hard ceiling and still
+no error when a datagram exceeds it — the wall is simply six times further
+out, and now movable.

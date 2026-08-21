@@ -327,7 +327,7 @@ The full matrix, both workarounds, and the script that produced it
 | Docker CLI and compose | Works via `jdocker`, or `eval "$(jm env)"` for a client you point yourself. Compose pulls FreeBSD variants under plain `podman`, so a Linux image needs `jpodman pull --os=linux <image>` first plus `pull_policy: missing` on the service |
 | Jails | Works — `bastille bootstrap`, `create`, `cmd`, `pkg install` in the guest |
 | Several machines at once | Works, but each needs its own SSH port — `jm init --ssh-port 2223 dev`, then `JM_MACHINE=dev jpodman ps` |
-| UDP from a Linux container | Works — binding, sending, receiving, DNS-over-UDP and publishing with `-p 5354:53/udp`, verified from the Mac's loopback and its LAN address. One idiom fails: busybox's `nc -u -l` reports `Address family not supported by protocol`. Use `apk add netcat-openbsd`, `socat`, or any real UDP server. Datagrams are capped at 1472 bytes by the gvproxy link, which does not fragment. See [UDP in a Linux container](docs/TROUBLESHOOTING.md#udp-in-a-linux-container) |
+| UDP from a Linux container | Works — binding, sending, receiving, DNS-over-UDP and publishing with `-p 5354:53/udp`, verified from the Mac's loopback and its LAN address. One idiom fails: busybox's `nc -u -l` reports `Address family not supported by protocol`. Use `apk add netcat-openbsd`, `socat`, or any real UDP server. Datagrams are capped at 8972 bytes by the gvproxy link, which does not fragment: it is MTU 9000 (the virtio-net jumbo frame) by default, and `JM_MTU` at `jm start` moves the ceiling — `JM_MTU=1500` restores Docker's link size and its 1472-byte cap. See [UDP in a Linux container](docs/TROUBLESHOOTING.md#udp-in-a-linux-container) |
 | `docker.io/node` (Linux) | **No.** The one image known to be broken: the binary starts and `node --version` prints, but `console.log` output never reaches the pipe and its HTTP servers do not accept connections. No known workaround |
 | Routable VM IP | **No.** gvproxy is NAT; vmnet/bridged is a later step |
 | Intel Macs, Linux and Windows hosts | **No.** Only `darwin/arm64` has a backend; the Linux release binaries are build-only. Apple Virtualization.framework cannot boot FreeBSD/arm64, hence QEMU |
@@ -343,7 +343,7 @@ The full matrix, both workarounds, and the script that produced it
 | `-v` mounts an empty directory | The host path is outside the shared set (`jm inspect`), or you wrote `/tmp/...` instead of `/private/tmp/...` |
 | A name resolves on the Mac but not in a container | `jm doctor`, then `resolver.log` |
 | `nc -u -l` in a Linux container says `Address family not supported` | Only busybox's UDP listener is affected — `apk add netcat-openbsd`, or use `socat`. UDP itself works |
-| UDP datagrams over 1472 bytes never arrive | The gvproxy link is MTU 1500 and does not fragment; `jm doctor` states the limit per machine |
+| UDP datagrams over 8972 bytes never arrive | The gvproxy link does not fragment, so its MTU (9000 by default) is a hard ceiling; `jm doctor` states the limit per machine, and `JM_MTU` at `jm start` changes it (576–16384) |
 | Stale state after a crash or reboot | `jm stop` repairs "broken" (pid file without process); `jm rm && jm init` is always a clean slate |
 
 Host-side logs, all under `~/.jailmachine/machines/<name>/`:

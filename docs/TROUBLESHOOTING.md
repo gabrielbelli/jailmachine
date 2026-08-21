@@ -51,7 +51,7 @@ guest, to the same address) — printing a one-line fix per failure. Note that i
 | `-v /Users/me/src:/app` mounts an empty directory | The host path is outside the machine's share set, or it is under `/tmp` | `jm inspect` lists the shares; write `/private/tmp/...` not `/tmp/...`; add a root with `jm set --mount`. See *a share is empty* below |
 | `zsh: no such file or directory` from `jm set --mount $P:ro` | zsh reads a trailing `:ro` as a history modifier | Quote it: `jm set --mount "${P}:ro"`, and `-v "${P}:${P}:ro"` |
 | A name resolves on the Mac but not in a container | The host resolver is down, or the guest was not pointed at it | `jm doctor`, then `resolver.log`. See *names do not resolve* below |
-| UDP datagrams over 1472 bytes never arrive | The gvproxy link is MTU 1500 and does not fragment | Keep datagrams under 1472 bytes, or use TCP; `jm doctor` states the limit. See *UDP in a Linux container* below |
+| UDP datagrams over 8972 bytes never arrive | The gvproxy link does not fragment, and its MTU is 9000 by default | Keep datagrams under 8972 bytes, or use TCP; `jm doctor` states the limit, and `JM_MTU` at `jm start` moves it. See *UDP in a Linux container* below |
 | `nc -u -l` in a Linux container → `Address family not supported by protocol` | busybox's UDP listener peeks its peer with a zero-length `recvmsg()`, which returns at once on FreeBSD where Linux blocks | `apk add netcat-openbsd`, or `socat UDP4-RECVFROM:…`. UDP itself works; see *UDP in a Linux container* below |
 | `jpodman ps` pauses and prints `starting jailmachine …` | Autostart is doing its job | Nothing. `JM_AUTOSTART=0` or `jpodman --no-autostart ps` to fail instead |
 | `jdocker: the docker CLI is not on PATH` | Only the engine is provided by jm | `brew install docker` (the client alone), or use `jpodman` |
@@ -392,28 +392,44 @@ jpodman run -d --os=linux -p 5354:53/udp <image>
 
 ### Large datagrams vanish
 
-If datagrams under about 1.4 kB work and larger ones never arrive, this is
-the cause and not a bug in your program. The host-to-guest link is gvproxy's,
-MTU 1500, and **it does not fragment**, so the largest UDP payload that
-survives is 1472 bytes — 1500 less the 20-byte IPv4 and 8-byte UDP headers.
-Over that, the datagram is dropped with no error at either end and nothing
-in any log.
+If datagrams up to a few kilobytes work and larger ones never arrive, this
+is the cause and not a bug in your program. The host-to-guest link is
+gvproxy's and **it does not fragment**, so the largest UDP payload that
+survives is the link MTU less the 20-byte IPv4 and 8-byte UDP headers. That
+MTU is **9000** by default — the virtio-net jumbo frame — which puts the
+ceiling at **8972 bytes**. Over that, the datagram is dropped with no error
+at either end and nothing in any log.
 
 ```
-1472 bytes -> reply 1472
-1473 bytes -> no reply
+8972 bytes -> reply 8972
+8973 bytes -> no reply
 ```
 
 `jm doctor` states the limit for each machine:
 
 ```
-[ ok ]  datagram limit dev   published udp carries payloads up to 1472 bytes (gvproxy MTU 1500); larger datagrams are dropped, not fragmented
+[ ok ]  datagram limit dev   published udp carries payloads up to 8972 bytes (gvproxy MTU 9000); larger datagrams are dropped, not fragmented. $JM_MTU changes the link size (576..16384; JM_MTU=1500 matches Docker)
 ```
 
-TCP never meets this, because the stack segments to fit. Keep datagrams
-under 1472 bytes, or use TCP. DNS is unaffected in practice: an oversized
-reply is truncated and the resolver retries over TCP, which is what the
-truncation bit is for.
+`$JM_MTU` moves the ceiling. It is read at `jm start`, clamped to 576–16384,
+and the guest takes the value over DHCP — `jm ssh -- ifconfig vtnet0` shows
+the `mtu` it settled on, which is the authority: `jm doctor` states the limit
+from the variable in *its* environment, not from the running machine.
+
+```bash
+JM_MTU=1500 jm start        # Docker's exact link size; ceiling back to 1472
+JM_MTU=4000 jm start        # anything in between
+```
+
+There is a ceiling either way: gvproxy still never fragments, so this is
+**not** parity with Linux, where the sender's stack would split an oversized
+datagram and the receiver would reassemble it. The default simply puts the
+wall six times further out than a 1500-byte link does.
+
+TCP never meets this, because the stack segments to fit — measured
+throughput is the same at 9000 as at 1500. Keep datagrams under the limit,
+or use TCP. DNS is unaffected in practice: an oversized reply is truncated
+and the resolver retries over TCP, which is what the truncation bit is for.
 
 ### If a published UDP port does not answer
 

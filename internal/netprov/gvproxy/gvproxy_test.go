@@ -52,7 +52,7 @@ func TestArgs(t *testing.T) {
 		"-ssh-port", "2222",
 		"-pid-file", "/state/machines/test/gvproxy.pid",
 		"-log-file", "/state/machines/test/gvproxy.log",
-		"-mtu", "1500",
+		"-mtu", strconv.Itoa(DefaultMTU),
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("argv mismatch\n got: %q\nwant: %q", got, want)
@@ -518,5 +518,25 @@ func TestExposeErrExplainsABusyHostPort(t *testing.T) {
 	other := errors.New("gvproxy api: POST /services/forwarder/expose: 500: port already exposed")
 	if got := exposeErr(udp, other); got.Error() != other.Error() {
 		t.Errorf("unrelated failure was rewritten to %q", got)
+	}
+}
+
+func TestMTUFromEnv(t *testing.T) {
+	for _, tc := range []struct {
+		env  string
+		want int
+	}{
+		{"", DefaultMTU},
+		{"nonsense", DefaultMTU},
+		{"1500", 1500},
+		{"576", 576},
+		{"100", DefaultMTU}, // below the floor: ignored
+		{"70000", MaxMTU},   // above virtio's jumbo limit: clamped
+		{" 4000 ", 4000},    // trimmed
+	} {
+		t.Setenv("JM_MTU", tc.env)
+		if got := MTU(); got != tc.want {
+			t.Errorf("JM_MTU=%q: MTU() = %d, want %d", tc.env, got, tc.want)
+		}
 	}
 }

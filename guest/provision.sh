@@ -309,7 +309,11 @@ rm -f /firstboot-reboot
 i=0; until host -W 2 pkg.freebsd.org >/dev/null 2>&1 || [ $i -ge 60 ]; do sleep 2; i=$((i+1)); done
 # packages
 env ASSUME_ALWAYS_YES=yes pkg bootstrap -f
-pkg install -y podman-suite bastille
+# catatonit is the pod infra container's init; podman does not depend on it,
+# but "podman kube play" needs it, and kube YAML is the compose substitute on
+# FreeBSD (podman-compose is not packaged and "podman compose" needs an
+# external provider on the client side).
+pkg install -y podman-suite bastille catatonit
 # zfs / storage for containers
 sysrc zfs_enable=YES
 zfs create -o mountpoint=/var/db/containers zroot/containers || true

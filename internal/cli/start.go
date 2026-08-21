@@ -131,6 +131,15 @@ func startMachine(ctx context.Context, args []string, opts startOpts) error {
 	if st != backend.Running {
 		logf(stdout, "%s: starting %s networking", machine.StageNetwork, p.Name())
 	}
+	// The link size is fixed when the provider starts (gvproxy reads
+	// $JM_MTU there), so record it: doctor and inspect must report the
+	// machine as it runs, not as this shell would start it.
+	if caps := p.Capabilities(); caps.MTU != m.MTU {
+		m.MTU = caps.MTU
+		if err := store().Save(m); err != nil {
+			return err
+		}
+	}
 	att, ep, err := p.Start(ctx, m)
 	if err != nil {
 		return machine.NewStageError(machine.StageNetwork, networkHint(m, p), err)

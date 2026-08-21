@@ -641,6 +641,7 @@ machine record.
 | `JM_QEMU_ACCEL` | QEMU backend | Accelerator override. Default `hvf` on macOS, `kvm` on Linux; `JM_QEMU_ACCEL=tcg` is pure emulation with `-cpu cortex-a72`, an order of magnitude slower — for building images on machines without a hypervisor, not for using them. Start-stage timeouts are stretched eightfold under TCG |
 | `JM_IMAGE_BASEURL` | prebaked image source | Fetch the prebaked image and its `.sha256` from `$JM_IMAGE_BASEURL/<file name>` instead of the GitHub release. For testing an image that is not published yet |
 | `JM_GVPROXY` | gvproxy provider | Path to the `gvproxy` binary, instead of `PATH` and then `/opt/homebrew/opt/podman/libexec/podman/gvproxy` |
+| `JM_MTU` | `jm start` (gvproxy provider) | Link size gvproxy and the guest agree on. Default **9000**, the virtio-net jumbo frame; clamped to **576–16384** (a value below 576 or that is not a number falls back to the default, one above 9000 clamps to 9000). It caps published UDP at the MTU less 28 bytes — 8972 by default, 1472 with `JM_MTU=1500`, which is Docker's link size. Read from the environment at every `jm start` and **not** stored in the machine record, so a machine uses whatever was set when it was last started; the guest picks it up over DHCP. See [Datagrams are capped at 8972 bytes](#datagrams-are-capped-at-8972-bytes) |
 | `JM_E2E` | `make e2e` | `JM_E2E=1` enables the end-to-end test; it is skipped otherwise |
 
 Testing an unpublished guest image:
@@ -1002,7 +1003,7 @@ table onto the guest's containers (ADR 0004).
 | `-p 127.0.0.1:8080:80` | your loopback only; the LAN gets connection refused |
 | `-p [::1]:8080:80` | your IPv6 loopback only |
 | `-p 192.168.0.18:8080:80` | that address only; an address your Mac does not have is a per-mapping error, as under docker |
-| `-p 8080-8082:80-82`, `-p 8080:80/udp` | as above, one mapping per port, protocol preserved |
+| `-p 8080-8082:80-82`, `-p 8080:80/udp` | as above, one mapping per port, protocol preserved. A published UDP datagram is capped at 8972 bytes — see [Datagrams are capped at 8972 bytes](#datagrams-are-capped-at-8972-bytes) |
 
 `-p localhost:8080:80` is the one docker spelling that does not reach jm at
 all: podman rejects the name client-side.
@@ -1102,30 +1103,49 @@ jpodman run --rm --os=linux docker.io/alpine \
   sh -c 'apk add -q socat && socat UDP4-RECVFROM:9999,fork SYSTEM:"tr a-z A-Z"'
 ```
 
-### Datagrams are capped at 1472 bytes
+### Datagrams are capped at 8972 bytes
 
-The host-to-guest link is gvproxy's, with an MTU of 1500, and **it does not
-fragment**. A UDP payload of 1472 bytes (1500 less the 20-byte IPv4 and
-8-byte UDP headers) arrives; 1473 is dropped in silence, with no error on
-either side and nothing in any log:
+The host-to-guest link is gvproxy's and **it does not fragment**, so the
+largest UDP payload that survives is the link MTU less the 20-byte IPv4 and
+8-byte UDP headers. The MTU is **9000** by default — the virtio-net jumbo
+frame the guest NIC advertises and gvproxy hands out over DHCP — so a
+payload of 8972 bytes arrives and 8973 is dropped in silence, with no error
+on either side and nothing in any log:
 
 ```
-1470 bytes -> reply 1470
-1472 bytes -> reply 1472
-1473 bytes -> no reply
-4000 bytes -> no reply
+1400 bytes -> reply 1400
+8972 bytes -> reply 8972
+8973 bytes -> no reply
 ```
 
 TCP never meets this — the stack segments to fit — so it only shows up on
-UDP. `jm doctor` prints the number for each machine:
+UDP, and the jumbo default costs it nothing (10 MB downloads measured at
+2.4–2.8 s with MTU 9000 against 2.9–3.8 s with MTU 1500). `jm doctor` prints
+the number for each machine:
 
 ```
-[ ok ]  datagram limit dev   published udp carries payloads up to 1472 bytes (gvproxy MTU 1500); larger datagrams are dropped, not fragmented
+[ ok ]  datagram limit dev   published udp carries payloads up to 8972 bytes (gvproxy MTU 9000); larger datagrams are dropped, not fragmented. $JM_MTU changes the link size (576..16384; JM_MTU=1500 matches Docker)
 ```
 
-Design for it as you would for any other network: keep datagrams under
-1472 bytes, or use TCP. DNS is unaffected in practice — a reply that does
-not fit falls back to TCP, which is exactly what the truncation bit is for.
+`$JM_MTU` moves the ceiling. It is read from the environment at `jm start`,
+clamped to 576–16384, and the guest picks the value up over DHCP:
+
+```bash
+JM_MTU=1500 jm start                # Docker's exact link size, ceiling 1472
+jm ssh -- ifconfig vtnet0 | head -1 # what the guest settled on
+```
+
+It is not stored in the machine record, so a machine runs with whatever was
+in the environment the last time it was started — and `jm doctor` prints the
+limit from the same variable rather than from the running machine, so if the
+two could differ, `ifconfig vtnet0` in the guest is the authority.
+
+A ceiling remains whatever the MTU: gvproxy never fragments, so this is
+**not** Linux-style fragmentation, only a wall six times further out than a
+1500-byte link puts it. Design for it as you would for any other network:
+keep datagrams under the limit, or use TCP. DNS is unaffected in practice —
+a reply that does not fit falls back to TCP, which is exactly what the
+truncation bit is for.
 
 ### Picking a host port
 
@@ -1415,7 +1435,7 @@ Stated plainly, so you can plan around it.
 | Limit | What it looks like / what instead |
 |---|---|
 | busybox `nc -u -l` in a Linux container | Fails with `Address family not supported by protocol`. It is the only known casualty of FreeBSD returning at once from a zero-length `recvmsg()` where Linux blocks. UDP itself works — `apk add netcat-openbsd`, `socat`, or any real UDP server. See [UDP from a container](#udp-from-a-container) |
-| UDP datagrams over 1472 bytes | Dropped in silence: the gvproxy link is MTU 1500 and does not fragment. `jm doctor` states the limit per machine. Keep datagrams under it, or use TCP. See [Datagrams are capped at 1472 bytes](#datagrams-are-capped-at-1472-bytes) |
+| UDP datagrams over 8972 bytes | Dropped in silence: the gvproxy link does not fragment, and its MTU is 9000 by default. `jm doctor` states the limit per machine, and `JM_MTU` at `jm start` moves it (576–16384; `JM_MTU=1500` is Docker's link size and its 1472-byte cap). Keep datagrams under the limit, or use TCP. See [Datagrams are capped at 8972 bytes](#datagrams-are-capped-at-8972-bytes) |
 
 **Not planned for the MVP:**
 

@@ -68,7 +68,13 @@ type Machine struct {
 	// "docker run -p" does on Linux. It lives on the record rather than in
 	// the environment of whichever shell started the machine, so that the
 	// binding a running forwarder uses is the one "jm inspect" shows.
-	PublishAddr string    `json:"publish_addr,omitempty"`
+	PublishAddr string `json:"publish_addr,omitempty"`
+	// MTU is the link size the provider gave this machine when it was last
+	// started. It lives on the record for the same reason PublishAddr
+	// does: $JM_MTU is read once, at start, so "jm doctor" and "jm
+	// inspect" must report what the running machine actually uses rather
+	// than what the current shell would ask for.
+	MTU         int       `json:"mtu,omitempty"`
 	Created     time.Time `json:"created"`
 	Provisioned bool      `json:"provisioned"`
 	// ImageTrusted records whether the disk image was verified against a
