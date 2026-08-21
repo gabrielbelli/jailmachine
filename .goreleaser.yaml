@@ -153,8 +153,11 @@ homebrew_casks:
           end
           # jpodman: podman pointed at the machine, without touching the default connection
           FileUtils.ln_sf "#{HOMEBREW_PREFIX}/bin/jm", "#{HOMEBREW_PREFIX}/bin/jpodman"
-      uninstall: |
-        FileUtils.rm_f "#{HOMEBREW_PREFIX}/bin/jpodman"
+    # goreleaser's cask hooks have no uninstall phase; the symlink is removed by
+    # brew's zap/uninstall stanza below.
+    zap:
+      trash:
+        - "#{HOMEBREW_PREFIX}/bin/jpodman"
     caveats: |
       Quickstart (macOS on Apple Silicon):
 
