@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 	"github.com/gabrielbelli/jailmachine/internal/forwarder"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
 	"github.com/gabrielbelli/jailmachine/internal/netprov"
+	"github.com/gabrielbelli/jailmachine/internal/sshx"
 )
 
 // newForwarderCmd is the hidden foreground entry point of the port
@@ -45,13 +48,16 @@ func newForwarderCmd() *cobra.Command {
 				return err
 			}
 			logger := log.New(stdout, "forwarder: ", log.LstdFlags)
-			logger.Printf("starting for %s (guest %s, pid %d)", m.Name, ep.GuestIP, os.Getpid())
+			logger.Printf("starting for %s (guest %s, publishing on %s, pid %d)",
+				m.Name, ep.GuestIP, forwarder.HostIP(m.PublishAddr), os.Getpid())
 			defer logger.Printf("stopped")
 			return forwarder.Run(cmd.Context(), forwarder.Config{
 				Provider:  p,
 				Machine:   m,
 				GuestIP:   ep.GuestIP,
+				HostIP:    m.PublishAddr,
 				Engine:    podmanEngine{connection: m.Name},
+				Guest:     sshGuest{m: m},
 				StatePath: forwarder.StatePath(m.Dir),
 				SSHLocal:  net.JoinHostPort(ep.SSHHost, strconv.Itoa(ep.SSHPort)),
 				Log:       logger,
@@ -67,8 +73,14 @@ type podmanEngine struct {
 }
 
 // psTimeout bounds one "podman ps" over SSH so a wedged connection cannot
-// stall the reconciliation loop.
-const psTimeout = 30 * time.Second
+// stall the reconciliation loop; inspectTimeout does the same for the
+// batched "podman inspect" that resolves container addresses, and
+// guestRuleTimeout for the SSH command that loads jm's pf anchor.
+const (
+	psTimeout        = 30 * time.Second
+	inspectTimeout   = 30 * time.Second
+	guestRuleTimeout = 30 * time.Second
+)
 
 func (e podmanEngine) PS(ctx context.Context) ([]byte, error) {
 	bin, err := exec.LookPath("podman")
@@ -90,6 +102,64 @@ func (e podmanEngine) PS(ctx context.Context) ([]byte, error) {
 		return nil, fmt.Errorf("podman ps: %w", err)
 	}
 	return out, nil
+}
+
+// Inspect batches one "podman inspect" for the containers whose published
+// ports need a guest-side redirect (forwarder.Rule); the addresses it
+// returns are recomputed on every reconcile, because a restarted container
+// gets a new one.
+func (e podmanEngine) Inspect(ctx context.Context, ids []string) ([]byte, error) {
+	if len(ids) == 0 {
+		return []byte("[]"), nil
+	}
+	bin, err := exec.LookPath("podman")
+	if err != nil {
+		return nil, errors.New("podman not found on PATH")
+	}
+	ctx, cancel := context.WithTimeout(ctx, inspectTimeout)
+	defer cancel()
+	args := append([]string{"--connection", e.connection, "inspect", "--type", "container", "--format", "json"}, ids...)
+	out, err := exec.CommandContext(ctx, bin, args...).Output()
+	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, fmt.Errorf("podman inspect: timed out after %s", inspectTimeout)
+		}
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && len(ee.Stderr) > 0 {
+			return nil, fmt.Errorf("podman inspect: %w: %s", err, bytes.TrimSpace(ee.Stderr))
+		}
+		return nil, fmt.Errorf("podman inspect: %w", err)
+	}
+	return out, nil
+}
+
+// sshGuest is the forwarder's control channel into the guest: it loads jm's
+// pf anchor over the same SSH connection everything else uses. The whole
+// rule set is written on every change, so the anchor is a pure function of
+// the desired state and a crash cannot leave a rule behind that the next
+// reconcile does not overwrite.
+type sshGuest struct{ m *machine.Machine }
+
+func (g sshGuest) ApplyRules(ctx context.Context, text string) error {
+	ctx, cancel := context.WithTimeout(ctx, guestRuleTimeout)
+	defer cancel()
+	ep, err := endpointOf(g.m)
+	if err != nil {
+		return err
+	}
+	c, err := sshx.Dial(ctx, ep.SSHHost, ep.SSHPort, g.m.SSHUser, sshKey(g.m))
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	_, errOut, err := c.RunScript(ctx, "loading jm's redirect rules", forwarder.AnchorScript(text))
+	if err != nil {
+		if msg := strings.TrimSpace(errOut); msg != "" {
+			return fmt.Errorf("%w: %s", err, msg)
+		}
+		return err
+	}
+	return nil
 }
 
 func (e podmanEngine) Events(ctx context.Context) (io.ReadCloser, error) {
@@ -150,7 +220,7 @@ func startForwarder(m *machine.Machine, p netprov.Provider, ep netprov.Endpoint)
 		logf(stdout, "%s: %s networking cannot publish container ports; skipping", machine.StageForwarder, p.Name())
 		return nil
 	}
-	exe, err := os.Executable()
+	exe, err := jmBinary()
 	if err != nil {
 		return machine.NewStageError(machine.StageForwarder, "", fmt.Errorf("locating the jm binary: %w", err))
 	}
@@ -159,7 +229,8 @@ func startForwarder(m *machine.Machine, p netprov.Provider, ep netprov.Endpoint)
 		logf(stdout, "%s: port forwarder already running", machine.StageForwarder)
 		return nil
 	}
-	logf(stdout, "%s: starting the port forwarder (log: %s)", machine.StageForwarder, pr.LogPath())
+	logf(stdout, "%s: starting the port forwarder, publishing on %s (log: %s)",
+		machine.StageForwarder, forwarder.HostIP(m.PublishAddr), pr.LogPath())
 	if err := pr.Start(exe); err != nil {
 		return machine.NewStageError(machine.StageForwarder, "see "+pr.LogPath(), err)
 	}
@@ -185,15 +256,20 @@ func stopForwarder(ctx context.Context, m *machine.Machine, p netprov.Provider) 
 	}
 }
 
-// forwards reads the persisted mapping table for inspect/list/ports; it
-// never talks to the provider.
-func forwards(m *machine.Machine) []forwarder.Entry {
+// forwardState reads the forwarder's persisted state for
+// inspect/list/ports: the mapping table, its per-mapping errors, and the
+// publish address the running forwarder was started with. It never talks to
+// the provider, and an unreadable or missing file is an empty state.
+func forwardState(m *machine.Machine) *forwarder.State {
 	if m.Dir == "" {
-		return nil
+		return &forwarder.State{}
 	}
 	st, err := forwarder.Load(forwarder.StatePath(m.Dir))
 	if err != nil {
-		return nil
+		return &forwarder.State{}
 	}
-	return st.Owned
+	return st
 }
+
+// forwards is forwardState's mapping table alone.
+func forwards(m *machine.Machine) []forwarder.Entry { return forwardState(m).Owned }

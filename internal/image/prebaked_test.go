@@ -184,9 +184,13 @@ func TestPrebakedFetchSparse(t *testing.T) {
 	if !bytes.Equal(got[:len(payload)], payload) || !bytes.Equal(got[len(payload):], make([]byte, GiB-int64(len(payload)))) {
 		t.Fatal("payload differs after zstd round trip")
 	}
-	// Only ~32 KiB of data was written; the rest must be holes.
-	if a := allocated(t, dest); a > 4<<20 {
-		t.Fatalf("file not sparse: %d bytes allocated", a)
+	// Only ~32 KiB of data was written; the rest must be holes. The bound
+	// is generous because how much a filesystem allocates around those two
+	// writes is its own business — GitHub's macos-15 runners allocate
+	// ~16 MiB of APFS extents for them — and what the test is really
+	// guarding is that a 1 GiB image does not cost 1 GiB of blocks.
+	if a := allocated(t, dest); a > GiB/16 {
+		t.Fatalf("file not sparse: %d bytes allocated of %d", a, GiB)
 	}
 	for _, leftover := range []string{dest + ".zst", dest + ".zst.part", dest + ".tmp"} {
 		if _, err := os.Stat(leftover); !os.IsNotExist(err) {

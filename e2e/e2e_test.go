@@ -130,8 +130,12 @@ func TestLifecycle(t *testing.T) {
 		"mkdir -p /www && echo ok > /www/index.html && exec httpd -f -p 80 -h /www"}
 	podman(append([]string{"run", "-d", "--name", "web", "-p", "8080:80"}, httpd...)...)
 	waitCurl("http://127.0.0.1:8080/", true, 90*time.Second)
-	if out := jm("ports", name); !strings.Contains(out, "127.0.0.1:8080") {
-		t.Fatalf("jm ports does not list 127.0.0.1:8080:\n%s", out)
+	// Published on every host interface, as docker is on Linux: the same
+	// port answers over IPv6 loopback, which is what "localhost" resolves
+	// to first on macOS.
+	waitCurl("http://[::1]:8080/", true, 30*time.Second)
+	if out := jm("ports", name); !strings.Contains(out, "0.0.0.0:8080") {
+		t.Fatalf("jm ports does not list 0.0.0.0:8080:\n%s", out)
 	}
 	podman("rm", "-f", "web")
 	waitCurl("http://127.0.0.1:8080/", false, 30*time.Second)

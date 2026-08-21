@@ -7,19 +7,20 @@ client an endpoint pointing at it — so you can run **native FreeBSD OCI
 images**, **Linux images** through the Linuxulator, and **jails**, from a
 macOS terminal, without keeping a FreeBSD box around.
 
-> **Status: MVP / working demo.** This release proves the idea end to end and
-> is usable for real work: `jm init && jm start`, then build and run FreeBSD
-> and Linux images, publish ports to the host, create jails in the guest.
-> It is not yet a Docker Desktop replacement — no host directory sharing,
-> container DNS is gvproxy's rather than your Mac's, no autostart at login,
-> and `docker` parity stops at `jm env`. Those four are being built on the
-> `docker-parity` branch and are not in this release.
+> **Status: MVP / working demo.** This proves the idea end to end and is
+> usable for real work: `jm init && jm start`, then build and run FreeBSD and
+> Linux images, publish ports to the host, create jails in the guest. Since
+> v0.1.0 it also shares host directories at identical paths, resolves names
+> exactly as your Mac does, starts the machine on demand from `jpodman` /
+> `jdocker`, and ships a `jdocker` wrapper for the docker CLI. It is still not
+> a Docker Desktop replacement: see
+> [what works, and what does not yet](#what-works-and-what-does-not-yet).
 
 ## Install
 
 macOS on Apple Silicon only. `qemu` (for HVF) and `podman` (which also ships
-`gvproxy`) are required; the cask declares both and creates the `jpodman`
-symlink, otherwise they are yours to arrange.
+`gvproxy`) are required; the cask declares both and creates the `jpodman` and
+`jdocker` symlinks, otherwise they are yours to arrange.
 
 ```bash
 brew install --cask gabrielbelli/tap/jailmachine
@@ -28,6 +29,7 @@ brew install --cask gabrielbelli/tap/jailmachine
 brew install qemu podman
 go install github.com/gabrielbelli/jailmachine/cmd/jm@latest
 ln -sf "$(go env GOPATH)/bin/jm" "$(go env GOPATH)/bin/jpodman"
+ln -sf "$(go env GOPATH)/bin/jm" "$(go env GOPATH)/bin/jdocker"
 
 # or, from source (PREFIX defaults to /opt/homebrew):
 git clone https://github.com/gabrielbelli/jailmachine && cd jailmachine && make install
@@ -40,26 +42,39 @@ Details in [docs/INSTALL.md](docs/INSTALL.md).
 
 ```bash
 jm init      # SSH key, download and verify the guest image, grow the disk, write the seed
-jm start     # boot, provision, connect podman, start the port forwarder
+jm start     # boot, provision, connect podman, share host paths, start the forwarder and resolver
 ```
 
 `jm init` takes about 45–60 s, dominated by the roughly 800 MiB image
 download and its mandatory SHA256 check. On the prebaked image a cold first
 boot takes about 22 s (32 s was observed once with two other VMs already
-running on the host) and a warm start 12–20 s; `--image official:<release>`
+running on the host) and a warm start 12–25 s; `--image official:<release>`
 provisions a stock FreeBSD cloud image on first boot instead, taking about
 2 minutes.
 
-`jpodman` is `podman` pointed at the machine, whatever your default
-connection is; jm never repoints a default you already had (`jm start
---set-default` opts in, and on a Mac with no podman connections at all,
-podman itself promotes the first one jm registers).
+`jpodman` is `podman` pointed at the machine and `jdocker` is the docker CLI
+pointed at the same engine, whatever your default connection or docker context
+is; jm never repoints a default you already had (`jm start --set-default` opts
+in, and on a Mac with no podman connections at all, podman itself promotes the
+first one jm registers). **Both wrappers start a stopped machine for you**,
+printing one line on stderr while it boots — `JM_AUTOSTART=0`, or
+`--no-autostart` as the first argument, makes them fail instead.
 
-The guest is FreeBSD, so **Linux images need `--os=linux`**:
+The guest is FreeBSD, so **Linux images need `--os=linux`** with podman:
 
 ```bash
 jpodman run --rm --os=linux docker.io/alpine echo hi              # Linux, via the Linuxulator
 jpodman run --rm ghcr.io/freebsd/freebsd-runtime:15.1 uname -srm  # native FreeBSD
+```
+
+`jdocker` needs no flag — the docker CLI has none, so the wrapper defaults
+`DOCKER_DEFAULT_PLATFORM=linux/arm64` and a plain `jdocker run` pulls the
+Linux image as Docker Desktop would. Set `DOCKER_DEFAULT_PLATFORM` yourself,
+or pass `--platform`, for native FreeBSD images.
+
+```bash
+jdocker run --rm docker.io/alpine echo hi
+jdocker compose up -d
 ```
 
 Build a native FreeBSD image:
@@ -80,14 +95,109 @@ or two after the container starts, hence the retry):
 jpodman run -d --rm --os=linux -p 8080:80 --name web docker.io/busybox \
   sh -c 'echo hello from the FreeBSD VM > /tmp/index.html && httpd -f -p 80 -h /tmp'
 curl --retry 10 --retry-connrefused http://localhost:8080/   # hello from the FreeBSD VM
-jm ports              # what is mapped, and why something is not
+jm ports              # what is mapped, where it binds, and why something is not
 jpodman rm -f web
 ```
 
-For the Docker CLI, compose, or plain `podman`: `eval "$(jm env)"` (fish:
-`eval (jm env --shell fish)`). There is **no `jdocker` wrapper** in this
-release, and compose needs one extra step for Linux images — see
+For plain `podman` or a docker client you would rather point yourself:
+`eval "$(jm env)"` (fish: `eval (jm env --shell fish)`). Compose needs one
+extra step for Linux images — see
 [Docker Hub compatibility](#docker-hub-compatibility).
+
+## Sharing host directories
+
+Host directories appear in the guest **at the same absolute path**, so a
+volume argument written on the Mac resolves inside the VM unchanged — from
+any directory, with no rewriting and no `/host_mnt` prefix:
+
+```bash
+jpodman run --rm --os=linux -v ~/code:/app docker.io/alpine ls /app
+jpodman run --rm --os=linux -v ~/code:"$HOME/code" docker.io/alpine ls "$HOME/code"
+```
+
+A new machine shares your home directory, `/Volumes`, `/private/tmp` and the
+per-user temporary directory `$TMPDIR` lives in (`/var/folders/<hash>`), so
+`-v $(mktemp -d):/work` and `-v $TMPDIR/x:/work` both work. `jm inspect`
+lists the set, and `jm doctor` checks that a file written on the host really
+is visible to a container at the same path.
+
+```bash
+jm init --mount /work --mount /srv/data:ro   # on top of the defaults
+jm init --no-mounts                          # share nothing
+jm set --mount /work --unmount /Volumes      # machine stopped; takes effect on start
+jm inspect | grep -i share
+```
+
+> **Every container can read and write everything shared** — by default that
+> is your whole home directory, including `~/.ssh`, `~/.aws` and
+> `~/.jailmachine` itself. That is the same posture as Docker Desktop's
+> default, and it is a deliberate one: narrow it with `jm set --no-mounts`
+> plus explicit `--mount` roots, or mount what you need read-only with
+> `--mount /srv/data:ro`, if you run images you do not trust.
+
+> **`/tmp` is the one path that cannot follow the rule.** On macOS it is a
+> symlink to `/private/tmp`, and a share mounted at the guest's own `/tmp`
+> would shadow it — so jm shares `/private/tmp` instead and never rewrites
+> your `-v` argument. Write `-v /private/tmp/x:/app`, not `-v /tmp/x:/app`;
+> the latter silently binds the guest's own empty `/tmp/x`.
+
+> **zsh users: quote a `:ro` suffix.** `:ro` at the end of an unquoted word
+> is a history modifier, so `jm set --mount $P:ro` fails with
+> `zsh: no such file or directory` or a bad-modifier error. Write
+> `jm set --mount "${P}:ro"` — and the same for a volume argument,
+> `-v "${P}:${P}:ro"`.
+
+> Shares are for source trees and data. Ownership follows the Mac user,
+> `utimes` is a silent no-op and `chown`/`mkfifo` fail, and 9p is far slower
+> than the guest's ZFS (tens of MB/s, roughly 20× slower on metadata) — keep
+> build output in an engine-managed volume.
+
+## Name resolution
+
+Whatever resolves on the Mac resolves in the guest and in containers, with
+the same answer. `jm start` runs a small resolver on the host and points the
+guest at it, so queries go through macOS's own resolution API: split-horizon
+VPN resolvers, per-domain nameservers, search domains from `scutil --dns`,
+`/etc/hosts` entries, `.local` mDNS names, and the special-use development
+TLDs `.test`, `.invalid`, `.home.arpa` and `.onion` that a stock DNS resolver
+would answer `NXDOMAIN` on its own. Joining or leaving a VPN converges
+without a restart.
+
+The Mac itself is `host.docker.internal` and `host.containers.internal` from
+inside a container, and answers to its own hostname and `.local` name; a host
+answer of `127.0.0.1` is rewritten to the address that means "the host" in
+the guest, so a service on your loopback is reachable.
+
+```bash
+jpodman run --rm --os=linux docker.io/alpine ping -c1 host.docker.internal
+jm doctor            # asserts the guest resolves a host-only name to the right address
+```
+
+> If the guest's resolver cannot be brought up, `jm start` warns and carries
+> on with the resolution the guest already had rather than failing; the check
+> in `jm doctor` is what reports the loss, and `resolver.log` in the machine
+> directory says why.
+
+## Publishing ports
+
+`jpodman run -p` works as on any other machine: a forwarder started by
+`jm start` watches podman events and converges gvproxy's mapping table onto
+the guest's container state.
+
+> **Published ports bind every host interface by default**, as `docker run -p`
+> does on Linux: `127.0.0.1`, `::1`, `localhost` **and your LAN address**, so
+> anyone on your network can reach the container. Confine them to the
+> loopback with `jm init --publish-addr 127.0.0.1` or, on an existing machine,
+> `jm set --publish-addr 127.0.0.1` (it applies from the next `jm stop` +
+> `jm start`). The address is stored on the machine and shown by `jm inspect`
+> and `jm ports`; `JM_PUBLISH_ADDR` is an override read at `jm start` time and
+> written onto the record.
+
+Naming a host address in the flag itself (`-p 127.0.0.1:8080:80`) does not
+work yet: the engine binds that address inside the guest, and `jm ports`
+reports it rather than forwarding it. Publish as `-p 8080:80` and choose the
+host-side address with `--publish-addr`. **Being fixed** — see
+[what works, and what does not yet](#what-works-and-what-does-not-yet).
 
 ## How it works
 
@@ -95,20 +205,25 @@ QEMU (`-M virt,accel=hvf`, EDK2 firmware, virtio) boots a FreeBSD 15.1 arm64
 guest; networking is [gvproxy](https://github.com/containers/gvisor-tap-vsock),
 the same userspace stack `podman machine` uses. Host to guest is SSH only, as
 root with a dedicated ed25519 key: FreeBSD has no vsock driver, so the engine
-socket is tunnelled over SSH rather than exposed directly.
+socket is tunnelled over SSH rather than exposed directly. Host directories
+are exported over virtio-9p (there is no virtiofs driver either) and mounted
+declaratively by the guest before the engine starts.
 
 ```mermaid
 flowchart LR
   subgraph mac["macOS host"]
     jm["jm (lifecycle)"]
-    cli["jpodman / podman / docker"]
+    cli["jpodman / jdocker / podman / docker"]
     gv["gvproxy"]
     fwd["port forwarder"]
+    res["host resolver"]
   end
   subgraph vm["FreeBSD guest (QEMU + HVF)"]
     sshd["sshd"]
     api["podman system service<br/>/var/run/podman/podman.sock"]
+    unb["local_unbound"]
     work["containers + bastille jails"]
+    shr["9p shares at identity paths"]
   end
   jm -->|SSH control channel| sshd
   cli -->|unix socket| gv
@@ -116,7 +231,11 @@ flowchart LR
   fwd -->|events + ps| api
   fwd -->|expose / unexpose| gv
   gv -.->|virtio-net 192.168.127.2| sshd
+  unb -->|forward to 192.168.127.254| res
   api --> work
+  jm -.->|virtio-9p| shr
+  work --> shr
+  work --> unb
 ```
 
 Published ports are reconciled, not requested: the forwarder watches the
@@ -132,30 +251,32 @@ Every flag and environment variable is in [docs/USAGE.md](docs/USAGE.md).
 
 | Command | Does |
 |---|---|
-| `jm init [name]` | Create a machine: SSH key, image download and SHA256 check, grow disk, NoCloud seed |
-| `jm start [name]` | Boot, provision on first boot, connect podman, start the port forwarder; idempotent |
-| `jm stop [name]` | Stop the port forwarder, ask the guest to power off, then the hypervisor and the network provider |
+| `jm init [name]` | Create a machine: SSH key, image download and SHA256 check, grow disk, NoCloud seed. `--cpus`, `--memory`, `--disk`, `--image`, `--ssh-port`, `--mount`, `--no-mounts`, `--publish-addr` |
+| `jm start [name]` | Boot, provision on first boot, connect podman, mount the shares, start the port forwarder and the host resolver; idempotent |
+| `jm stop [name]` | Stop the forwarder and resolver, ask the guest to power off, then the hypervisor and the network provider |
 | `jm ssh [name] [-- cmd]` | Root shell, or a command, in the guest |
-| `jm podman` / `jpodman` | Run the host podman against the machine, whatever your default connection is |
+| `jm podman` / `jpodman` | Run the host podman against the machine, whatever your default connection is; starts it if stopped |
+| `jm docker` / `jdocker` | Run the host docker CLI (and compose) against the machine's engine, leaving your docker contexts alone; starts it if stopped |
 | `jm env [name]` | Shell exports (`CONTAINER_HOST`, `DOCKER_HOST`) for podman and docker clients |
-| `jm ports [name]` | Published container ports, with the error per mapping |
-| `jm list` / `jm inspect` | Machines and their computed state (`--json` on both) |
-| `jm set [name]` | Change `--cpus`, `--memory`, `--ssh-port`, `--disk` (disk grows only, live if running) |
+| `jm ports [name]` | Published container ports, where they bind, and the error per mapping |
+| `jm list` / `jm inspect` | Machines and their computed state, shares and publish address (`--json` on both) |
+| `jm set [name]` | Change `--cpus`, `--memory`, `--ssh-port`, `--disk` (grows only, live if running), `--mount`/`--unmount`, `--publish-addr` |
 | `jm console [name]` | Guest serial console log (`-f` to follow) |
 | `jm rm [name]` | Remove the machine, its directory and its podman connections |
-| `jm doctor` | Check qemu, HVF, EDK2 firmware, gvproxy, podman, ssh, the state root and every machine |
+| `jm doctor` | Check qemu, HVF, EDK2 firmware, gvproxy, podman, ssh, the state root, share parity, resolver parity and every machine |
 | `jm version` / `jm image build` | Build identity (`--json`); and, for maintainers, sealing a prebaked guest image (about 800 MiB as a `.zst`) |
 
 ## Image providers
 
 `jm init --image <source>`. The contract an image must satisfy is in
 [docs/guest-contract.md](docs/guest-contract.md) and
-[ADR 0003](docs/adr/0003-guest-contract-and-image-sources.md); `JM_IMAGE_BASEURL`
-points the prebaked source elsewhere, to test an unpublished image.
+[ADR 0003](docs/adr/0003-guest-contract-and-image-sources.md);
+`JM_IMAGE_BASEURL` points the prebaked source elsewhere, to test an
+unpublished image.
 
 | Source | What you get | Verification |
 |---|---|---|
-| `prebaked` (default), `prebaked:<ver>` | Already-provisioned guest from this repo's `guest-<ver>` GitHub release — this release ships `guest-15.1.0`; first boot is a boot, nothing more | Mandatory `.sha256` sidecar, checked by `jm init` |
+| `prebaked` (default), `prebaked:<ver>` | Already-provisioned guest from this repo's `guest-<ver>` GitHub release; first boot is a boot, nothing more | Mandatory `.sha256` sidecar, checked by `jm init` |
 | `official`, `official:<release>` | Stock FreeBSD `BASIC-CLOUDINIT-zfs` cloud image, provisioned on first boot | Mandatory `CHECKSUM.SHA256` |
 | Path or http(s) URL to `.raw` (or `.img`), `.raw.xz`, `.raw.zst` | Your own disk satisfying the contract; `jm` applies the seed, you own provisioning | Sibling `.sha256` if present, else `image_trusted=false` in `jm inspect` |
 
@@ -196,19 +317,59 @@ The full matrix, both workarounds, and the script that produced it
 | Capability | State |
 |---|---|
 | Native FreeBSD OCI images | Works — run and build, e.g. `ghcr.io/freebsd/freebsd-runtime:15.1` |
-| Linux images | Works through the Linuxulator, with `--os=linux` |
+| Linux images | Works through the Linuxulator, with `--os=linux` (podman) or the wrapper's default platform (`jdocker`) |
+| Host directory sharing | Works — host paths appear in the guest at the **same absolute path** over 9p; defaults are your home tree, `/Volumes`, `/private/tmp` and `$TMPDIR`'s root. Slow (tens of MB/s), `utimes` is a no-op, `chown`/`mkfifo` fail |
+| Container DNS matching the host | Works — the host's own resolver answers for the guest, so VPN, split-horizon, `/etc/hosts` and `.local` names all match, and the Mac is `host.docker.internal` |
+| Autostart | Works on demand: `jpodman` and `jdocker` start a stopped machine. There is deliberately **no** login agent — `JM_AUTOSTART=0` opts out |
 | `docker.io/nginx` (Linux) | Works with **one config line**: `accept_mutex on;` in the `events` block. Stock nginx registers its listening socket with `EPOLLEXCLUSIVE` when `worker_processes > 1`, which FreeBSD's `linux_epoll` rejects. A ready-made image is in [demo/](demo/README.md#the-nginx-finding) |
-| Publishing ports (`-p 8080:80`) | Works — reconciled onto the host by the forwarder |
+| Publishing ports (`-p 8080:80`) | Works — reconciled onto the host by the forwarder, binding every interface by default (`--publish-addr` to change the default) |
+| `-p 127.0.0.1:8080:80`, `-p [::1]:…`, ranges, `/udp` | Works — a host address in the flag binds that address **on the Mac** and nothing else, as under Docker Desktop. `-p localhost:…` is rejected by podman itself |
+| Docker CLI and compose | Works via `jdocker`, or `eval "$(jm env)"` for a client you point yourself. Compose pulls FreeBSD variants under plain `podman`, so a Linux image needs `jpodman pull --os=linux <image>` first plus `pull_policy: missing` on the service |
 | Jails | Works — `bastille bootstrap`, `create`, `cmd`, `pkg install` in the guest |
-| Docker CLI and compose | Works via `eval "$(jm env)"`. Compose pulls FreeBSD variants, so a Linux image needs `jpodman pull --os=linux <image>` first plus `pull_policy: missing` on the service. No further `docker` parity |
 | Several machines at once | Works, but each needs its own SSH port — `jm init --ssh-port 2223 dev`, then `JM_MACHINE=dev jpodman ps` |
-| Host directory mounts | **No.** FreeBSD has no virtiofs driver; 9p is what `docker-parity` is building. Use NFS or sshfs meanwhile |
-| Container DNS matching the host | **No.** Containers resolve through gvproxy, so split-horizon and VPN names will not match |
-| Autostart at login | **No.** Start the machine yourself with `jm start` |
-| `docker.io/node` (Linux) | **No.** The one image known to be broken: the binary starts and `node --version` prints, but `console.log` output never reaches the pipe and its HTTP servers do not accept connections. No known workaround in this release |
-| A `jdocker` wrapper | **No.** `jpodman` has no docker-named twin here; point docker clients with `eval "$(jm env)"`. A `jdocker` is part of the `docker-parity` work |
-| `-p 127.0.0.1:8080:80`, routable VM IP | **No.** A loopback host IP binds the guest's loopback (`jm ports` reports it); gvproxy is NAT, so vmnet/bridged is a later step |
+| UDP from a Linux container | Works — binding, sending, receiving, DNS-over-UDP and publishing with `-p 5354:53/udp`, verified from the Mac's loopback and its LAN address. One idiom fails: busybox's `nc -u -l` reports `Address family not supported by protocol`. Use `apk add netcat-openbsd`, `socat`, or any real UDP server. Datagrams are capped at 1472 bytes by the gvproxy link, which does not fragment. See [UDP in a Linux container](docs/TROUBLESHOOTING.md#udp-in-a-linux-container) |
+| `docker.io/node` (Linux) | **No.** The one image known to be broken: the binary starts and `node --version` prints, but `console.log` output never reaches the pipe and its HTTP servers do not accept connections. No known workaround |
+| Routable VM IP | **No.** gvproxy is NAT; vmnet/bridged is a later step |
 | Intel Macs, Linux and Windows hosts | **No.** Only `darwin/arm64` has a backend; the Linux release binaries are build-only. Apple Virtualization.framework cannot boot FreeBSD/arm64, hence QEMU |
+
+## Troubleshooting
+
+| Symptom | Do |
+|---|---|
+| Anything at all | `jm doctor` — checks every tool and machine and prints a fix per failure |
+| `start` hangs or fails at a stage | The error names the stage and the log to read; `jm console` shows the guest's serial console (`-f` to follow the boot) |
+| Provisioning failed | `jm ssh -- cat /var/log/jm-provision.log`; the marker `/var/db/jm-provision-failed` means the script aborted |
+| Port not reachable | `jm ports` lists each mapping with its error (host port busy, loopback bind, forwarder down) |
+| `-v` mounts an empty directory | The host path is outside the shared set (`jm inspect`), or you wrote `/tmp/...` instead of `/private/tmp/...` |
+| A name resolves on the Mac but not in a container | `jm doctor`, then `resolver.log` |
+| `nc -u -l` in a Linux container says `Address family not supported` | Only busybox's UDP listener is affected — `apk add netcat-openbsd`, or use `socat`. UDP itself works |
+| UDP datagrams over 1472 bytes never arrive | The gvproxy link is MTU 1500 and does not fragment; `jm doctor` states the limit per machine |
+| Stale state after a crash or reboot | `jm stop` repairs "broken" (pid file without process); `jm rm && jm init` is always a clean slate |
+
+Host-side logs, all under `~/.jailmachine/machines/<name>/`:
+
+| File | From |
+|---|---|
+| `console.log` | guest serial console (`jm console`) |
+| `qemu.log` | QEMU's own stdout/stderr |
+| `gvproxy.log` | network provider |
+| `forwarder.log` | port-publishing loop |
+| `resolver.log` | host DNS resolver (name-resolution parity) |
+
+More symptoms and fixes in
+[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
+
+## Building from source
+
+```bash
+git clone https://github.com/gabrielbelli/jailmachine && cd jailmachine
+make build && ./jm version
+make test lint
+JM_E2E=1 make e2e     # full init -> start -> podman run -> stop -> rm, needs qemu + podman
+```
+
+`bin/jm` is the original shell proof of concept, kept as legacy reference;
+the Go binary is the product.
 
 ## Documentation
 

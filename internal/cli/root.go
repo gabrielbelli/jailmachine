@@ -60,7 +60,16 @@ func NewRootCmd() *cobra.Command {
 		// Unknown subcommands are usage errors (exit 2), not failures: a
 		// root without Run would print help and exit 0 instead.
 		Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error { return cmd.Help() },
+		// Parse the root's persistent flags before dispatching to a child.
+		// The client wrappers ("podman", "docker") set DisableFlagParsing so
+		// that podman's and docker's own flags reach them untouched, and
+		// cobra's default dispatch parses a command's flags only in the
+		// command itself — which would leave --state-root/--json/--quiet
+		// unparsed and pass them on to the client, resolving (and, with
+		// autostart, booting) a machine in the state root the user did not
+		// name. Traversal parses them on the way down instead.
+		TraverseChildren: true,
+		RunE:             func(cmd *cobra.Command, _ []string) error { return cmd.Help() },
 		// Backends and podman receive paths from the state root; make it
 		// absolute once so they do not depend on the working directory.
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
@@ -89,8 +98,10 @@ func NewRootCmd() *cobra.Command {
 		newListCmd(),
 		newEnvCmd(),
 		newPodmanCmd(),
+		newDockerCmd(),
 		newPortsCmd(),
 		newForwarderCmd(),
+		newResolverCmd(),
 		newDoctorCmd(),
 		newSetCmd(),
 		newConsoleCmd(),
@@ -114,7 +125,7 @@ func markUsageErrors(cmd *cobra.Command) {
 
 const rootLong = `jailmachine (jm) provisions and manages a FreeBSD virtual machine for running
 jails (bastille) and OCI containers (podman), and connects the host's podman
-client to it.
+and docker clients to it.
 
 Quickstart (three commands):
 
@@ -122,10 +133,29 @@ Quickstart (three commands):
   jm start                     # boot, provision on first boot, connect podman
   jpodman run --rm --os=linux docker.io/alpine echo hi
 
-jpodman is podman aimed at the machine ("podman --connection <name> ..."),
-so it works whatever your default connection is. Linux images run through
-the Linuxulator and need --os=linux on the host podman (or "podman pull
---os=linux"); native FreeBSD images need nothing.
+"jm start" registers a podman connection named after the machine but leaves
+your default connection alone. jpodman is podman aimed at that connection and
+jdocker is the docker CLI aimed at the same engine; both are symlinks to jm,
+both work whatever your default connection is, and both start a stopped
+machine on demand (JM_AUTOSTART=0 or a leading --no-autostart to opt out).
+"jm start --set-default" opts into repointing plain podman.
+
+Linux images run through the Linuxulator and need --os=linux on the host
+podman (or "podman pull --os=linux"); native FreeBSD images need nothing.
+
+Host directories are shared into the guest at the *same* absolute path, so
+"-v /Users/you/src:/app" works from anywhere with no path rewriting. The
+default set is your home tree, /Volumes, /private/tmp and $TMPDIR's root;
+"jm init/set --mount DIR[:ro]", --unmount and --no-mounts change it, and
+"jm inspect" lists it. Every container can read and write everything shared.
+
+Names resolve as they do on the Mac: the host's own resolver answers for the
+guest, so VPN and split-horizon records, /etc/hosts entries and .local names
+all work inside a container, and the host itself is host.docker.internal
+(host.containers.internal).
+
+Published ports bind every host interface by default, as docker does on
+Linux; "jm init/set --publish-addr 127.0.0.1" keeps them on loopback.
 
 Commands that take an optional [name] default to "jailmachine"; when that
 does not exist and exactly one machine does, that one is used. Exit codes:
@@ -143,7 +173,7 @@ func Execute() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	root := NewRootCmd()
-	root.SetArgs(wrapperArgs(os.Args)[1:])
+	root.SetArgs(wrapperArgs(root, os.Args)[1:])
 	cmd, err := root.ExecuteContextC(ctx)
 	if err != nil {
 		command := ""

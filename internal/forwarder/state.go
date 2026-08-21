@@ -44,7 +44,13 @@ func (e Entry) Status() string {
 type State struct {
 	Version int       `json:"version"`
 	Updated time.Time `json:"updated"`
-	Owned   []Entry   `json:"mappings"`
+	// PublishAddr is the host address the forwarder that wrote this file
+	// was started with. The record's value can be changed at any time, but
+	// a running forwarder goes on binding the one it booted with, so
+	// "jm ports" and "jm inspect" read this to say what is really bound
+	// and mark the record's value as pending.
+	PublishAddr string  `json:"publish_addr,omitempty"`
+	Owned       []Entry `json:"mappings"`
 }
 
 // Load reads forwards.json; a missing file is an empty state, not an

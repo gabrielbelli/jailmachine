@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -124,27 +125,21 @@ func TestShowConsoleFollowCancelledBeforeLog(t *testing.T) {
 	}
 }
 
-// safeBuffer is a bytes.Buffer safe for a writer and a polling reader.
+// safeBuffer is a bytes.Buffer safe for a writer and a polling reader. The
+// mutex is zero-value ready: lazily creating it would itself be the race.
 type safeBuffer struct {
-	mu  chan struct{}
+	mu  sync.Mutex
 	buf bytes.Buffer
 }
 
-func (b *safeBuffer) lock() {
-	if b.mu == nil {
-		b.mu = make(chan struct{}, 1)
-	}
-	b.mu <- struct{}{}
-}
-
 func (b *safeBuffer) Write(p []byte) (int, error) {
-	b.lock()
-	defer func() { <-b.mu }()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return b.buf.Write(p)
 }
 
 func (b *safeBuffer) String() string {
-	b.lock()
-	defer func() { <-b.mu }()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return b.buf.String()
 }

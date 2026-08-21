@@ -1,12 +1,16 @@
 # Contributing
 
-> **This release is an MVP — a working demo.** It proves the whole idea end
-> to end and is usable day to day: `jm init && jm start`, then native
-> FreeBSD and Linux OCI images, published ports and bastille jails. Four
-> things are deliberately not in it — host directory mounts at identical
-> paths, DNS 1:1 with the host, autostart on login, and full `docker` CLI
-> parity (including a `jdocker` wrapper). They are being built on the
-> `docker-parity` branch; please raise them there rather than here.
+> **Still an MVP — a working demo**, but a wider one than v0.1.0. As well as
+> `jm init && jm start`, native FreeBSD and Linux OCI images, published ports
+> and bastille jails, the tree now carries host directory mounts at identical
+> paths (ADR 0007), name resolution 1:1 with the host (ADR 0008), autostart on
+> demand from `jpodman`/`jdocker`, and a `jdocker` wrapper for the docker CLI.
+> `-p` now means what it means under Docker Desktop, and UDP works from
+> Linux containers — publishing included. The one Linuxulator gap left is a
+> zero-length `recvmsg()` that returns where Linux blocks, which breaks
+> busybox's `nc -u -l` and nothing else known.
+> There is deliberately **no** autostart-at-login agent — see
+> `docs/tech-choices.md` for why.
 
 ## Ground rules
 
@@ -38,29 +42,84 @@ QEMU cannot boot the guest. Run it locally before tagging a release.
 | `JM_NETWORK=user` | QEMU slirp instead of gvproxy (no `jm env`, no port publishing) |
 | `JM_HOME=/path` | State root (same as `--state-root`) |
 
-## Releasing
+## Cutting a release
 
-Releases are cut by `.github/workflows/release.yml` when a `v*` tag is
-pushed; it runs goreleaser, which builds `darwin/arm64` (supported) plus
-`linux/arm64` and `linux/amd64` (build-only), uploads the archives and
-`checksums.txt` to a GitHub release, and pushes a cask to
-`gabrielbelli/homebrew-tap`.
+**CI releases on tag. The local `goreleaser release` is the fallback.**
+Pick one; do not do both by habit, though doing both is now survivable
+(see *Re-running a tag* below).
+
+### The normal path: push a tag
 
 ```bash
 make release-snapshot     # goreleaser check + dry run into dist/
 git tag -a v0.1.0 -m "v0.1.0" && git push origin v0.1.0
 ```
 
+`.github/workflows/release.yml` picks the tag up, runs the unit tests, then
+runs goreleaser: it builds `darwin/arm64` (supported) plus `linux/arm64` and
+`linux/amd64` (build-only), uploads the archives and `checksums.txt` to a
+GitHub release, and pushes a cask to `gabrielbelli/homebrew-tap`.
+
 > **Before tagging `v<ver>`**, the guest image release `guest-<GuestVersion>`
 > (the `image.GuestVersion` that binary embeds) must already be published:
 > `jm init` of the new binary fetches it by default and fails otherwise.
+
+You do not have to push a tag to find out whether the workflow works. Every
+branch push and pull request runs it in dry-run mode (the `release-dry-run`
+job in `ci.yml` calls `release.yml` itself with `dry_run: true`), and
+*Actions → release → Run workflow* does the same on demand. A dry run builds,
+archives, generates the changelog and makes the same publish decisions, with
+`--skip=publish`: nothing is uploaded and no cask is pushed.
+
+### The fallback: release from a Mac
+
+If CI is unavailable, a maintainer can publish the same artefacts by hand:
+
+```bash
+export GITHUB_TOKEN=$(gh auth token)
+export HOMEBREW_TAP_GITHUB_TOKEN=<fine-grained PAT>   # optional, for the cask
+goreleaser release --clean
+```
+
+This is a fallback, not a habit: it publishes whatever is in the working
+tree, from one machine, with no test gate in front of it.
+
+### Re-running a tag
+
+Re-running the tag in CI after a local `goreleaser release` (or after a
+failed run) is fine. `release.replace_existing_artifacts: true` in
+`.goreleaser.yaml` makes goreleaser **replace** the assets already attached
+to the release instead of POSTing duplicates, which is what used to end the
+job with:
+
+```
+422 Validation Failed [{Resource:ReleaseAsset Field:name Code:already_exists}]
+```
+
+The workflow also logs a notice when it finds a release for the tag already
+published, so the log says what happened.
 
 ### Secrets
 
 | Secret | Used by | Why |
 |---|---|---|
 | `GITHUB_TOKEN` | `release.yml`, `guest-image.yml` | Automatic; creates releases and uploads assets in this repository |
-| `HOMEBREW_TAP_GITHUB_TOKEN` | `release.yml` (goreleaser `homebrew_casks`) | The automatic token cannot push to another repository. Create a **fine-grained personal access token** with *Contents: read and write* on `gabrielbelli/homebrew-tap` only, and add it under *Settings → Secrets and variables → Actions* of `gabrielbelli/jailmachine` |
+| `HOMEBREW_TAP_GITHUB_TOKEN` | `release.yml` (goreleaser `homebrew_casks`) | The automatic token cannot push to another repository. See below. |
+
+#### The Homebrew tap token
+
+`HOMEBREW_TAP_GITHUB_TOKEN` is the only secret that has to be created by
+hand. Create a **fine-grained personal access token** with *Contents: read
+and write* on `gabrielbelli/homebrew-tap` only, and add it under *Settings
+→ Secrets and variables → Actions* of `gabrielbelli/jailmachine`.
+
+**A missing token does not fail the release.** `release.yml` checks for the
+secret before starting goreleaser; when it is absent it adds
+`--skip=homebrew`, publishes everything else normally, and leaves a notice
+and a job summary naming this section. `brew install
+gabrielbelli/tap/jailmachine` then keeps serving the previous version until
+the cask is updated — by hand, or by re-running the workflow once the secret
+exists.
 
 ### Version stamping
 

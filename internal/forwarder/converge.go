@@ -19,10 +19,16 @@ type Result struct {
 	// External are desired mappings that already exist in the provider but
 	// were not created by us; they are left alone and not adopted.
 	External []netprov.Mapping
+	// Skipped are published ports that cannot be reached from the host at
+	// all (see Plan), seen for the first time. They are recorded in the
+	// state so that "jm ports" can explain them, and reported here so the
+	// forwarder says so once when it happens rather than leaving the user
+	// to discover a dead port with curl.
+	Skipped []Entry
 }
 
 func (r Result) changed() bool {
-	return len(r.Exposed)+len(r.Unexposed)+len(r.Failed) > 0
+	return len(r.Exposed)+len(r.Unexposed)+len(r.Failed)+len(r.Skipped) > 0
 }
 
 func (r Result) String() string {
@@ -35,6 +41,10 @@ func (r Result) String() string {
 	}
 	if len(r.Failed) > 0 {
 		parts = append(parts, fmt.Sprintf("failed %v", r.Failed))
+	}
+	for _, e := range r.Skipped {
+		parts = append(parts, fmt.Sprintf("warning: %s %s is published in the guest but not on the host: %s",
+			e.Proto, e.Local, e.Error))
 	}
 	if len(r.External) > 0 {
 		parts = append(parts, fmt.Sprintf("left alone (not ours) %v", r.External))
@@ -54,13 +64,16 @@ func (r Result) String() string {
 // recorded per entry and retried on the next call. st is saved to statePath
 // whenever it changes.
 func Converge(ctx context.Context, p netprov.Provider, m *machine.Machine, desired []netprov.Mapping, st *State, statePath string) (Result, error) {
-	return ConvergeWith(ctx, p, m, desired, nil, st, statePath)
+	return ConvergeWith(ctx, p, m, Plan{Mappings: desired}, st, statePath)
 }
 
-// ConvergeWith is Converge plus the unpublishable entries from Plan: they
-// are kept in st (with their Error, so "jm ports" lists them) but never
-// exposed, and dropped once podman no longer reports them.
-func ConvergeWith(ctx context.Context, p netprov.Provider, m *machine.Machine, desired []netprov.Mapping, skipped []Entry, st *State, statePath string) (Result, error) {
+// ConvergeWith is Converge over a whole Plan: the unpublishable entries are
+// kept in st (with their Error, so "jm ports" lists them) but never
+// exposed, and dropped once podman no longer reports them, while a mapping
+// whose guest-side redirect is not in place yet keeps its host leg and
+// carries the reason as its error until the next reconcile fixes it.
+func ConvergeWith(ctx context.Context, p netprov.Provider, m *machine.Machine, pl Plan, st *State, statePath string) (Result, error) {
+	desired, skipped := pl.Mappings, pl.Unpublishable
 	var res Result
 	live, err := p.List(ctx, m)
 	if err != nil {
@@ -118,32 +131,38 @@ func ConvergeWith(ctx context.Context, p netprov.Provider, m *machine.Machine, d
 		s := skip[k]
 		s.Since = now
 		keep = append(keep, s)
+		res.Skipped = append(res.Skipped, s)
 		dirty = true
 	}
 	st.Owned = keep
 
-	// Missing: desired but not live. Record ownership first.
+	// Missing: desired but not live. Record ownership first. New entries are
+	// collected and appended only after the loop: appending to st.Owned in
+	// the loop can reallocate its backing array and orphan the *Entry
+	// pointers idx hands out, silently dropping the status updates below.
 	idx := st.index()
 	var todo []netprov.Mapping
+	var added []Entry
 	for _, k := range sortedKeys(want) {
 		mp := want[k]
 		e, owned := idx[k]
 		if liveSet[k] {
 			if !owned {
 				res.External = append(res.External, mp)
-			} else if e.Error != "" {
-				e.Error = ""
+			} else if want := pl.Pending[k]; e.Error != want {
+				e.Error = want
 				e.Since = now
 				dirty = true
 			}
 			continue
 		}
 		if !owned {
-			st.Owned = append(st.Owned, Entry{Proto: mp.Proto, Local: mp.Local, Remote: mp.Remote, Since: now})
+			added = append(added, Entry{Proto: mp.Proto, Local: mp.Local, Remote: mp.Remote, Since: now})
 			dirty = true
 		}
 		todo = append(todo, mp)
 	}
+	st.Owned = append(st.Owned, added...)
 	if dirty {
 		if err := st.Save(statePath); err != nil {
 			return res, fmt.Errorf("saving %s: %w", statePath, err)
@@ -163,8 +182,8 @@ func ConvergeWith(ctx context.Context, p netprov.Provider, m *machine.Machine, d
 			res.Failed = append(res.Failed, mp)
 			continue
 		}
-		if e.Error != "" {
-			e.Error = ""
+		if want := pl.Pending[key(mp)]; e.Error != want {
+			e.Error = want
 			e.Since = now
 			dirty = true
 		}

@@ -39,6 +39,7 @@ docs/adr/               decisions
 | M4 | Named machines + UX | `jm list`, `jm set`, `jm console`, progress bars, error messages with fixes | 1–2 days |
 | M5 | Prebaked image pipeline | GitHub Actions builds+signs image; `jm init` defaults to it; `--image official` and BYO paths tested | 2–3 days |
 | M6 | Release | goreleaser, Homebrew tap, README quickstart, `jm doctor` (checks qemu/gvproxy/podman versions) | 1 day |
+| M7 | Docker parity (post-MVP, `docker-parity`) | Host directory shares at identical paths (ADR 0007), name resolution 1:1 with the host (ADR 0008), autostart on demand from `jpodman`/`jdocker`, the `jdocker` wrapper, guest clock resync, and docker-identical `-p` semantics (host address, ranges and `/udp`) on `0.0.0.0` by default with `--publish-addr`, UDP included (verified end to end; only busybox's `nc -u -l` idiom is unsupported by FreeBSD) | in progress |
 
 Roughly **two weeks** of focused work; M1–M3 are the critical path.
 

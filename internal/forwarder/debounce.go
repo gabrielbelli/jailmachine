@@ -14,6 +14,7 @@ type debouncer struct {
 	delay time.Duration
 	mu    sync.Mutex
 	timer *time.Timer
+	force bool
 }
 
 func newDebouncer(delay time.Duration) *debouncer {
@@ -23,9 +24,30 @@ func newDebouncer(delay time.Duration) *debouncer {
 
 // Trigger (re)starts the delay; the signal fires once it lapses without
 // another Trigger. A signal nobody has consumed yet is not duplicated.
-func (d *debouncer) Trigger() {
+func (d *debouncer) Trigger() { d.trigger(false) }
+
+// TriggerForce is Trigger for a reason that also invalidates what the
+// forwarder believes about state it cannot see — the guest's pf anchor
+// after an event stream reconnect, which may span a guest reboot. The flag
+// survives coalescing and is read once, by takeForce.
+func (d *debouncer) TriggerForce() { d.trigger(true) }
+
+// takeForce reports whether any trigger since the last call asked for a
+// forced resync, and clears the flag.
+func (d *debouncer) takeForce() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	f := d.force
+	d.force = false
+	return f
+}
+
+func (d *debouncer) trigger(force bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if force {
+		d.force = true
+	}
 	if d.timer != nil {
 		d.timer.Stop()
 	}

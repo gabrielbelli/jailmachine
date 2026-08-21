@@ -36,6 +36,16 @@ type Endpoint struct {
 	APISocket string
 	// DNS is the resolver the guest is handed, "" if unknown.
 	DNS string
+	// Gateway is the provider's own address on the guest network
+	// (gvproxy: 192.168.127.1), "" when the provider has none.
+	Gateway string
+	// HostAlias is the address, on the provider's network, that reaches
+	// the host itself (gvproxy translates 192.168.127.254 to the host's
+	// loopback, port for port). It is what host.containers.internal
+	// answers, and the address the guest sends DNS to when jm runs a host
+	// resolver for name-resolution parity (ADR 0008). "" when the provider
+	// offers no route back to the host.
+	HostAlias string
 }
 
 // Mapping is one host<->guest port forward. Local and Remote are
@@ -59,6 +69,29 @@ type Capabilities struct {
 	// providers live inside the hypervisor (slirp) and always report
 	// Running, so they can never disagree with a stopped backend.
 	Supervised bool
+	// MTU is the largest IP packet the provider's virtual link carries
+	// between host and guest, 0 when the provider does not say. It is worth
+	// reporting because the link does not fragment: a TCP stream is
+	// segmented to fit and never notices, but a UDP datagram larger than
+	// MTU minus its headers is dropped in silence, with no error at either
+	// end. MaxDatagram turns it into the number a user can act on.
+	MTU int
+}
+
+// IPv4HeaderBytes and UDPHeaderBytes are what a datagram spends on headers
+// before any of the link's MTU is left for payload.
+const (
+	IPv4HeaderBytes = 20
+	UDPHeaderBytes  = 8
+)
+
+// MaxDatagram is the largest UDP payload that survives the provider's link,
+// or 0 when the provider does not publish an MTU.
+func (c Capabilities) MaxDatagram() int {
+	if c.MTU <= IPv4HeaderBytes+UDPHeaderBytes {
+		return 0
+	}
+	return c.MTU - IPv4HeaderBytes - UDPHeaderBytes
 }
 
 // APIForwarder is an optional Provider interface for providers whose

@@ -1,0 +1,55 @@
+[
+  {
+    "Id": "04df36ec8eadb4b5e529887c41a6741778d8c33f9398f34332f769cf4c65383e",
+    "Name": "w-lo",
+    "State": {"Status": "running", "Running": true},
+    "NetworkSettings": {
+      "IPAddress": "",
+      "Networks": {
+        "podman": {"NetworkID": "podman", "IPAddress": "10.88.0.15", "IPPrefixLen": 16, "Gateway": "10.88.0.1"}
+      }
+    }
+  },
+  {
+    "Id": "3c0a9d1f5b8e4a27a1c6d0e93f7b21548ac6e0d4b9f3172e5c8a06d4e1f2b933",
+    "Name": "w-lorange",
+    "State": {"Status": "running", "Running": true},
+    "NetworkSettings": {
+      "IPAddress": "",
+      "Networks": {
+        "podman": {"NetworkID": "podman", "IPAddress": "10.88.0.19", "IPPrefixLen": 16, "Gateway": "10.88.0.1"}
+      }
+    }
+  },
+  {
+    "Id": "5d72e91a08c34b6f9e2d17a5c840b3f6721e9d0a4c58b3e27f16094ad8c5b2e1",
+    "Name": "w-udplo",
+    "State": {"Status": "running", "Running": true},
+    "NetworkSettings": {
+      "IPAddress": "10.88.0.23",
+      "Networks": {}
+    }
+  },
+  {
+    "Id": "b77257e45a77ba2d4449b3e88d823b2f072d94586145f6a7925793594b7c31e2",
+    "Name": "w-wild",
+    "State": {"Status": "running", "Running": true},
+    "NetworkSettings": {
+      "IPAddress": "",
+      "Networks": {
+        "podman": {"NetworkID": "podman", "IPAddress": "10.88.0.11", "IPPrefixLen": 16, "Gateway": "10.88.0.1"}
+      }
+    }
+  },
+  {
+    "Id": "fc7c3b760eb6a84b0b056152689a973b3e94dbd2b5d489388e3136f0e270687d",
+    "Name": "w-v6lo",
+    "State": {"Status": "running", "Running": true},
+    "NetworkSettings": {
+      "IPAddress": "",
+      "Networks": {
+        "podman": {"NetworkID": "podman", "IPAddress": "10.88.0.17", "IPPrefixLen": 16, "Gateway": "10.88.0.1"}
+      }
+    }
+  }
+]

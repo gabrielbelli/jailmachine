@@ -3,6 +3,7 @@ package gvproxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -119,7 +120,7 @@ func TestEndpointAndAttachment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := netprov.Endpoint{GuestIP: "192.168.127.2", SSHHost: "127.0.0.1", SSHPort: 2222, APISocket: dir + "/podman.sock", DNS: "192.168.127.1"}
+	want := netprov.Endpoint{GuestIP: "192.168.127.2", SSHHost: "127.0.0.1", SSHPort: 2222, APISocket: dir + "/podman.sock", DNS: "192.168.127.2", Gateway: "192.168.127.1", HostAlias: "192.168.127.254"}
 	if ep != want {
 		t.Fatalf("endpoint = %+v, want %+v", ep, want)
 	}
@@ -481,5 +482,41 @@ func TestStartReportsEarlyExit(t *testing.T) {
 	}
 	if st, _ := pr.State(m); st != backend.Stopped {
 		t.Fatalf("state after failed start = %s", st)
+	}
+}
+
+// A host port another process already holds is the one expose failure a user
+// can do something about, so it must not reach "jm ports" as raw control-API
+// plumbing. Every other failure is passed through untouched: rewriting an
+// error nobody has a fix for only hides what actually went wrong.
+func TestExposeErrExplainsABusyHostPort(t *testing.T) {
+	raw := errors.New("gvproxy api: POST /services/forwarder/expose: 500 Internal Server Error: " +
+		"listen udp 0.0.0.0:5353: bind: address already in use")
+	udp := netprov.Mapping{Proto: "udp", Local: "0.0.0.0:5353", Remote: "192.168.127.2:5353"}
+	got := exposeErr(udp, raw)
+	if got == nil {
+		t.Fatal("a busy host port must stay an error")
+	}
+	for _, want := range []string{"already holds this host port", "lsof -nP -iUDP:5353", "different host port"} {
+		if !strings.Contains(got.Error(), want) {
+			t.Errorf("message %q does not mention %q", got, want)
+		}
+	}
+	if strings.Contains(got.Error(), "gvproxy api") {
+		t.Errorf("message still leaks the control API: %q", got)
+	}
+
+	// An empty Proto is tcp, as it is on the wire.
+	tcp := netprov.Mapping{Local: "127.0.0.1:8080", Remote: "192.168.127.2:8080"}
+	if got := exposeErr(tcp, raw); !strings.Contains(got.Error(), "lsof -nP -iTCP:8080") {
+		t.Errorf("empty proto should read as tcp, got %q", got)
+	}
+
+	if err := exposeErr(udp, nil); err != nil {
+		t.Errorf("success must stay success, got %v", err)
+	}
+	other := errors.New("gvproxy api: POST /services/forwarder/expose: 500: port already exposed")
+	if got := exposeErr(udp, other); got.Error() != other.Error() {
+		t.Errorf("unrelated failure was rewritten to %q", got)
 	}
 }

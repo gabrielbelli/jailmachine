@@ -5,6 +5,10 @@
 # selects the fast path in provision.sh on the next machine).
 # See docs/guest-contract.md.
 set -x
+# Host shares belong to the machine this image was built on, not to the
+# image: unmount them so nothing of the builder's host is captured.
+service jm_shares stop || true
+rm -rf /var/db/jm
 # Per-machine identity: the next machine's seed brings its own key and
 # hostname; sshd regenerates host keys on start (sshd_keygen precmd).
 rm -f /root/.ssh/authorized_keys

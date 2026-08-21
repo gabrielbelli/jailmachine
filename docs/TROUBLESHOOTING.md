@@ -1,11 +1,12 @@
 # Troubleshooting
 
-> **This release is an MVP — a working demo.** It proves the whole idea end
-> to end and is usable day to day, but the polished behaviour (host
-> directory mounts at identical paths, DNS 1:1 with the host, autostart,
-> `docker` CLI parity) is being built right now on the `docker-parity`
-> branch and is **not** in this release. Several entries below are limits of
-> this release rather than faults to fix.
+> **Still an MVP — a working demo**, but a wider one than v0.1.0: host
+> directory mounts at identical paths, name resolution 1:1 with the host,
+> autostart on demand, the `jdocker` wrapper and docker-identical `-p`
+> semantics are all here, and so is UDP — publishing included. Several
+> entries below are deliberate limits rather than faults; the one real
+> Linuxulator gap left is narrow enough to have its own section
+> ([UDP in a Linux container](#udp-in-a-linux-container)).
 
 Everything here is on macOS/Apple Silicon, the only supported host. For how
 the pieces fit together, see [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -21,8 +22,10 @@ jm ssh -- <command>       # run anything in the guest, e.g. jm ssh -- service po
 
 `jm doctor` checks `qemu-system-aarch64` (≥ 8) and HVF, the EDK2 firmware,
 `gvproxy`, `podman` (≥ 5), `ssh`/`ssh-keygen`, `xz`, the state root, the
-socket-path budget, and each machine's combined state — printing a one-line
-fix per failure. Note that it inspects the default state root
+socket-path budget, each machine's combined state, **share parity** (a file
+written on the host must be visible to a container at the same path) and
+**resolution parity** (a name only the host can resolve must resolve in the
+guest, to the same address) — printing a one-line fix per failure. Note that it inspects the default state root
 (`~/.jailmachine`, or `$JM_HOME`) unless you pass `--state-root`.
 
 ## Symptom → cause → fix
@@ -45,11 +48,17 @@ fix per failure. Note that it inspects the default state root
 | `redis-server` exits with `Failed to test the kernel for a bug … Redis will now exit` | Redis' ARM64 copy-on-write probe cannot run under the Linuxulator | `redis-server --ignore-warnings ARM64-COW-BUG` |
 | `docker.io/node` prints `node --version` but nothing from `console.log`, and its servers never accept | Known-bad Linux image in this release | None. Use another image; see [USAGE](USAGE.md#node-the-one-known-bad-image) |
 | `docker compose up` → `no image found in image index for … OS "freebsd"` | Compose cannot ask for a platform, and the guest is FreeBSD | `jpodman pull --os=linux <image>` first, then `pull_policy: missing` on the service |
-| `-v /Users/me/src:/src` does nothing useful | No host directory sharing in this release | See *no host directory sharing* below |
+| `-v /Users/me/src:/app` mounts an empty directory | The host path is outside the machine's share set, or it is under `/tmp` | `jm inspect` lists the shares; write `/private/tmp/...` not `/tmp/...`; add a root with `jm set --mount`. See *a share is empty* below |
+| `zsh: no such file or directory` from `jm set --mount $P:ro` | zsh reads a trailing `:ro` as a history modifier | Quote it: `jm set --mount "${P}:ro"`, and `-v "${P}:${P}:ro"` |
+| A name resolves on the Mac but not in a container | The host resolver is down, or the guest was not pointed at it | `jm doctor`, then `resolver.log`. See *names do not resolve* below |
+| UDP datagrams over 1472 bytes never arrive | The gvproxy link is MTU 1500 and does not fragment | Keep datagrams under 1472 bytes, or use TCP; `jm doctor` states the limit. See *UDP in a Linux container* below |
+| `nc -u -l` in a Linux container → `Address family not supported by protocol` | busybox's UDP listener peeks its peer with a zero-length `recvmsg()`, which returns at once on FreeBSD where Linux blocks | `apk add netcat-openbsd`, or `socat UDP4-RECVFROM:…`. UDP itself works; see *UDP in a Linux container* below |
+| `jpodman ps` pauses and prints `starting jailmachine …` | Autostart is doing its job | Nothing. `JM_AUTOSTART=0` or `jpodman --no-autostart ps` to fail instead |
+| `jdocker: the docker CLI is not on PATH` | Only the engine is provided by jm | `brew install docker` (the client alone), or use `jpodman` |
 | `no space left on device` in the guest | Guest disk full | `jm set --disk <bigger>` |
 | `jm doctor` warns on `socket paths` | `--state-root` so deep that sockets no longer fit in `sun_path` (103 bytes) and fall back to `$TMPDIR` | Harmless, but a shorter state root keeps every file in one directory |
 | `jm rm` refuses because the machine will not stop | The hypervisor is wedged | `jm rm --force <name>` |
-| `jm <cmd>` → `no machine named "jailmachine" and several exist` | Ambiguous default | Name one: `jm start dev`. For `jm podman`/`jpodman` the hint's `jm podman <name>` form does **not** work — that command takes no name; use `JM_MACHINE=dev jpodman ps` |
+| `jm <cmd>` → `no machine named "jailmachine" and several exist` | Ambiguous default | Name one: `jm start dev`. `jm podman`/`jm docker` take no name — the error tells you to use `JM_MACHINE=dev jpodman ps` |
 
 ## `connection refused` from podman
 
@@ -191,16 +200,34 @@ jm ports
 ```
 
 ```text
+# publishing on 0.0.0.0 unless -p names a host address
 LOCAL           REMOTE              PROTO  STATUS
-127.0.0.1:8080  192.168.127.2:8080  tcp    ok
+0.0.0.0:8080    192.168.127.2:8080  tcp    ok
+127.0.0.1:8082  192.168.127.2:8082  tcp    ok
 ```
+
+The `#` line names the machine's **default** publish address — `0.0.0.0`, so
+a plain `-p 8080:80` is reachable from your whole network. `jm set
+--publish-addr 127.0.0.1` (then `jm stop && jm start`) changes that default,
+and `-p 127.0.0.1:8080:80` confines a single container to your loopback
+without changing anything machine-wide, as it does under Docker Desktop.
 
 | `jm ports` says | Meaning | Fix |
 |---|---|---|
 | `# port forwarder for <name> is not running` | The loop is down | `jm start` (idempotent) |
-| `error: …address already in use` | Another process holds the host port | Free it, or republish on a different host port; it is retried at the next resync (30 s) |
-| `REMOTE` is `-`, `STATUS` is `error: guest binds 127.0.0.1 only…` | `-p 127.0.0.1:8080:80` bound the **guest's** loopback, so nothing on the host can reach it | Publish without a host IP: `-p 8080:80` |
+| `error: another process on this Mac already holds this host port` | Exactly that; the message carries the `lsof` to run | Free it, or republish on a different host port; it is retried at the next resync (30 s) |
+| the same, on a `/udp` mapping to host port 5353 | macOS runs mDNSResponder on `5353/udp` | Publish on another host port — `-p 5354:53/udp`. Nothing about UDP is at fault |
+| `error: …cannot assign requested address` | `-p <addr>:…` named an address your Mac does not have | Use one it has (`ifconfig`), or drop the address |
+| `error: the container has no address…yet`, `error: installing the redirect in the guest…` | The host side is bound but the guest-side redirect a `-p <addr>:…` needs is not in place yet | Wait one resync (30 s); if it persists, read `forwarder.log`. `jm ssh -- pfctl -a rdr/jm -s nat` lists the rules jm loaded (it errors with `DIOCGETRULES` when there are none, which is not a fault) |
+| `error: port N/tcp on the guest already carries container <id>'s publish` | The same guest port is published twice, one of them with a host address; only one can own the guest-side redirect. The id names the holder — often the same container (`-p 8080:80 -p 127.0.0.1:8080:81`), which the message calls `this container's own publish` | Give one of them a different host port |
+| `# the record says <addr>; this forwarder keeps <addr>` | `jm set --publish-addr` since the machine started | `jm stop && jm start` to apply it |
+| The port answers on `localhost` but you did not expect it on the LAN | A plain `-p` binds `0.0.0.0` by default, as `docker run -p` does on Linux | `-p 127.0.0.1:8080:80` for that container, or `jm set --publish-addr 127.0.0.1` for the machine |
 | nothing at all | The container is not running, or publishes no ports | `jpodman ps` |
+
+> Inside the guest, `curl localhost:<published port>` answers nothing even
+> when the mapping works: the engine's own port reservation socket wins over
+> the redirect for guest-local traffic. Test from the Mac, not from
+> `jm ssh`.
 
 Mappings a container should have but the table lacks usually mean the
 forwarder cannot reach the engine; `forwarder.log` records every `podman ps`
@@ -292,23 +319,176 @@ The retry flags matter: the forwarder reconciles a second or two after the
 container starts, so a bare `curl` usually gets one connection refused
 first.
 
-## No host directory sharing yet
+## UDP in a Linux container
 
-There is none in this release. FreeBSD has no virtiofs driver, and there is
-no vsock either (hence the podman socket over SSH). `-v /host/path:/in/ctr`
-will not do what it does on Docker Desktop: the path is resolved **inside
-the VM**.
+**UDP works.** Binding, sending, receiving, DNS-over-UDP and publishing with
+`-p <host>:<port>/udp` were all verified end to end from a Linux container,
+reached from the Mac's loopback and from its LAN address. If you read
+somewhere that Linux containers cannot bind UDP sockets, that claim was
+wrong and has been withdrawn.
 
-For now, move files explicitly:
+One idiom fails, and it is worth recognising because it is the one most
+people reach for when testing UDP by hand:
 
-```bash
-jm ssh -- mkdir -p /root/src
-tar cf - -C ~/src . | jm ssh -- tar xf - -C /root/src
-jpodman run --rm --os=linux -v /root/src:/src docker.io/busybox ls /src   # a guest path, not a host one
+```
+$ jpodman run --rm --os=linux docker.io/alpine sh -c 'nc -u -l -p 9999'
+nc: can't connect to remote host: Address family not supported by protocol
 ```
 
-9p-based sharing — host directories at identical paths — is what the
-`docker-parity` branch is building.
+### Which layer refuses, and why
+
+Not podman, not `ocijail`, not jm's forwarder, and not the address family.
+It is FreeBSD's own socket layer, inherited by the Linuxulator.
+
+busybox's `nc -u -l` has to learn who is talking to it before it can reply,
+and it does that by peeking the sender's address with a **zero-length**
+`recvmsg(…, MSG_PEEK)`, then `connect()`ing the socket to whatever address
+came back:
+
+```
+socket(AF_INET, SOCK_DGRAM, IPPROTO_IP)                = 3
+bind(3, {AF_INET, 0.0.0.0:9999}, 16)                   = 0
+recvmsg(3, {msg_namelen=16 => 0, iov_len=0}, MSG_PEEK) = 0
+connect(3, {sa_family=AF_UNSPEC, …}, 16)               = -1 EAFNOSUPPORT
+```
+
+On Linux that `recvmsg()` **blocks** until a datagram arrives and fills in
+`msg_name`. On FreeBSD it returns `0` at once with `msg_namelen = 0`, so
+busybox connects to an all-zero sockaddr and gets `EAFNOSUPPORT`. macOS
+behaves like FreeBSD here, and so does a C program run natively in the guest
+outside any container — this is BSD socket behaviour, not a container or
+jail artefact.
+
+The divergence is the **zero-length buffer alone**, not `MSG_PEEK` and not
+the address family:
+
+| `recvmsg` on an empty UDP socket | FreeBSD guest | macOS | Linux |
+|---|---|---|---|
+| 0 bytes, `MSG_PEEK` | returns at once | returns at once | blocks |
+| 0 bytes, no flags | returns at once | returns at once | blocks |
+| 1 byte, `MSG_PEEK` | blocks | blocks | blocks |
+| 1 byte, no flags | blocks | blocks | blocks |
+
+`AF_INET`, `AF_INET6` and `AF_UNIX` datagram sockets all create and bind
+normally, so forcing IPv4 with `nc -s 0.0.0.0` does not help: it produces a
+`socket(AF_INET, …)` and the identical failure at the same `connect()`.
+There is nothing for jm to fix; a remedy would be a Linuxulator change in
+FreeBSD itself.
+
+### What to use instead
+
+```bash
+# a real netcat
+jpodman run --rm --os=linux docker.io/alpine \
+  sh -c 'apk add -q netcat-openbsd && nc -u -l -p 9999'
+
+# socat
+jpodman run --rm --os=linux docker.io/alpine \
+  sh -c 'apk add -q socat && socat UDP4-RECVFROM:9999,fork SYSTEM:"tr a-z A-Z"'
+
+# and publishing, which needs nothing special
+jpodman run -d --os=linux -p 5354:53/udp <image>
+```
+
+### Large datagrams vanish
+
+If datagrams under about 1.4 kB work and larger ones never arrive, this is
+the cause and not a bug in your program. The host-to-guest link is gvproxy's,
+MTU 1500, and **it does not fragment**, so the largest UDP payload that
+survives is 1472 bytes — 1500 less the 20-byte IPv4 and 8-byte UDP headers.
+Over that, the datagram is dropped with no error at either end and nothing
+in any log.
+
+```
+1472 bytes -> reply 1472
+1473 bytes -> no reply
+```
+
+`jm doctor` states the limit for each machine:
+
+```
+[ ok ]  datagram limit dev   published udp carries payloads up to 1472 bytes (gvproxy MTU 1500); larger datagrams are dropped, not fragmented
+```
+
+TCP never meets this, because the stack segments to fit. Keep datagrams
+under 1472 bytes, or use TCP. DNS is unaffected in practice: an oversized
+reply is truncated and the resolver retries over TCP, which is what the
+truncation bit is for.
+
+### If a published UDP port does not answer
+
+Check `jm ports` first. A UDP mapping shows `ok` like any other, and the
+usual cause of a failure is that something on the Mac already holds the host
+port — `5353/udp` is mDNSResponder's:
+
+```
+0.0.0.0:5353  192.168.127.2:5353  udp  error: another process on this Mac already holds this host port (lsof -nP -iUDP:5353); publish the container on a different host port
+```
+
+Run the `lsof` the message gives you, then publish on a free host port. The
+mapping is retried every resync, so freeing the port is enough.
+
+## A share is empty, or a `-v` mounts nothing
+
+Host directories appear in the guest **at the same absolute path** they have
+on the Mac, so `-v /Users/me/src:/app` works from anywhere. When it mounts an
+empty directory instead, it is one of four things:
+
+```bash
+jm inspect | grep -i share    # what is actually shared
+jm doctor                     # writes a host file and asserts a container sees it
+```
+
+| Cause | Fix |
+|---|---|
+| The host path is outside the share set | `jm set --mount /that/root`, then `jm stop && jm start`. Defaults are your home tree, `/Volumes`, `/private/tmp` and `$TMPDIR`'s parent |
+| You wrote `/tmp/...` | Write `/private/tmp/...`. On macOS `/tmp` is a symlink to `/private/tmp`, and a share at the guest's own `/tmp` would shadow it, so jm shares the real path and never rewrites your argument |
+| The share shows `— missing on the host, not shared` | The directory has vanished (an unplugged disk). `jm start` drops it with a warning and picks it up again at the next start once it is back |
+| The guest image predates the `jm_shares` service | `jm start` warns about it. Re-create the machine on a current image: `jm rm && jm init && jm start` |
+
+A share whose *guest* mount failed is logged rather than fatal — the machine
+boots regardless — so `jm doctor` and `jm start`'s warnings are what tell you.
+
+Two more things that look like bugs and are not:
+
+- **`utimes` is a silent no-op and `chown`/`mkfifo` fail** on a 9p share. A
+  build that sets timestamps or ownership will misbehave; keep build output
+  in an engine-managed volume (`-v myvol:/out`) on the guest's ZFS.
+- **zsh eats a trailing `:ro`.** `jm set --mount $P:ro` and
+  `-v $P:$P:ro` fail before the command runs, because zsh reads `:ro` as a
+  history modifier. Quote the whole value: `"${P}:ro"`, `"${P}:${P}:ro"`.
+
+## Names do not resolve in the guest or in a container
+
+The Mac's own resolver answers for the guest, so anything that resolves in
+your browser should resolve in a container — VPN and split-horizon records,
+`/etc/hosts` entries, `.local` names, your search domains.
+
+```bash
+jm doctor                                    # asserts parity against a host-only name
+jm inspect | grep -i resolver                # is it running, and on what address
+tail -50 ~/.jailmachine/machines/*/resolver.log
+jm ssh -- host example.internal              # does the guest resolve it
+jpodman run --rm --os=linux docker.io/alpine nslookup example.internal
+```
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `Resolver: stopped` in `jm inspect` | The host resolver did not come up; `jm start` warns and leaves the guest's previous resolution alone | `jm stop && jm start`, then read `resolver.log` |
+| Resolves in the guest but not in a container | The engine gives containers their own resolver settings | `jm stop && jm start` re-pushes them; check `jm ssh -- cat /etc/resolv.conf` |
+| A VPN name started failing after connecting | The search list is re-read every 30 s and pushed without a restart, but **containers already running keep the list they were created with** | Re-create the container |
+| A short name fails, the fully-qualified one works | The search domain is not in the host's effective list | `scutil --dns` on the Mac is the source of truth |
+| Nothing resolves at all in a container | The guest's `local_unbound` is down | `jm ssh -- service local_unbound status` |
+
+jm never falls back to a public resolver when the host resolver errors: on a
+split-horizon network that would answer an internal name with a public
+address, and a wrong answer is worse than no answer. A failure is propagated
+verbatim, so the guest fails exactly where the host would.
+
+> A Linux container that runs its **own** resolver is fine as well: UDP
+> sockets bind, send and receive normally under the Linuxulator, so a
+> container doing its own lookups gets the same answers `local_unbound`
+> would give it. See [UDP in a Linux container](#udp-in-a-linux-container).
 
 ## Disk full, and growing the disk
 
@@ -348,6 +528,9 @@ Host-side, under `~/.jailmachine/machines/<name>/` (or `$JM_HOME`, or
 | `forward.log` | the `ssh -N -L` helper serving `podman.sock` | `unix://…/podman.sock` refuses connections |
 | `forwarder.log` | the port-publishing loop | A published port never appears |
 | `forwards.json` | the same loop | You want the owned mapping table without running anything |
+| `resolver.log` | the host DNS resolver | A name resolves on the Mac but not in the guest or a container |
+| `resolver.addr` | the same resolver | You want the `127.0.0.1:<port>` the guest forwards its queries to |
+| `guest/shares.tab` | jm, at every start | You want the share table exactly as the guest reads it |
 
 In the guest:
 
@@ -358,6 +541,8 @@ In the guest:
 | `/var/db/jm-provision-failed` | Failure marker — the script aborted |
 | `/var/log/podman_service.log` | The `podman system service` rc script |
 | `/var/run/podman/podman.sock` | The engine API the host connects to |
+| `/var/db/jm/conf/shares.tab` | The share table, mounted read-only from the host |
+| `/var/log/jm-rtcsync.log` | The clock resync daemon that steps the guest from the EFI RTC |
 
 ```bash
 jm inspect                    # prints console, network and forwarder log paths

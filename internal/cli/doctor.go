@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -26,6 +27,7 @@ func newDoctorCmd() *cobra.Command {
 				StateRoot: StateRoot(),
 				Machines:  machineChecks,
 			})
+			rep.Results = append(rep.Results, runExtraChecks(cmd.Context())...)
 			rep.Version = version.Version
 			var err error
 			if JSON() {
@@ -52,7 +54,7 @@ func newDoctorCmd() *cobra.Command {
 // root: the record must load, its backend and provider must be known, and
 // the combined state must not be broken (ADR 0005). Directories that
 // Store.List would skip (unreadable records) are reported, not hidden.
-func machineChecks(context.Context) []doctor.Result {
+func machineChecks(ctx context.Context) []doctor.Result {
 	entries, err := os.ReadDir(filepath.Join(StateRoot(), machine.MachinesDir))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -66,8 +68,69 @@ func machineChecks(context.Context) []doctor.Result {
 			continue
 		}
 		out = append(out, checkMachine(e.Name()))
+		m, err := store().Load(e.Name())
+		// Parity — of name resolution (ADR 0008) and of the shared
+		// directories (ADR 0007) — is a property of a running machine,
+		// so it is only asserted for one. Both check the thing the ADR
+		// promises rather than that a component is alive: a resolver
+		// that answers with the wrong address, or a share the backend
+		// attaches and the guest never mounts, is invisible otherwise.
+		if err == nil {
+			if res, ok := resolverParityCheck(ctx, m); ok {
+				out = append(out, res)
+			}
+			if res, ok := guestResolverParityCheck(ctx, m); ok {
+				out = append(out, res)
+			}
+		}
+		out = append(out, checkMachineShares(e.Name())...)
+		if err == nil {
+			if res, ok := sharesParityCheck(ctx, m); ok {
+				out = append(out, res)
+			}
+			if res, ok := datagramLimitCheck(m); ok {
+				out = append(out, res)
+			}
+		}
 	}
 	return out
+}
+
+// checkMachineShares reports on host filesystem sharing (ADR 0007): every
+// shared host path must still be a directory on this host, and the
+// machine's backend must be able to export it at all. Both are warnings:
+// an unplugged disk is dropped at start, it does not stop the machine. It
+// lists the roots, so a path that is not covered by any of them — /tmp/...
+// and anything outside the shared trees — can be seen at a glance.
+// Whether the guest actually mounts them is sharesParityCheck's job.
+func checkMachineShares(name string) []doctor.Result {
+	m, err := store().Load(name)
+	if err != nil || len(m.Shares) == 0 {
+		return nil
+	}
+	res := doctor.Result{Name: "shares " + name, Status: doctor.OK}
+	if b, err := backendFor(m); err == nil && !b.Capabilities().FileSharing {
+		res.Status = doctor.Warn
+		res.Detail = fmt.Sprintf("%d share(s) configured, backend %q cannot export them", len(m.Shares), b.Name())
+		res.Fix = "remove them with 'jm set --unmount <path>" + nameHint(name) + "' or use a backend that shares host directories"
+		return []doctor.Result{res}
+	}
+	ok, skipped := machine.UsableShares(m.Shares)
+	var paths []string
+	for _, s := range ok {
+		paths = append(paths, s.HostPath+" ("+s.Mode()+")")
+	}
+	res.Detail = fmt.Sprintf("%d share(s) at their host path: %s", len(ok), strings.Join(paths, ", "))
+	if len(skipped) > 0 {
+		var missing []string
+		for _, s := range skipped {
+			missing = append(missing, s.Share.HostPath+" ("+s.Reason+")")
+		}
+		res.Status = doctor.Warn
+		res.Detail = fmt.Sprintf("%d of %d share(s) unavailable: %s", len(skipped), len(m.Shares), strings.Join(missing, ", "))
+		res.Fix = "plug the volume back in, or 'jm set --unmount <path>" + nameHint(name) + "'"
+	}
+	return []doctor.Result{res}
 }
 
 func checkMachine(name string) doctor.Result {
@@ -96,4 +159,33 @@ func checkMachine(name string) doctor.Result {
 	}
 	res.Status = doctor.OK
 	return res
+}
+
+// datagramLimitCheck states the one silent limit of the host<->guest link:
+// it does not fragment, so a UDP datagram bigger than the provider's MTU
+// less its headers is dropped without an error at either end. TCP never
+// meets it — the stack segments to fit — and it is invisible in a packet
+// capture on the sending side, so someone whose 4 kB datagrams vanish has
+// nothing to go on. It is reported as OK rather than a warning because
+// nothing is wrong: it is a number to design against, and a pasted report
+// should carry it.
+//
+// The number comes from the provider's declared MTU rather than a probe: it
+// is a fixed property of the virtual link, and "jm doctor" must not have to
+// reach the guest to state a constant.
+func datagramLimitCheck(m *machine.Machine) (doctor.Result, bool) {
+	res := doctor.Result{Name: "datagram limit " + m.Name}
+	p, err := providerFor(m)
+	if err != nil {
+		return res, false // checkMachine already reports an unknown provider
+	}
+	caps := p.Capabilities()
+	max := caps.MaxDatagram()
+	if max == 0 {
+		return res, false // the provider does not say; do not invent one
+	}
+	res.Status = doctor.OK
+	res.Detail = fmt.Sprintf("published udp carries payloads up to %d bytes (%s MTU %d); larger datagrams are dropped, not fragmented",
+		max, p.Name(), caps.MTU)
+	return res, true
 }

@@ -5,6 +5,7 @@
 efistore
 /jm
 /jpodman
+/jdocker
 /dist
 
 # Personal Claude Code instructions, not part of the project

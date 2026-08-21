@@ -45,10 +45,10 @@ func init() { backend.Register(Backend{}) }
 // Name implements backend.Backend.
 func (Backend) Name() string { return Name }
 
-// Capabilities implements backend.Backend: QEMU gives us a serial console
-// and nothing else yet.
+// Capabilities implements backend.Backend: a serial console, and host
+// filesystem sharing over virtio-9p (ADR 0007).
 func (Backend) Capabilities() backend.Capabilities {
-	return backend.Capabilities{SerialConsole: true}
+	return backend.Capabilities{SerialConsole: true, FileSharing: true}
 }
 
 // Preflight implements backend.Backend: the emulator and its firmware must
@@ -83,13 +83,14 @@ func (b Backend) Logs(m *machine.Machine) []string {
 func (b Backend) paths(m *machine.Machine) Paths {
 	dir := m.Dir
 	return Paths{
-		Vars:    filepath.Join(dir, machine.EFIVarsFile),
-		Disk:    filepath.Join(dir, machine.DiskFile),
-		Seed:    filepath.Join(dir, machine.SeedFile),
-		Console: filepath.Join(dir, machine.ConsoleFile),
-		QMP:     QMPSocket(dir),
-		PID:     filepath.Join(dir, PIDFile),
-		Log:     filepath.Join(dir, LogFile),
+		Vars:      filepath.Join(dir, machine.EFIVarsFile),
+		Disk:      filepath.Join(dir, machine.DiskFile),
+		Seed:      filepath.Join(dir, machine.SeedFile),
+		Console:   filepath.Join(dir, machine.ConsoleFile),
+		QMP:       QMPSocket(dir),
+		PID:       filepath.Join(dir, PIDFile),
+		Log:       filepath.Join(dir, LogFile),
+		GuestConf: filepath.Join(dir, machine.GuestConfDir),
 	}
 }
 
@@ -182,7 +183,18 @@ func (b Backend) Start(ctx context.Context, m *machine.Machine, net backend.NetA
 		return fmt.Errorf("qemu: removing stale QMP socket: %w", err)
 	}
 
-	args := Args(m, net, p)
+	// Host filesystem sharing (ADR 0007): a share whose host path has
+	// vanished since it was added (an unplugged disk) is dropped rather
+	// than allowed to keep the machine from booting. The record is left
+	// alone — the directory may be back next time — so the filtering
+	// happens on a copy.
+	run := *m
+	run.Shares, _ = machine.UsableShares(m.Shares)
+	if err := writeShareTable(p.GuestConf, run.Shares); err != nil {
+		return err
+	}
+
+	args := Args(&run, net, p)
 	logf, err := os.OpenFile(p.Log, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return fmt.Errorf("qemu: opening %s: %w", p.Log, err)
@@ -199,6 +211,32 @@ func (b Backend) Start(ctx context.Context, m *machine.Machine, net backend.NetA
 	// file, but be defensive: a missing pid file means nothing is running.
 	if _, err := readPID(p.PID); err != nil {
 		return fmt.Errorf("qemu: exited without writing %s: %s", p.PID, tailOf(p.Log))
+	}
+	return nil
+}
+
+// writeShareTable publishes the share table into the directory exported to
+// the guest as machine.GuestConfTag, so that the guest's boot-time mount
+// script knows which mount tag belongs at which path. The table is written
+// even when it is empty, so that a machine whose shares were all removed
+// does not keep mounting yesterday's set.
+func writeShareTable(dir string, shares []machine.Share) error {
+	if dir == "" {
+		return nil
+	}
+	if len(shares) == 0 {
+		// Nothing to say and nothing said before: do not litter the
+		// machine directory on machines that share nothing.
+		if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("qemu: creating %s: %w", dir, err)
+	}
+	tab := filepath.Join(dir, machine.SharesTabFile)
+	if err := os.WriteFile(tab, []byte(machine.SharesTab(shares)), 0o644); err != nil {
+		return fmt.Errorf("qemu: writing %s: %w", tab, err)
 	}
 	return nil
 }

@@ -15,7 +15,7 @@ Every image runs with no arguments, prints something worth reading, and exits
 | [The five-minute demo script](#the-five-minute-demo-script) | Copy-paste tour, in order |
 | [The nginx finding](#the-nginx-finding) | Why stock `nginx:alpine` dies, and the one line that fixes it |
 | [`hub-matrix.sh`](#the-docker-hub-matrix) | Re-runs the whole Docker Hub compatibility matrix from `docs/USAGE.md` |
-| [How these are built and published](#how-these-are-built-and-published) | `make -C demo build test push`, and why FreeBSD `:latest` is manual |
+| [How these images are published](#how-these-images-are-published) | `make -C demo build test push`, and why FreeBSD `:latest` is manual |
 
 ## The images
 
@@ -187,9 +187,12 @@ all. Each container is run under `timeout 120`.
 
 ## Known limits
 
-- **No macOS bind mounts.** FreeBSD has no virtiofs driver, so
-  `-v /Users/you/src:/app` cannot work. Named volumes do, on the guest's ZFS
-  pool; use `jm ssh`, `jpodman cp`, NFS or sshfs to reach them.
+- **Bind mounts work, but over 9p.** FreeBSD has no virtiofs driver, so jm
+  shares host directories with `virtio-9p` at the *same absolute path* —
+  `-v /Users/you/src:/app` works, from any directory. It is slow (tens of
+  MB/s), `utimes` is a silent no-op and `chown`/`mkfifo` fail, so keep build
+  output in a named volume on the guest's ZFS pool. `jm inspect` lists what
+  is shared; `jm set --mount/--unmount` changes it.
 - **`--os=linux` on every Linux image**, for `build` and `run` alike.
 - **Not every Linux image works.** The Linuxulator implements most of the
   Linux syscall surface, not all of it — the missing `EPOLLEXCLUSIVE` is

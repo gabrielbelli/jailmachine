@@ -65,6 +65,24 @@ func newStartCmd() *cobra.Command {
 }
 
 func runStart(ctx context.Context, args []string) error {
+	return startMachine(ctx, args, startOpts{})
+}
+
+// startOpts vary "jm start" for autostart (see autostart.go).
+type startOpts struct {
+	// waitLock queues behind another jm command operating on the machine
+	// instead of failing: two wrappers racing to boot the same stopped
+	// machine must both end up with a running one (ADR 0005: start is
+	// idempotent and resumable).
+	waitLock bool
+	// skipIfReady returns as soon as the lock shows the machine already
+	// booted and its engine answering — which is what the wrapper that
+	// waited behind the one that did the work finds.
+	skipIfReady bool
+}
+
+// startMachine is "jm start", with the variations autostart needs.
+func startMachine(ctx context.Context, args []string, opts startOpts) error {
 	m, err := loadMachine(args)
 	if err != nil {
 		return err
@@ -73,7 +91,7 @@ func runStart(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	unlock, err := lock(m.Name)
+	unlock, err := lockMaybeWait(ctx, m.Name, opts.waitLock)
 	if err != nil {
 		return err
 	}
@@ -81,6 +99,22 @@ func runStart(ctx context.Context, args []string) error {
 
 	st, err := stateOf(m, b, p)
 	if err != nil {
+		return err
+	}
+	if opts.skipIfReady && st == backend.Running && engineReachable(m) {
+		return nil
+	}
+	// $JM_PUBLISH_ADDR is an override read here, once, and written onto the
+	// record: the forwarder runs detached, so the address it binds must be
+	// on the machine rather than in this shell's environment (ADR 0004).
+	//
+	// It is read under the lock and only on the path that actually starts
+	// the machine: the record is shared state, and a jpodman shell that
+	// exports the variable must not rewrite the record of a machine that is
+	// already running with another address — which this invocation would
+	// not restart, so the running forwarder would go on binding the old one
+	// while "jm inspect" showed the new.
+	if err := applyPublishAddrEnv(m); err != nil {
 		return err
 	}
 	if st == backend.Broken {
@@ -108,6 +142,15 @@ func runStart(ctx context.Context, args []string) error {
 		}
 	}
 
+	// Stage: dns (host half). The resolver that answers the guest's queries
+	// from the host's own resolver runs on the host and does not need the
+	// guest, so it comes up with the network (ADR 0008); the guest is
+	// pointed at it once sshd answers.
+	resolverPort, err := startResolver(ctx, m, ep)
+	if err != nil {
+		return err
+	}
+
 	// Stage: backend. A running machine skips the boot but still goes
 	// through the remaining stages, which are idempotent: an interrupted
 	// first boot, a failed connect or a dead forward is finished here
@@ -117,6 +160,11 @@ func runStart(ctx context.Context, args []string) error {
 		logf(stdout, "%s: %s is already running (ssh %s:%d); checking the remaining stages", machine.StageBackend, m.Name, ep.SSHHost, ep.SSHPort)
 	} else {
 		logf(stdout, "%s: booting %s (%d cpus, %d MiB, ssh on %s:%d)", machine.StageBackend, m.Name, m.CPUs, m.MemoryMiB, ep.SSHHost, ep.SSHPort)
+		// A share whose host path has gone is dropped by the backend
+		// rather than allowed to keep the machine from booting (ADR
+		// 0007); say so once, here, where the user can see it.
+		warnUnsupportedShares(m, b)
+		warnMissingShares(m.Shares)
 		if err := b.Start(ctx, m, att); err != nil {
 			// Do not leave a provider running for a hypervisor that never
 			// started; that would read as "broken" afterwards.
@@ -135,6 +183,11 @@ func runStart(ctx context.Context, args []string) error {
 	// A disk grown by "jm set --disk" while stopped is handed to the guest
 	// now that sshd answers.
 	finishPendingGrow(ctx, m, client)
+	// The guest keeps its own clock in step with the host's (see clock.go);
+	// correct it once here as well, so a machine that was already running
+	// through a host sleep, or a guest too old to carry the resync service,
+	// is right before anything is built or run in it.
+	syncGuestClock(ctx, m, client)
 
 	// Stage: provision.
 	logf(stdout, "%s: waiting for %s", machine.StageProvision, machine.GuestProvisionMarker)
@@ -150,6 +203,16 @@ func runStart(ctx context.Context, args []string) error {
 		return err
 	}
 	if err := waitGuestSocket(ctx, m, client); err != nil {
+		return err
+	}
+	// A guest too old to carry the jm_shares service attaches the shared
+	// devices and mounts nothing, which is silent everywhere else (ADR
+	// 0007); say so here, as the clock check does for jm_rtcsync.
+	warnMissingShareSupport(ctx, m, client)
+
+	// Stage: dns (guest half): the guest and its containers get exactly one
+	// nameserver, the host resolver started above.
+	if err := configureGuestDNS(ctx, m, client, ep, resolverPort); err != nil {
 		return err
 	}
 

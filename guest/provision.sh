@@ -18,6 +18,262 @@ sed -i '' -e 's/^#\{0,1\}PermitRootLogin.*/PermitRootLogin prohibit-password/' /
 # keys first, and fall back to start if restart still fails.
 service sshd keygen
 service sshd restart || service sshd start
+# Host filesystem sharing (ADR 0007, docs/guest-contract.md). Installed on
+# both paths and rewritten on every boot of every machine, so a prebaked
+# image that predates this script picks it up without being rebuilt.
+cat > /usr/local/etc/rc.d/jm_shares <<'RC'
+#!/bin/sh
+# PROVIDE: jm_shares
+# REQUIRE: FILESYSTEMS
+# BEFORE: LOGIN
+# KEYWORD: shutdown
+#
+# Mount the host directories jm shares with this machine, each at the same
+# absolute path it has on the host, before the container engine starts
+# (ADR 0007). Which mount tag belongs at which path is read from a table
+# the host publishes as a read-only 9p share of its own, so the set can
+# change between boots with nothing pushed into the guest over ssh.
+#
+# Nothing here is allowed to stop the boot: a share whose device is not
+# there (an unplugged disk, an older jm) is logged and skipped.
+. /etc/rc.subr
+
+name=jm_shares
+rcvar=jm_shares_enable
+: ${jm_shares_enable:="YES"}
+start_cmd=jm_shares_start
+stop_cmd=jm_shares_stop
+
+_jm_conf_tag=jmconf
+_jm_conf_dir=/var/db/jm/conf
+_jm_tab=$_jm_conf_dir/shares.tab
+_jm_begin="# BEGIN jm shares (generated, do not edit)"
+_jm_end="# END jm shares"
+
+_jm_mounted()
+{
+	mount -t p9fs | awk -v p="$1" '$3 == p { found = 1 } END { exit !found }'
+}
+
+# _jm_fstab rewrites the jm-managed block of /etc/fstab from the table, so
+# the mounts are declared where an administrator looks for them and
+# "mount -a" agrees with what jm_shares did. A mountpoint containing
+# whitespace cannot be spelt in fstab and is left as a comment; jm_shares
+# mounts it all the same.
+_jm_fstab()
+{
+	_tab=$1
+	_tmp=$(mktemp /etc/fstab.jm.XXXXXX) || return 0
+	awk -v b="$_jm_begin" -v e="$_jm_end" '
+		$0 == b { skip = 1 }
+		!skip { print }
+		$0 == e { skip = 0 }
+	' /etc/fstab > $_tmp 2>/dev/null || { rm -f $_tmp; return 0; }
+	printf '%s\n' "$_jm_begin" >> $_tmp
+	while IFS='	' read -r _tag _dir _mode; do
+		case "$_tag" in ''|'#'*) continue ;; esac
+		case "$_dir" in
+		*\ *|*\	*)
+			printf '# %s\t%s\tmounted by jm_shares (fstab cannot spell this path)\n' "$_tag" "$_dir" >> $_tmp
+			continue ;;
+		esac
+		printf '%s\t%s\tp9fs\t%s,late,failok\t0\t0\n' "$_tag" "$_dir" "$_mode" >> $_tmp
+	done < $_tab
+	printf '%s\n' "$_jm_end" >> $_tmp
+	chmod 644 $_tmp && mv $_tmp /etc/fstab
+	return 0
+}
+
+jm_shares_start()
+{
+	kldload -n p9fs 2>/dev/null
+	mkdir -p $_jm_conf_dir
+	_jm_mounted $_jm_conf_dir ||
+	    mount -t p9fs -o ro $_jm_conf_tag $_jm_conf_dir 2>/dev/null
+	if [ ! -f $_jm_tab ]; then
+		echo "jm_shares: no share table, nothing to mount"
+		_jm_fstab /dev/null
+		return 0
+	fi
+	_jm_fstab $_jm_tab
+	# Parents come first in the table, so a read-only directory nested in
+	# a writable tree is mounted over it, not under it.
+	while IFS='	' read -r _tag _dir _mode; do
+		case "$_tag" in ''|'#'*) continue ;; esac
+		_jm_mounted "$_dir" && continue
+		mkdir -p "$_dir" 2>/dev/null ||
+		    { echo "jm_shares: cannot create $_dir"; continue; }
+		if mount -t p9fs -o "$_mode" "$_tag" "$_dir" 2>/dev/null; then
+			echo "jm_shares: mounted $_dir ($_mode)"
+		else
+			echo "jm_shares: skipping $_dir: host share $_tag is not attached"
+		fi
+	done < $_jm_tab
+	return 0
+}
+
+jm_shares_stop()
+{
+	[ -f $_jm_tab ] && tail -r $_jm_tab | while IFS='	' read -r _tag _dir _mode; do
+		case "$_tag" in ''|'#'*) continue ;; esac
+		_jm_mounted "$_dir" && umount -f "$_dir" 2>/dev/null
+	done
+	_jm_mounted $_jm_conf_dir && umount -f $_jm_conf_dir 2>/dev/null
+	return 0
+}
+
+load_rc_config $name
+run_rc_command "$1"
+RC
+chmod +x /usr/local/etc/rc.d/jm_shares
+sysrc jm_shares_enable=YES
+service jm_shares start || true
+# Guest clock (docs/tech-choices.md). A virtual machine's timekeeping stops
+# with its host: after the Mac sleeps the guest wakes minutes or hours
+# behind, and certificates, builds and package signatures are all wrong
+# until something corrects it. The hypervisor's RTC keeps host wall time, so
+# a small service reads it through the EFI runtime services device and steps
+# the clock when the two diverge. Installed on both paths and rewritten on
+# every boot of every machine, so a prebaked image that predates this script
+# picks it up without being rebuilt.
+#
+# machdep.disable_rtc_set=1 is not optional: without it the kernel writes
+# the guest's own skew back into the RTC and the reference is lost (measured
+# on 2026-08-21: with it 0, a clock put five minutes back stayed wrong).
+sysctl machdep.disable_rtc_set=1 >/dev/null 2>&1 || true
+sysrc -f /etc/sysctl.conf machdep.disable_rtc_set=1 >/dev/null 2>&1 || true
+cat > /usr/local/etc/jm-rtcsync.c <<'CSRC'
+/*
+ * jm-rtcsync: keep this guest's clock in step with its host's.
+ *
+ * The hypervisor's real-time clock tracks host wall time (qemu's default
+ * -rtc base=utc,clock=host), so it stays right while the guest's own
+ * timekeeping stops during a host sleep. Read it through the EFI runtime
+ * services device and step the system clock whenever the two differ by more
+ * than the threshold. Requires machdep.disable_rtc_set=1.
+ */
+#include <sys/types.h>
+#include <sys/efi.h>
+#include <sys/efiio.h>
+#include <sys/ioctl.h>
+#include <sys/time.h>
+
+#include <err.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+static int
+rtc_now(int fd, struct timeval *tv)
+{
+	struct efi_tm t;
+	struct tm tm;
+
+	memset(&t, 0, sizeof(t));
+	if (ioctl(fd, EFIIOC_GET_TIME, &t) < 0)
+		return (-1);
+	memset(&tm, 0, sizeof(tm));
+	tm.tm_year = t.tm_year - 1900;
+	tm.tm_mon = t.tm_mon - 1;
+	tm.tm_mday = t.tm_mday;
+	tm.tm_hour = t.tm_hour;
+	tm.tm_min = t.tm_min;
+	tm.tm_sec = t.tm_sec;
+	tv->tv_sec = timegm(&tm);
+	tv->tv_usec = t.tm_nsec / 1000;
+	return (0);
+}
+
+int
+main(int argc, char **argv)
+{
+	struct timeval rtc, now;
+	long interval = 10, threshold = 2, skew;
+	int ch, fd, once = 0;
+
+	while ((ch = getopt(argc, argv, "1i:t:")) != -1) {
+		switch (ch) {
+		case '1':
+			once = 1;
+			break;
+		case 'i':
+			interval = strtol(optarg, NULL, 10);
+			break;
+		case 't':
+			threshold = strtol(optarg, NULL, 10);
+			break;
+		default:
+			errx(2, "usage: jm-rtcsync [-1] [-i interval] [-t threshold]");
+		}
+	}
+	if ((fd = open("/dev/efi", O_RDONLY)) < 0)
+		err(1, "open /dev/efi");
+	setvbuf(stdout, NULL, _IOLBF, 0);
+	for (;;) {
+		if (rtc_now(fd, &rtc) < 0)
+			err(1, "EFIIOC_GET_TIME");
+		gettimeofday(&now, NULL);
+		skew = (long)(rtc.tv_sec - now.tv_sec);
+		if (skew >= threshold || skew <= -threshold) {
+			if (settimeofday(&rtc, NULL) < 0)
+				err(1, "settimeofday");
+			printf("stepped the clock by %+lds (host rtc %lld, guest was %lld)\n",
+			    skew, (long long)rtc.tv_sec, (long long)now.tv_sec);
+		}
+		if (once)
+			break;
+		sleep((unsigned)interval);
+	}
+	return (0);
+}
+CSRC
+if cc -O2 -pipe -o /usr/local/sbin/jm-rtcsync.new /usr/local/etc/jm-rtcsync.c 2>/dev/null; then
+  mv /usr/local/sbin/jm-rtcsync.new /usr/local/sbin/jm-rtcsync
+else
+  rm -f /usr/local/sbin/jm-rtcsync.new
+  echo "jm-provision: no C compiler in this image; the guest clock will not resync after a host sleep"
+fi
+cat > /usr/local/etc/rc.d/jm_rtcsync <<'RC'
+#!/bin/sh
+# PROVIDE: jm_rtcsync
+# REQUIRE: FILESYSTEMS
+# BEFORE: LOGIN
+# KEYWORD: shutdown
+#
+# Step this guest's clock to the hypervisor's RTC whenever they diverge, so
+# the guest is right again seconds after the host wakes from sleep.
+. /etc/rc.subr
+
+name=jm_rtcsync
+rcvar=jm_rtcsync_enable
+: ${jm_rtcsync_enable:="YES"}
+: ${jm_rtcsync_interval:="10"}
+: ${jm_rtcsync_threshold:="2"}
+pidfile=/var/run/jm_rtcsync.pid
+command=/usr/sbin/daemon
+command_args="-f -P ${pidfile} -o /var/log/jm-rtcsync.log /usr/local/sbin/jm-rtcsync -i ${jm_rtcsync_interval} -t ${jm_rtcsync_threshold}"
+start_precmd=jm_rtcsync_prestart
+
+jm_rtcsync_prestart()
+{
+	# The EFI runtime services device is where the RTC is read from; on a
+	# kernel that has it as a module, load it first.
+	kldload -n efirt 2>/dev/null
+	[ -c /dev/efi ] || { echo "jm_rtcsync: no /dev/efi; not starting"; return 1; }
+	[ -x /usr/local/sbin/jm-rtcsync ] || { echo "jm_rtcsync: not built; not starting"; return 1; }
+	sysctl machdep.disable_rtc_set=1 >/dev/null 2>&1
+	return 0
+}
+
+load_rc_config $name
+run_rc_command "$1"
+RC
+chmod +x /usr/local/etc/rc.d/jm_rtcsync
+sysrc jm_rtcsync_enable=YES
+service jm_rtcsync restart || service jm_rtcsync start || true
 # Fast path (ADR 0003, docs/guest-contract.md): a prebaked image built by
 # "jm image build" already ran everything below and carries the ready
 # marker; its seal.sh put /firstboot back so this script runs once more on

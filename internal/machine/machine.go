@@ -62,16 +62,26 @@ type Machine struct {
 	// GuestIP is the stable guest address the provider hands out, recorded
 	// so that tools can reconnect without the provider being up. It is
 	// configuration derived from the provider, not runtime state.
-	GuestIP     string    `json:"guest_ip,omitempty"`
+	GuestIP string `json:"guest_ip,omitempty"`
+	// PublishAddr is the host address published container ports bind to
+	// (ADR 0004). Empty means the default, which is every interface, as
+	// "docker run -p" does on Linux. It lives on the record rather than in
+	// the environment of whichever shell started the machine, so that the
+	// binding a running forwarder uses is the one "jm inspect" shows.
+	PublishAddr string    `json:"publish_addr,omitempty"`
 	Created     time.Time `json:"created"`
 	Provisioned bool      `json:"provisioned"`
 	// ImageTrusted records whether the disk image was verified against a
 	// published checksum when fetched (ADR 0003: trust is a property of
 	// the source, surfaced uniformly). Records written before the field
 	// existed came from the checksummed official source and load as true.
-	ImageTrusted bool              `json:"image_trusted"`
-	BackendOpts  map[string]string `json:"backend_opts,omitempty"`
-	Dir          string            `json:"-"`
+	ImageTrusted bool `json:"image_trusted"`
+	// Shares are the host directories offered to the guest at their own
+	// absolute path (ADR 0007). The set is reconciled at every start, not
+	// frozen at init; an empty set means no host filesystem sharing.
+	Shares      []Share           `json:"shares,omitempty"`
+	BackendOpts map[string]string `json:"backend_opts,omitempty"`
+	Dir         string            `json:"-"`
 }
 
 // Defaults returns a Machine populated with the PoC defaults. The caller

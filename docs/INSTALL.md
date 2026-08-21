@@ -1,12 +1,15 @@
 # Installing jailmachine
 
-> **This release is an MVP — a working demo.** It proves the whole idea end
-> to end and it is usable: one command brings up a FreeBSD VM, native
-> FreeBSD OCI images and Linux images both run, published ports reach the
-> host, and bastille jails work inside the guest. The polished behaviour —
-> host directory mounts at identical paths, DNS 1:1 with the host,
-> autostart, full docker CLI parity — is being built on the `docker-parity`
-> branch and is **not** in this release.
+> **Still an MVP — a working demo**, but a wider one than v0.1.0. One command
+> brings up a FreeBSD VM, native FreeBSD OCI images and Linux images both run,
+> published ports reach the host, and bastille jails work inside the guest.
+> Since v0.1.0 it also shares host directories at identical paths, resolves
+> names exactly as the Mac does, starts a stopped machine on demand from
+> `jpodman`/`jdocker`, ships a `jdocker` wrapper for the docker CLI, and
+> publishes ports with docker-identical `-p` semantics, UDP included. The
+> one Linuxulator gap left is narrow: busybox's `nc -u -l` fails where every
+> other UDP server works — see
+> [TROUBLESHOOTING](TROUBLESHOOTING.md#udp-in-a-linux-container).
 
 See [USAGE.md](USAGE.md) for the command reference once jm is installed,
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md) when something misbehaves, and
@@ -29,7 +32,7 @@ See [USAGE.md](USAGE.md) for the command reference once jm is installed,
 
 Three supported paths. They differ in what gets installed for you.
 
-| Path | Gives you | Installs dependencies | `jpodman` symlink | Gatekeeper |
+| Path | Gives you | Installs dependencies | `jpodman` / `jdocker` symlinks | Gatekeeper |
 |---|---|---|---|---|
 | Homebrew cask | `jm` on `PATH` | Yes (`qemu`, `podman`) | Yes | Handled for you |
 | `go install` | `jm` in `$(go env GOPATH)/bin` | No | Manual | May need `xattr` |
@@ -43,7 +46,9 @@ brew install --cask gabrielbelli/tap/jailmachine
 
 The cask declares `qemu` and `podman` as dependencies, so Homebrew installs
 them if they are missing. It also strips the quarantine flag from the binary
-and creates the `jpodman` symlink next to `jm`.
+and creates the `jpodman` and `jdocker` symlinks next to `jm`. The docker CLI
+itself is not a dependency — `brew install docker` if you want `jdocker` or
+`docker compose`.
 
 `brew install gabrielbelli/tap/jailmachine` (without `--cask`) resolves to
 the same cask.
@@ -58,19 +63,20 @@ go install github.com/gabrielbelli/jailmachine/cmd/jm@latest
 A binary installed this way reports the module version it was built from
 (`jm version` shows `0.1.1`, with an empty commit when the module proxy built
 it); the Homebrew cask and the release archives carry the commit and build date
-as well. `jpodman` is not created for you: link it yourself with
-`ln -s "$(command -v jm)" "$(dirname "$(command -v jm)")/jpodman"`.
+as well. `jpodman` and `jdocker` are not created for you: link them yourself (see
+below).
 
-Then put the Go bin directory on your `PATH` and create the `jpodman`
-symlink by hand:
+Then put the Go bin directory on your `PATH` and create the wrapper symlinks
+by hand:
 
 ```bash
 export PATH="$(go env GOPATH)/bin:$PATH"
 ln -sf "$(go env GOPATH)/bin/jm" "$(go env GOPATH)/bin/jpodman"
+ln -sf "$(go env GOPATH)/bin/jm" "$(go env GOPATH)/bin/jdocker"
 ```
 
-`jm` decides it is being called as `jpodman` from the name of the binary, so
-the link must be called exactly `jpodman`.
+`jm` decides it is being called as a wrapper from the name of the binary, so
+the links must be called exactly `jpodman` and `jdocker`.
 
 > A binary built by `go install` is not stamped with a version: `jm version`
 > reports `dev`, `none`, `unknown`. That is expected, and it is how jm tells
@@ -85,7 +91,7 @@ make install
 ```
 
 `make install` builds with the version, commit and date stamped from `git
-describe` and installs both `jm` and the `jpodman` symlink into
+describe` and installs `jm` and both the `jpodman` and `jdocker` symlinks into
 `$(PREFIX)/bin`. `PREFIX` defaults to `/opt/homebrew`:
 
 ```bash
@@ -148,7 +154,7 @@ carry a `fix:` line under the row:
 
 ```bash
 jm init      # download the prebaked guest image, verify it, write the seed
-jm start     # boot, provision, connect podman, start the port forwarder
+jm start     # boot, provision, connect podman, mount the shares, start the forwarder and resolver
 jpodman run --rm --os=linux docker.io/alpine echo hi
 ```
 
@@ -159,12 +165,12 @@ Measured on an Apple Silicon Mac (2026-08-21):
 | `jm init` from the published release | about 45–60 s on a fast link, almost all of it the download |
 | First boot, prebaked image (the default) | about 22 s (32 s measured once with two other VMs already running on the host) |
 | First boot, `--image official:<release>` | about 2 min (packages are installed inside the guest, including one kernel reboot) |
-| Later starts of an existing machine | 12–20 s |
+| Later starts of an existing machine | 12–25 s |
 
 Most of that is the guest's own boot, so a later start costs much the same
 as the first one on the prebaked path; a busy host adds to both. `jm init`
-is separate and dominated by the download — this release fetches the
-`guest-15.1.0` release asset, roughly 800 MiB, then verifies its SHA256 and
+is separate and dominated by the download — it fetches the
+`guest-<version>` release asset named by the binary, roughly 800 MiB, then verifies its SHA256 and
 decompresses it sparsely.
 
 The guest is FreeBSD, so podman pulls FreeBSD image variants by default.
@@ -174,10 +180,25 @@ works — the verified matrix, including the two images that need a
 workaround and the one that does not work at all, is in
 [USAGE.md](USAGE.md#docker-hub-compatibility-verified).
 
-Docker clients and compose reach the machine with `eval "$(jm env)"`; there
-is no `jdocker` wrapper in this release, and compose needs
+Docker clients and compose reach the machine through `jdocker` (`brew install
+docker` for the client), or with `eval "$(jm env)"` for a client you would
+rather point yourself. `jdocker` defaults `DOCKER_DEFAULT_PLATFORM` to
+`linux/arm64`, so a plain `jdocker run` pulls the Linux image as Docker
+Desktop would; export the variable yourself, or pass `--platform`, for native
+FreeBSD images. Under plain `podman`, compose still needs
 `jpodman pull --os=linux <image>` plus `pull_policy: missing` for a Linux
 image, because it cannot ask for a platform itself.
+
+Both wrappers start a stopped machine before running the client, printing one
+line on stderr while it boots. `JM_AUTOSTART=0` (or `--no-autostart` as the
+first argument) makes them fail instead. There is no login agent: nothing
+starts a machine unless you or a wrapper asks.
+
+Host directories are shared into the guest at the same absolute path — your
+home tree, `/Volumes`, `/private/tmp` and `$TMPDIR`'s root by default — so
+`-v ~/code:/app` works out of the box. `jm init --mount`, `--no-mounts` and
+`jm set --mount/--unmount` change the set; see
+[USAGE.md](USAGE.md#sharing-host-directories).
 
 ## Upgrade
 
@@ -213,8 +234,8 @@ jm rm jailmachine          # repeat per machine, or: jm rm <name>
 
 # 2. remove the binary
 brew uninstall --cask jailmachine       # Homebrew
-# or: rm -f "$(go env GOPATH)/bin/jm" "$(go env GOPATH)/bin/jpodman"
-# or: rm -f /opt/homebrew/bin/jm /opt/homebrew/bin/jpodman
+# or: rm -f "$(go env GOPATH)/bin/jm" "$(go env GOPATH)/bin/jpodman" "$(go env GOPATH)/bin/jdocker"
+# or: rm -f /opt/homebrew/bin/jm /opt/homebrew/bin/jpodman /opt/homebrew/bin/jdocker
 
 # 3. remove any state left behind
 rm -rf ~/.jailmachine
@@ -231,8 +252,8 @@ the guest's `known_hosts` entry and deletes the machine directory, so steps
 interrupted. `rm -rf ~/.jailmachine` is otherwise a complete uninstall of
 all runtime state — nothing is stored anywhere else.
 
-`brew uninstall --cask jailmachine` removes `jm`, but **leaves the
-`jpodman` symlink behind**: Homebrew casks have no uninstall hook, so the
+`brew uninstall --cask jailmachine` removes `jm`, but **leaves the `jpodman`
+and `jdocker` symlinks behind**: Homebrew casks have no uninstall hook, so the
 symlink removal lives in the cask's zap stanza. Run
 `brew uninstall --zap --cask jailmachine` (or `brew zap --cask jailmachine`)
 to take it with you, or delete it by hand as in step 2 above.

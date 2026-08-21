@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gabrielbelli/jailmachine/internal/netprov"
@@ -83,7 +84,39 @@ func (c *Client) do(ctx context.Context, method, path string, body any) ([]byte,
 // Expose adds a host->guest mapping.
 func (c *Client) Expose(ctx context.Context, m netprov.Mapping) error {
 	_, err := c.do(ctx, http.MethodPost, exposePath, toWire(m))
-	return err
+	return exposeErr(m, err)
+}
+
+// inUseText is the bind failure gvproxy reports when the host port a mapping
+// wants is already taken. The control API returns it as a 500 whose body is
+// Go's own listen error, so the text is all there is to match on.
+const inUseText = "address already in use"
+
+// exposeErr rewrites the one expose failure the user can act on. gvproxy
+// binds the host side of a mapping itself, so a port another process on this
+// Mac already holds comes back as a 500 carrying a listen error. Left as it
+// is, "jm ports" shows a line of control-API plumbing where the two useful
+// facts should be: which process to look for, and that the fix is to publish
+// on another host port.
+//
+// UDP meets this far more often than TCP, because macOS runs mDNSResponder
+// on 5353/udp: the obvious "-p 5353:53/udp" for a DNS container always
+// collides, and the raw message reads like UDP publishing is broken when it
+// is only that one port that is occupied.
+func exposeErr(m netprov.Mapping, err error) error {
+	if err == nil || !strings.Contains(err.Error(), inUseText) {
+		return err
+	}
+	proto := m.Proto
+	if proto == "" {
+		proto = "tcp"
+	}
+	port := m.Local
+	if _, p, splitErr := net.SplitHostPort(m.Local); splitErr == nil {
+		port = p
+	}
+	return fmt.Errorf("another process on this Mac already holds this host port (lsof -nP -i%s:%s); publish the container on a different host port",
+		strings.ToUpper(proto), port)
 }
 
 // Unexpose removes a mapping.

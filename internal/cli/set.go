@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/gabrielbelli/jailmachine/internal/backend"
+	"github.com/gabrielbelli/jailmachine/internal/forwarder"
 	"github.com/gabrielbelli/jailmachine/internal/image"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
 	"github.com/gabrielbelli/jailmachine/internal/sshx"
@@ -32,16 +33,31 @@ func newSetCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "set [name]",
 		Short: "Change a machine's resources",
-		Long: "Change CPUs, memory, disk size or the SSH port of a machine.\n" +
-			"--cpus, --memory and --ssh-port need the machine stopped. --disk only grows\n" +
-			"(disk.raw is extended sparsely); on a running machine the guest's partition\n" +
-			"and ZFS pool are extended at once, otherwise on the next 'jm start'.",
+		Long: "Change CPUs, memory, disk size, the SSH port or the shared host\n" +
+			"directories of a machine.\n" +
+			"--cpus, --memory, --ssh-port, --mount and --unmount need the machine stopped.\n" +
+			"--disk only grows (disk.raw is extended sparsely); on a running machine the\n" +
+			"guest's partition and ZFS pool are extended at once, otherwise on the next\n" +
+			"'jm start'.\n\n" +
+			"A shared directory appears in the guest at its own absolute path, so\n" +
+			"'-v /work/src:/app' resolves inside the guest unchanged. The share set takes\n" +
+			"effect on the next start; jm says so.\n\n" +
+			"--publish-addr sets the host address container ports are published on when\n" +
+			"the publish flag names none (the default is every interface, as docker does\n" +
+			"on Linux). It is a default, not an override: '-p 127.0.0.1:8080:80' binds the\n" +
+			"host's loopback whatever it says. It applies when the forwarder is next\n" +
+			"started; 'jm ports' says so while the old one is still bound.",
+		Example: `  jm set --cpus 8 --memory 8GiB
+  jm set --mount /work --mount /srv/data:ro
+  jm set --unmount /srv/data
+  jm set --publish-addr 127.0.0.1   # keep published ports off the LAN`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			o.cpusSet = cmd.Flags().Changed("cpus")
 			o.memorySet = cmd.Flags().Changed("memory")
 			o.diskSet = cmd.Flags().Changed("disk")
 			o.sshPortSet = cmd.Flags().Changed("ssh-port")
+			o.publishAddrSet = cmd.Flags().Changed("publish-addr")
 			return runSet(cmd.Context(), args, o)
 		},
 	}
@@ -50,13 +66,19 @@ func newSetCmd() *cobra.Command {
 	f.StringVar(&o.memory, "memory", "", "memory: MiB, or with a unit (4096MiB, 4GiB, 4g)")
 	f.IntVar(&o.disk, "disk", 0, "disk size in GiB (grow only)")
 	f.IntVar(&o.sshPort, "ssh-port", 0, "host port forwarded to the guest's sshd")
+	f.StringArrayVar(&o.mount, "mount", nil, mountFlagUsage)
+	f.StringArrayVar(&o.unmount, "unmount", nil, "stop sharing a host directory (repeatable)")
+	f.StringVar(&o.publishAddr, "publish-addr", "", publishAddrFlagUsage)
 	return cmd
 }
 
 type setOpts struct {
 	cpus, disk, sshPort                     int
 	memory                                  string
+	publishAddr                             string
+	mount, unmount                          []string
 	cpusSet, memorySet, diskSet, sshPortSet bool
+	publishAddrSet                          bool
 }
 
 // ParseMemoryMiB parses a memory size: a bare number is MiB; suffixes
@@ -93,19 +115,51 @@ func ParseMemoryMiB(s string) (int, error) {
 type changes struct {
 	cpus, memoryMiB, diskGiB, sshPort       int
 	cpusSet, memorySet, diskSet, sshPortSet bool
+	// publishAddr is the host address published ports bind to; it takes
+	// effect when the forwarder is next started, so it needs no stop.
+	publishAddr    string
+	publishAddrSet bool
+	// shares is the new share set; sharesSet says whether --mount or
+	// --unmount was given at all (an empty set is a legitimate result).
+	shares    []machine.Share
+	sharesSet bool
 }
 
 // any reports whether at least one flag was given.
-func (c changes) any() bool { return c.cpusSet || c.memorySet || c.diskSet || c.sshPortSet }
+func (c changes) any() bool {
+	return c.cpusSet || c.memorySet || c.diskSet || c.sshPortSet || c.sharesSet || c.publishAddrSet
+}
 
-// needsStopped reports whether the changes require a stopped machine.
-func (c changes) needsStopped() bool { return c.cpusSet || c.memorySet || c.sshPortSet }
+// needsStopped reports whether the changes require a stopped machine. The
+// share set is part of the virtual hardware, so it changes only between
+// boots.
+func (c changes) needsStopped() bool {
+	return c.cpusSet || c.memorySet || c.sshPortSet || c.sharesSet
+}
 
 // validate parses and range-checks the flags against the current record.
 func (o setOpts) validate(m *machine.Machine) (changes, error) {
-	c := changes{cpusSet: o.cpusSet, memorySet: o.memorySet, diskSet: o.diskSet, sshPortSet: o.sshPortSet}
+	c := changes{
+		cpusSet: o.cpusSet, memorySet: o.memorySet, diskSet: o.diskSet, sshPortSet: o.sshPortSet,
+		publishAddrSet: o.publishAddrSet,
+		sharesSet:      len(o.mount) > 0 || len(o.unmount) > 0,
+	}
 	if !c.any() {
-		return c, errors.New("nothing to set (use --cpus, --memory, --disk or --ssh-port)")
+		return c, errors.New("nothing to set (use --cpus, --memory, --disk, --ssh-port, --publish-addr, --mount or --unmount)")
+	}
+	if o.publishAddrSet {
+		addr, err := parsePublishAddr(o.publishAddr)
+		if err != nil {
+			return c, err
+		}
+		c.publishAddr = addr
+	}
+	if c.sharesSet {
+		shares, err := applyMounts(m.Shares, o.mount, o.unmount)
+		if err != nil {
+			return c, err
+		}
+		c.shares = shares
 	}
 	if o.cpusSet {
 		if o.cpus < minCPUs || o.cpus > maxCPUs {
@@ -162,7 +216,7 @@ func runSet(ctx context.Context, args []string, o setOpts) error {
 	}
 	stopHint := "stop the machine first: jm stop" + nameHint(m.Name)
 	if st != backend.Stopped && c.needsStopped() {
-		return withHint(fmt.Errorf("%s is %s; cpus, memory and the ssh port change only on a stopped machine", m.Name, st), stopHint)
+		return withHint(fmt.Errorf("%s is %s; cpus, memory, the ssh port and the shared directories change only on a stopped machine", m.Name, st), stopHint)
 	}
 
 	if c.cpusSet && c.cpus != m.CPUs {
@@ -177,6 +231,29 @@ func runSet(ctx context.Context, args []string, o setOpts) error {
 		logf(stdout, "ssh port: %d -> %d", m.SSHPort, c.sshPort)
 		forgetHostKey(m)
 		m.SSHPort = c.sshPort
+	}
+	if c.sharesSet && !sameShares(c.shares, m.Shares) {
+		b, err := backendFor(m)
+		if err != nil {
+			return err
+		}
+		m.Shares = c.shares
+		warnUnsupportedShares(m, b)
+		warnMissingShares(m.Shares)
+		if len(m.Shares) == 0 {
+			logf(stdout, "shares: none")
+		}
+		for _, sh := range m.Shares {
+			logf(stdout, "share: %s", sh)
+		}
+		logf(stdout, "the shared directories are attached on the next start: jm start%s", nameHint(m.Name))
+	}
+	if c.publishAddrSet && c.publishAddr != m.PublishAddr {
+		m.PublishAddr = c.publishAddr
+		logf(stdout, "publish address: %s", forwarder.HostIP(m.PublishAddr))
+		if st == backend.Running {
+			logf(stdout, "%s", publishAddrNote(m))
+		}
 	}
 	if c.diskSet && c.diskGiB != m.DiskGiB {
 		var resizer backend.Resizer
@@ -224,7 +301,8 @@ func runSet(ctx context.Context, args []string, o setOpts) error {
 	if err := store().Save(m); err != nil {
 		return err
 	}
-	logf(stdout, "%s: %d cpus, %d MiB, %d GiB, ssh port %d", m.Name, m.CPUs, m.MemoryMiB, m.DiskGiB, m.SSHPort)
+	logf(stdout, "%s: %d cpus, %d MiB, %d GiB, ssh port %d, publishing on %s",
+		m.Name, m.CPUs, m.MemoryMiB, m.DiskGiB, m.SSHPort, forwarder.HostIP(m.PublishAddr))
 	return nil
 }
 
