@@ -547,6 +547,25 @@ With several machines and none named `jailmachine`, `jpodman` cannot pick
 one; the error suggests `JM_MACHINE=<name> jpodman ...`, because this command
 takes no machine-name argument.
 
+**`jpodman compose` is the one argument jm looks at.** `podman compose` is a
+shim: podman hands the work to an external provider on the host (Docker
+Compose, or `podman-compose`) and passes it the connection's URI. Its
+`ssh://` URI would send the provider looking for a docker daemon inside the
+guest, which fails with `docker system dial-stdio … exit status 255`, so a
+`compose` invocation is pointed at the machine's socket connection
+(`<name>-sock`) with `DOCKER_HOST` and `CONTAINER_HOST` set to that unix
+socket. Every other invocation keeps the SSH connection, untouched.
+
+```bash
+jpodman compose up -d
+jpodman kube play pod.yaml     # the FreeBSD-native route, no provider needed
+```
+
+Note that the podman wrapper sets **no** default platform, unlike `jdocker`:
+a Linux image needs `platform: linux/arm64` in the service, or a pre-pull
+with `--os=linux`. See
+[Compose and Kubernetes YAML](#compose-and-kubernetes-yaml).
+
 `jpodman` is a symlink to `jm` — invoked under that name, `jpodman X` runs
 `jm podman X`. The exit code is podman's own.
 
@@ -580,6 +599,14 @@ yourself wins, as does an explicit `--platform`:
 DOCKER_DEFAULT_PLATFORM= jdocker run --rm ghcr.io/freebsd/freebsd-runtime:15.1 uname -srm
 export DOCKER_DEFAULT_PLATFORM=freebsd/arm64   # or pin it for the shell
 ```
+
+**Compose.** Because `DOCKER_HOST` is all the Compose plugin needs,
+`jdocker compose` drives the guest's podman with nothing else to configure —
+including host bind mounts, which resolve because shares sit at identical
+paths. The default platform above applies to compose too, so most Linux
+services come up without a `platform:` line; the full story, and the two
+other routes, are in
+[Compose and Kubernetes YAML](#compose-and-kubernetes-yaml).
 
 Machine selection, argument pass-through, autostart and `--no-autostart`
 behave exactly as for `jm podman`. `jdocker` is a symlink to `jm`; the exit
@@ -750,38 +777,13 @@ jdocker compose up -d
 eval "$(jm env)"             # or point the shell yourself
 docker ps
 docker version               # server: freebsd/arm64/freebsd-15.1
-docker compose up -d         # see below for Linux images
+docker compose up -d         # see Compose and Kubernetes YAML
 ```
 
-**Compose and Linux images.** The guest is a FreeBSD host, so compose pulls
-FreeBSD image variants, and compose has no per-service equivalent of
-`--os=linux`. Under `jdocker` this is usually invisible, because the wrapper
-already defaults `DOCKER_DEFAULT_PLATFORM=linux/arm64`; under a shell pointed
-with `eval "$(jm env)"` and no such variable, a service using a Linux image
-fails at pull time with:
-
-```
-Error response from daemon: no image found in image index for architecture "arm64", variant "", OS "freebsd"
-```
-
-Pre-pull the Linux image and tell compose not to pull again:
-
-```bash
-jpodman pull --os=linux docker.io/busybox
-```
-
-```yaml
-services:
-  web:
-    image: docker.io/busybox
-    pull_policy: missing       # use the linux/arm64 image already in the guest
-    ports: ["8082:80"]
-    command: ["httpd", "-f", "-p", "80"]
-```
-
-With those two lines `docker compose up -d` succeeds, `jm ports` shows the
-mapping as `ok` and the port answers on the Mac. Native FreeBSD images
-(`ghcr.io/freebsd/freebsd-runtime:15.1` and friends) need neither step.
+**Compose has a section of its own.** All three orchestration routes —
+`jdocker compose`, `jpodman compose` and `jpodman kube play` — with full
+examples, the `platform:` / `--os=linux` rule and the healthcheck caveat, are
+in [Compose and Kubernetes YAML](#compose-and-kubernetes-yaml).
 
 This is socket-level compatibility rather than a reimplementation: the docker
 CLI talks to podman's Docker-compatible API, and `jdocker` only sets
@@ -1202,6 +1204,222 @@ than failing the container:
 
 Publish on a free port instead — `-p 5354:53/udp`. The mapping is retried on
 every resync, so freeing the port is enough to make it come up.
+
+---
+
+# Compose and Kubernetes YAML
+
+A multi-container stack reaches a machine by one of three routes. All three
+end at the **same engine** — the guest's podman — and every port they publish
+is reconciled by the **same forwarder**, so `jm ports` explains any of them.
+
+| Route | Needs on the Mac | Pick it when |
+|---|---|---|
+| [`jdocker compose`](#docker-compose-through-jdocker) | the `docker` CLI with the Compose plugin | You already have a `compose.yaml`, and want Docker Desktop's behaviour: host bind mounts, `ports:`, a default platform that is already `linux/arm64` |
+| [`jpodman compose`](#docker-compose-through-jpodman) | `podman`, plus Compose as its external provider | podman is your client and you would rather not point `DOCKER_HOST` at anything by hand |
+| [`jpodman kube play`](#podman-kube-play) | nothing but `podman` | You want the route FreeBSD itself implements — no external provider on the Mac, and the same YAML a FreeBSD server would run |
+
+> **Nothing compose-shaped is installed in the guest.** `podman-compose` is
+> not packaged for FreeBSD, and `podman compose` is a shim that hands the work
+> to a provider running **on your Mac**. `podman kube play` is the one podman
+> implements itself, which is why it is the FreeBSD-native answer — the same
+> conclusion the
+> [freebsd-oauth2-proxy-oci](https://github.com/gabrielbelli/freebsd-oauth2-proxy-oci)
+> image documents for a bare-metal FreeBSD host.
+
+## Docker Compose through `jdocker`
+
+`jm docker` execs the real docker CLI with `DOCKER_HOST` pointing at the
+machine's socket, so `docker compose` drives the guest's podman with nothing
+else to configure (verified with the Docker Compose plugin v5.3.1). Bind mounts work because host directories exist in the
+guest **at the same absolute path** (ADR 0007), so Compose's own path
+expansion — relative sources become absolute host paths — lands on the right
+directory.
+
+```yaml
+# compose.yaml
+services:
+  web:
+    image: docker.io/library/busybox
+    platform: linux/arm64
+    command: ["httpd", "-f", "-p", "80", "-h", "/www"]
+    volumes:
+      - ${HOME}/jm-share-test/compose:/www:ro
+    ports:
+      - "8190:80"
+```
+
+```bash
+mkdir -p ~/jm-share-test/compose
+echo 'served from the Mac' > ~/jm-share-test/compose/index.html
+jdocker compose up -d
+curl --retry 10 --retry-connrefused http://127.0.0.1:8190/   # served from the Mac
+jm ports
+jdocker compose down
+```
+
+The bind source must be inside a shared root (`jm inspect` lists them, and
+`/tmp` is the one path that is not what you think — write
+`/private/tmp/...`). Everything else is ordinary Compose: it is talking to
+podman's Docker-compatible API over a unix socket, not to a translation
+layer.
+
+## Docker Compose through `jpodman`
+
+`podman compose` is a shim: podman looks for an external provider (Docker
+Compose, or `podman-compose`) on the host and passes it the connection's URI.
+Left alone, podman would hand the provider its **`ssh://`** URI, which sends
+Compose looking for a docker daemon inside the guest and fails before
+anything starts:
+
+```
+command [ssh -l root … docker system dial-stdio] has exited with exit status 255
+```
+
+jm answers that in the wrapper: a `compose` invocation is targeted at the
+machine's **socket** connection (`<name>-sock`) instead, with `DOCKER_HOST`
+and `CONTAINER_HOST` set to that unix socket, which is what the provider
+needs. So the plain thing works:
+
+```bash
+jpodman compose up -d
+jpodman compose ps
+jpodman compose down
+```
+
+Only `compose` is treated this way; every other `jpodman` invocation still
+uses the SSH connection, untouched. It needs a network provider that exposes
+an API socket (gvproxy, the default) — without one there is no unix socket to
+hand the provider, and the `ssh://` failure above is what you get.
+
+> **One difference from `jdocker`:** the podman wrapper sets no default
+> platform, so a service using a Linux image needs `platform: linux/arm64` in
+> the file (or a pre-pull — see
+> [Linux images need a platform](#linux-images-need-a-platform)).
+
+## `podman kube play`
+
+The FreeBSD-native route: podman reads a Kubernetes `Pod` (or `Deployment`)
+manifest and runs it, with no provider on the Mac and no compose
+implementation anywhere.
+
+```yaml
+# pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: jm-demo
+spec:
+  containers:
+    - name: web
+      image: docker.io/library/busybox
+      imagePullPolicy: IfNotPresent   # keep the image pulled with --os=linux
+      command: ["sh", "-c"]
+      args: ["echo hello from a pod > /tmp/index.html && httpd -f -p 80 -h /tmp"]
+      ports:
+        - containerPort: 80
+          hostPort: 8191
+```
+
+```bash
+jpodman pull --os=linux docker.io/library/busybox   # Linux image: select the manifest first
+jpodman kube play pod.yaml
+curl --retry 10 --retry-connrefused http://127.0.0.1:8191/   # hello from a pod
+jm ports
+jpodman kube down pod.yaml
+```
+
+A pod needs an **infra container**, whose init process is `catatonit`. The
+guest image installs `sysutils/catatonit` alongside `podman-suite`
+(`guest/provision.sh`), so `kube play` works on a machine created from a
+current image; on an older one, see
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
+`imagePullPolicy` matters here: podman follows Kubernetes' rule that an
+image tagged `:latest`, or tagged not at all, is pulled every time — which
+would ask the registry for the FreeBSD variant again and undo the
+`--os=linux` pull. `IfNotPresent` uses the image already in the guest.
+
+`jpodman kube generate <container|pod>` writes a manifest out of what is
+already running, which is the quickest way to a file that works.
+
+## Linux images need a platform
+
+The guest is a FreeBSD host, so podman there picks **FreeBSD image variants**
+by default. Neither compose nor `kube play` has an `--os` flag, so the choice
+has to be made another way:
+
+| Route | Say it like this |
+|---|---|
+| `jdocker compose` | Nothing, usually: the wrapper defaults `DOCKER_DEFAULT_PLATFORM=linux/arm64`. `platform: linux/arm64` on the service is the explicit, portable spelling |
+| `jpodman compose` | `platform: linux/arm64` on the service |
+| `eval "$(jm env)"; docker compose` | `platform: linux/arm64`, or pre-pull plus `pull_policy: missing` |
+| `jpodman kube play` | `jpodman pull --os=linux <image>` first; the manifest itself cannot ask |
+
+Without it, the pull fails with the OS in the message:
+
+```
+Error response from daemon: no image found in image index for architecture "arm64", variant "", OS "freebsd"
+```
+
+The pre-pull form works for every route — put the image in the guest with the
+platform already chosen, and tell compose not to fetch it again:
+
+```bash
+jpodman pull --os=linux docker.io/library/busybox
+```
+
+```yaml
+services:
+  web:
+    image: docker.io/library/busybox
+    pull_policy: missing       # use the linux/arm64 image already in the guest
+```
+
+Native FreeBSD images (`ghcr.io/freebsd/freebsd-runtime:15.1` and friends)
+need none of this — and under `jdocker` they need
+`DOCKER_DEFAULT_PLATFORM=freebsd/arm64`, or an explicit `platform:`, to
+override the wrapper's default.
+
+## Ports go through the same forwarder
+
+A compose `ports:` entry and a `hostPort:` in a Pod manifest are both just
+published ports on the guest's engine. The detached forwarder watches the
+guest's container state and converges gvproxy's mapping table onto it, so
+they behave exactly like `-p` on `jpodman run`:
+
+```
+# publishing on 0.0.0.0 unless -p names a host address
+LOCAL           REMOTE              PROTO  STATUS
+0.0.0.0:8190    192.168.127.2:8190  tcp    ok
+0.0.0.0:8191    192.168.127.2:8191  tcp    ok
+```
+
+That means the same rules apply: the default host address is the machine's
+publish address (`0.0.0.0` — every interface, including your LAN), the
+mapping appears a second or two after the container starts, and a failure is
+reported per mapping rather than failing the stack. See
+[Publishing ports and `--publish-addr`](#publishing-ports-and---publish-addr).
+
+## Healthchecks and restart policies do not fire
+
+**Anything long-lived started from a compose file or a Pod manifest is
+affected**: podman on FreeBSD has no systemd timers, so a `healthcheck:` /
+`livenessProbe` never runs on a schedule (the status sits at `starting`), and
+`restart: always` applies only at boot, not when a process dies. That is a
+podman-on-FreeBSD gap, not a jm one — a bare-metal FreeBSD container host
+behaves the same way — and it is tracked as
+[#3](https://github.com/gabrielbelli/jailmachine/issues/3).
+
+Run one by hand, or from a cron entry in the guest:
+
+```bash
+jm ssh -- podman healthcheck run web
+jm ssh -- podman ps --format '{{.Names}}  {{.Status}}'
+```
+
+Do not design a stack that depends on the engine restarting a crashed
+container for you until that is fixed.
 
 ---
 

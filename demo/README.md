@@ -83,7 +83,33 @@ Two tabs, identical pages. One is an `x86`/`aarch64` **Linux** ELF binary, the
 other a **FreeBSD** ELF binary. Same kernel, same CPU, same 4 cores.
 
 ```bash
-# 5. Where did the data go?
+# 5. The same image again, this time from a Kubernetes manifest.
+cat > /tmp/jm-demo-pod.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: jm-demo-web
+spec:
+  containers:
+    - name: web
+      image: ghcr.io/gabrielbelli/jm-demo-nginx-linuxulator
+      imagePullPolicy: IfNotPresent   # keep the image pulled with --os=linux above
+      ports:
+        - containerPort: 80
+          hostPort: 8082
+EOF
+jpodman kube play /tmp/jm-demo-pod.yaml
+curl -s --retry 10 --retry-connrefused localhost:8082/whoami.txt
+```
+`podman kube play` is podman's **own** orchestrator: nothing is installed in
+the guest for it, and no compose provider runs on the Mac — which is why it
+is the FreeBSD-native answer to a compose file. The manifest's `hostPort`
+goes through the same forwarder as `-p`, so `jm ports` lists it beside the
+other two. The three orchestration routes are in
+[`docs/USAGE.md`](../docs/USAGE.md#compose-and-kubernetes-yaml).
+
+```bash
+# 6. Where did the data go?
 jpodman run --rm -v jm-demo-data:/data ghcr.io/gabrielbelli/jm-demo-volume
 jpodman run --rm -v jm-demo-data:/data ghcr.io/gabrielbelli/jm-demo-volume   # log grew
 jm ssh -- ls -l /var/db/containers/storage/volumes/jm-demo-data/_data
@@ -92,7 +118,8 @@ The last command is the punchline: the file is on the guest's ZFS pool, and
 `jm ssh` is how you reach it. There is no bind mount from macOS.
 
 ```bash
-# 6. Tidy up.
+# 7. Tidy up.
+jpodman kube down /tmp/jm-demo-pod.yaml
 jpodman rm -f nginx-linux nginx-native
 jpodman volume rm jm-demo-data
 ```

@@ -74,8 +74,12 @@ or pass `--platform`, for native FreeBSD images.
 
 ```bash
 jdocker run --rm docker.io/alpine echo hi
-jdocker compose up -d
+jdocker compose up -d          # a compose.yaml, driving the guest's podman
+jpodman kube play pod.yaml     # or Kubernetes YAML, FreeBSD's native route
 ```
+
+Those two and `jpodman compose` are all covered in
+[Compose and Kubernetes YAML](docs/USAGE.md#compose-and-kubernetes-yaml).
 
 Build a native FreeBSD image:
 
@@ -100,9 +104,9 @@ jpodman rm -f web
 ```
 
 For plain `podman` or a docker client you would rather point yourself:
-`eval "$(jm env)"` (fish: `eval (jm env --shell fish)`). Compose needs one
-extra step for Linux images — see
-[Docker Hub compatibility](#docker-hub-compatibility).
+`eval "$(jm env)"` (fish: `eval (jm env --shell fish)`). A Linux image in a
+compose file or a Pod manifest needs its platform naming — see
+[Compose and Kubernetes YAML](docs/USAGE.md#compose-and-kubernetes-yaml).
 
 ## Sharing host directories
 
