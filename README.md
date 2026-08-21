@@ -163,11 +163,23 @@ jm inspect | grep -i share
 > happens to exist in the guest as well, silently binds the guest's own
 > empty `/tmp/x`.
 
-> **zsh users: quote a `:ro` suffix.** `:ro` at the end of an unquoted word
-> is a history modifier, so `jm set --mount $P:ro` fails with
-> `zsh: no such file or directory` or a bad-modifier error. Write
-> `jm set --mount "${P}:ro"` — and the same for a volume argument,
-> `-v "${P}:${P}:ro"`.
+> **zsh users: brace a `:ro` suffix — quoting does not help.** In zsh, `:ro`
+> at the end of a word carrying a parameter expansion is a *history
+> modifier*: `:r` strips the extension and the `o` is left behind, so both
+> `$P:ro` and `"$P:ro"` become `/Users/you/codeo`. Only braces or a
+> backslash survive:
+>
+> ```bash
+> jm set --mount "${P}:ro"                  # or $P\:ro
+> jpodman run --rm --os=linux -v "${P}:${P}:ro" docker.io/alpine ls "$P"
+> ```
+>
+> Nothing warns you. `jm set --mount $P:ro` on a stopped machine exits `0`
+> and changes nothing: the mangled path falls inside a root that is already
+> shared, so it is absorbed and the `:ro` is lost. The only signal is what is
+> *missing* — no `==> share:` lines and no "attached on the next start"
+> notice, just the machine summary. A correct `"${P}:ro"` prints both. bash
+> is unaffected in every form.
 
 > Shares are for source trees and data. `utimes` is a silent no-op, an
 > `inotify` watch **cannot be created** on a share at all —
@@ -323,7 +335,14 @@ out of MVP scope ([ADR 0006](docs/adr/0006-scope-boundaries.md)).
 jm ssh -- bastille bootstrap 15.1-RELEASE
 jm ssh -- bastille create demo 15.1-RELEASE 10.17.89.10
 jm ssh -- bastille cmd demo pkg install -y curl
+jm ssh -- bastille list all          # "-a" is deprecated in bastille 1.4.4
+jm ssh -- bastille destroy -a -y demo
 ```
+
+> `bastille destroy -f` is *not* the non-interactive form — `-f` only forces
+> unmounting datasets, so the command still prompts and then dies on the
+> empty answer `jm ssh` gives it (`[ERROR]: Invalid input. Please answer 'y'
+> or 'n'`). `-y` is "assume yes" and `-a` stops the jail first.
 
 ## Docker Hub compatibility
 
@@ -352,7 +371,8 @@ The full matrix, both workarounds, and the script that produced it
 | Native FreeBSD OCI images | Works — run and build, e.g. `ghcr.io/freebsd/freebsd-runtime:15.1` |
 | Linux images | Works through the Linuxulator, with `--os=linux` (podman) or the wrapper's default platform (`jdocker`) |
 | Host directory sharing | Works — host paths appear in the guest at the **same absolute path** over 9p; defaults are your home tree, `/Volumes`, `/private/tmp` and `$TMPDIR`'s root. Slow (~70 MB/s), `utimes` is a no-op, an `inotify` watch cannot be created on a share at all, and guest ownership and modes live in host xattrs |
-| Container DNS matching the host | Works — the host's own resolver answers for the guest, so VPN, split-horizon, `/etc/hosts` and `.local` names all match, and the Mac is `host.docker.internal` |
+| Container DNS matching the host | Works for **external** names — the host's own resolver answers for the guest, so VPN, split-horizon, `/etc/hosts` and `.local` names all match, and the Mac is `host.docker.internal` |
+| Resolving another **container** by its name | **No.** The guest's podman uses the CNI backend and `netavark` is not packaged for FreeBSD, so the `podman` network has `dns_enabled: false` and `nc: bad address 'redis'` is what you get. Use a Pod (`localhost`), `network_mode: "service:<name>"`, or `--add-host`/`extra_hosts` ([#5](https://github.com/gabrielbelli/jailmachine/issues/5)) |
 | Autostart | Works on demand: `jpodman` and `jdocker` start a stopped machine. There is deliberately **no** login agent — `JM_AUTOSTART=0` opts out |
 | `docker.io/nginx` (Linux) | Works with **one config line**: `accept_mutex on;` in the `events` block. Stock nginx registers its listening socket with `EPOLLEXCLUSIVE` when `worker_processes > 1`, which FreeBSD's `linux_epoll` rejects. A ready-made image is in [demo/](demo/README.md#the-nginx-finding) |
 | Publishing ports (`-p 8080:80`) | Works — reconciled onto the host by the forwarder, binding every interface by default (`--publish-addr` to change the default) |
@@ -373,7 +393,8 @@ The full matrix, both workarounds, and the script that produced it
 | `start` hangs or fails at a stage | The error names the stage and the log to read; `jm console` shows the guest's serial console (`-f` to follow the boot) |
 | Provisioning failed | `jm ssh -- cat /var/log/jm-provision.log`; the marker `/var/db/jm-provision-failed` means the script aborted |
 | Port not reachable | `jm ports` lists each mapping with its error (host port busy, loopback bind, forwarder down) |
-| `-v` mounts an empty directory, or fails `source path does not exist` | The host path is outside the shared set (`jm inspect`), or you wrote `/tmp/...` instead of `/private/tmp/...` |
+| `-v` fails `source path does not exist`, or mounts an empty directory | The host path is outside the shared set (`jm inspect`), or you wrote `/tmp/...` instead of `/private/tmp/...`. A source that exists nowhere in the guest is an **error**; one that happens to exist there anyway binds the guest's own copy, which looks empty |
+| A container cannot resolve another container by name (`nc: bad address 'redis'`) | Container DNS is off — the guest's podman runs the CNI backend and `netavark` is not packaged for FreeBSD ([#5](https://github.com/gabrielbelli/jailmachine/issues/5)). Put the containers in a **Pod** and use `localhost`, or `network_mode: "service:<name>"`, or `--add-host`/`extra_hosts` |
 | A name resolves on the Mac but not in a container | `jm doctor`, then `resolver.log` |
 | `nc -u -l` in a Linux container says `Address family not supported` | Only busybox's UDP listener is affected — `apk add netcat-openbsd`, or use `socat`. UDP itself works |
 | UDP datagrams over 8972 bytes never arrive | The gvproxy link does not fragment, so its MTU (9000 by default) is a hard ceiling; `jm doctor` states the limit per machine, and `JM_MTU` at `jm start` changes it (576–16384) |
@@ -406,6 +427,7 @@ the Go binary is the product.
 
 ## Documentation
 
+- [docs/tutorials/](docs/tutorials/) — four end-to-end walkthroughs: first container, shared-folder dev loop, a compose/kube stack, and native FreeBSD images and jails
 - [docs/INSTALL.md](docs/INSTALL.md) — install paths, requirements, uninstalling
 - [docs/USAGE.md](docs/USAGE.md) — every command, flag and environment variable
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the pieces fit together
@@ -429,4 +451,5 @@ Tracked, with measurements, in the issue tracker:
 | [#2 UDP datagrams larger than the link MTU are dropped](https://github.com/gabrielbelli/jailmachine/issues/2) | gvproxy does not fragment: the ceiling is 8972 bytes at the default MTU, where Linux delivers 65507. Native FreeBSD containers hit the same wall, so it is the link, not the Linuxulator | `JM_MTU` (576–16384) moves the ceiling; `jm doctor` states it per machine |
 | [#3 Healthchecks never run](https://github.com/gabrielbelli/jailmachine/issues/3) | A podman-on-FreeBSD gap: healthchecks are scheduled with systemd transient timers and there is no systemd, so `--health-interval` never fires and the status sits at `starting` with zero log entries. A bare-metal FreeBSD container host behaves the same. **Restart policies do work** — the issue's title still says otherwise and needs amending | `jm ssh -- podman healthcheck run <name>`, or a cron entry in the guest |
 | [#4 an inotify watch cannot be created on a 9p share, which also runs at ~70 MB/s](https://github.com/gabrielbelli/jailmachine/issues/4) | Not missing events — `inotify_add_watch` on a shared path fails outright with `Bad file descriptor`, so the watch is never created; it works on an engine-managed volume and on the container's own filesystem. Reads are coherent immediately. Metadata is the bigger cost: 1000 small files take **3.6 s** on a share against **0.76 s** on the guest's own disk | Use polling watchers (`CHOKIDAR_USEPOLLING=1`, `nodemon --legacy-watch`, `--watch.usePolling`); keep build output in an engine-managed volume |
+| [#5 containers cannot resolve each other by name](https://github.com/gabrielbelli/jailmachine/issues/5) | A podman-on-FreeBSD gap: the guest runs podman's **CNI** backend because `netavark` is not packaged for FreeBSD, and the CNI `dnsname` plugin is not packaged either, so `podman network inspect podman` reports `dns_enabled: false` and a sibling lookup fails with `nc: bad address 'redis'`. `aardvark-dns` is in the repo but is useless without netavark. This breaks the default shape of most compose files | Put the containers in a **Pod** — they share a network namespace, so `localhost` works, which is what `kube play` gives you. (Podman also writes pod mates' *container* names into `/etc/hosts`, but under `kube play` that is `<pod>-<container>`, not the manifest's `name:` — so use `localhost`.) Otherwise `network_mode: "service:<name>"` in compose, or `extra_hosts`/`--add-host` with the container's bridge IP |
 

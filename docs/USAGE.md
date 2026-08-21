@@ -31,7 +31,9 @@ jpodman run --rm --os=linux docker.io/alpine echo hi
   on the Mac, over 9p (the guest has no virtiofs driver). See
   [Sharing host directories](#sharing-host-directories).
 - Names resolve exactly as they do on the Mac, because the Mac's own resolver
-  answers for the guest. See [Name resolution](#name-resolution).
+  answers for the guest. See [Name resolution](#name-resolution). One
+  exception: a container cannot resolve **another container** by name —
+  see [Containers cannot resolve each other by name](#containers-cannot-resolve-each-other-by-name).
 
 ## Conventions shared by every command
 
@@ -81,7 +83,7 @@ finished steps are skipped and a partial download resumes.
 jm init
 jm init --cpus 2 --memory 2048 dev
 jm init --image official:15.1-RELEASE --disk 32
-jm init --mount /work --mount "/srv/data:ro"       # quote :ro in zsh
+jm init --mount /work --mount "/srv/data:ro"       # in zsh, brace a :ro on a variable
 jm init --no-mounts --publish-addr 127.0.0.1
 ```
 
@@ -428,7 +430,7 @@ jm stop && jm set --cpus 8 --memory 8GiB && jm start
 jm set --disk 128                       # works while running
 jm stop && jm set --mount /work --unmount /Volumes && jm start
 jm stop && jm set --no-mounts && jm start  # drop every share
-jm set --mount "${P}:ro"                # quote the :ro suffix in zsh
+jm set --mount "${P}:ro"                # braces, not quotes — see the zsh note below
 jm set --publish-addr 127.0.0.1
 ```
 
@@ -881,12 +883,21 @@ shares `/private/tmp` and leaves your argument alone:
 
 ```bash
 jpodman run --rm --os=linux -v /private/tmp/x:/app docker.io/alpine ls /app   # yes
-jpodman run --rm --os=linux -v /tmp/x:/app docker.io/alpine ls /app           # empty
+jpodman run --rm --os=linux -v /tmp/x:/app docker.io/alpine ls /app           # no
 ```
 
-The second silently binds the **guest's** own empty `/tmp/x` — no error from
-jm and none from podman. `$TMPDIR` and `mktemp -d` hand out `/var/folders/...`
-paths, which are shared, so those need no thought.
+What the second does depends on whether that path happens to exist **inside
+the guest**, and neither outcome is what you meant:
+
+| In the guest | Result |
+|---|---|
+| `/tmp/x` does not exist | podman refuses to start the container: `Error: OCI runtime error: ocijail: mounting {…}: source path does not exist: /tmp/x (create the directory first)`, exit `126` |
+| `/tmp/x` exists (it is the guest's own temporary directory) | It binds the **guest's** copy, silently — no error from jm and none from podman, and the mount looks empty |
+
+The same two outcomes apply to any `-v` source outside the share set: podman
+never silently invents an empty directory for a path that exists nowhere, it
+errors. `$TMPDIR` and `mktemp -d` hand out `/var/folders/...` paths, which
+are shared, so those need no thought.
 
 ## Changing the set
 
@@ -908,17 +919,46 @@ running one `jm set` refuses with `<name> is running; cpus, memory, the ssh
 port and the shared directories change only on a stopped machine` and exits
 `1`. The new set is attached at the next `jm start`.
 
-> **zsh: quote the `:ro` suffix.** In zsh, `:ro` at the end of an unquoted
-> word is a *history modifier*, so `jm set --mount $P:ro` fails before jm ever
-> sees it (`zsh: no such file or directory`, or a bad-modifier error). Quote
-> the whole value:
+> **zsh: brace the `:ro` suffix. Quoting does not fix it.** In zsh, a `:ro`
+> tacked onto a parameter expansion is a *history modifier* — `:r` strips the
+> extension and the stray `o` is appended to what is left — and double quotes
+> make no difference at all:
+>
+> | You write (`P=/Users/you/code`) | zsh produces | bash produces |
+> |---|---|---|
+> | `$P:ro` | `/Users/you/codeo` | `/Users/you/code:ro` |
+> | `"$P:ro"` | `/Users/you/codeo` | `/Users/you/code:ro` |
+> | `${P}:ro` | `/Users/you/code:ro` | `/Users/you/code:ro` |
+> | `$P\:ro` | `/Users/you/code:ro` | `/Users/you/code:ro` |
+>
+> So use braces (or a backslash), not quotes:
 >
 > ```bash
 > jm set --mount "${P}:ro"
 > jpodman run --rm --os=linux -v "${P}:${P}:ro" docker.io/alpine ls "$P"
 > ```
 >
-> bash is unaffected, but quoting is harmless there.
+> **The `jm set` failure is silent.** `jm set --mount $P:ro` on a stopped
+> machine exits `0` and changes nothing: `/Users/you/codeo` falls inside
+> `/Users/you`, which is already shared, so it is absorbed into that root and
+> the `:ro` is lost. The tell is what is *absent* — the command prints only
+> the machine summary line:
+>
+> ```console
+> $ jm set --mount $P:ro          # zsh, mangled
+> ==> jailmachine: 4 cpus, 4096 MiB, 64 GiB, ssh port 2222, publishing on 0.0.0.0
+>
+> $ jm set --mount "${P}:ro"      # braced, correct
+> ==> share: /Users/you (rw)
+> ==> share: /Users/you/code (ro)
+> ==> share: /Volumes (rw)
+> ...
+> ==> the shared directories are attached on the next start: jm start jailmachine
+> ==> jailmachine: 4 cpus, 4096 MiB, 64 GiB, ssh port 2222, publishing on 0.0.0.0
+> ```
+>
+> If `jm set --mount` prints no `share:` lines, it added nothing. `jm inspect`
+> is the other check — it lists every share with its mode.
 
 ## Modes and ownership on a share
 
@@ -1246,13 +1286,52 @@ is reconciled by the **same forwarder**, so `jm ports` explains any of them.
 | [`jpodman compose`](#docker-compose-through-jpodman) | `podman`, plus Compose as its external provider | podman is your client and you would rather not point `DOCKER_HOST` at anything by hand |
 | [`jpodman kube play`](#podman-kube-play) | nothing but `podman` | You want the route FreeBSD itself implements — no external provider on the Mac, and the same YAML a FreeBSD server would run |
 
-> **Nothing compose-shaped is installed in the guest.** `podman-compose` is
-> not packaged for FreeBSD, and `podman compose` is a shim that hands the work
-> to a provider running **on your Mac**. `podman kube play` is the one podman
-> implements itself, which is why it is the FreeBSD-native answer — the same
-> conclusion the
+> **Nothing compose-shaped is installed in the guest, on purpose.**
+> `py312-podman-compose` *is* packaged for FreeBSD (1.5.0 at the time of
+> writing — `jm ssh -- pkg search -e py312-podman-compose`), but jm does not
+> install it: our compose story is **host-side**. `podman compose` is a shim
+> that hands the work to a provider running on your Mac, and `jdocker
+> compose` uses the Compose plugin you already have. `podman kube play` is
+> the one route podman implements itself, which is why it is the
+> FreeBSD-native answer — the same conclusion the
 > [freebsd-oauth2-proxy-oci](https://github.com/gabrielbelli/freebsd-oauth2-proxy-oci)
 > image documents for a bare-metal FreeBSD host.
+
+## Containers cannot resolve each other by name
+
+**This breaks the default shape of most compose files**, so read it before
+you port one. The guest's podman runs the **CNI** network backend —
+`netavark` is not packaged for FreeBSD, and neither is the CNI `dnsname`
+plugin (`aardvark-dns` is in the package repo, but it is useless without
+netavark). So the default network has DNS switched off:
+
+```console
+$ jm ssh -- podman network inspect podman --format '{{.DNSEnabled}}'
+false
+```
+
+A service that reaches a sibling by its name fails at resolution, not at
+connect:
+
+```
+nc: bad address 'redis'
+```
+
+This is a podman-on-FreeBSD gap, not one of jm's; a bare-metal FreeBSD
+container host behaves the same. Tracked as
+[#5](https://github.com/gabrielbelli/jailmachine/issues/5). Three
+workarounds, all verified on this machine:
+
+| Instead of relying on DNS | Do |
+|---|---|
+| `kube play` | Put the containers in one **Pod**. They share a network namespace, so `localhost:6379` reaches the sibling, and a `kube play` manifest gives you this for free. Pod mates' *container* names go into `/etc/hosts` too, but `kube play` names them `<pod>-<container>` rather than the manifest's `name:` — `localhost` is the spelling that always works |
+| compose | `network_mode: "service:<name>"` on the dependent service — same shared namespace, so again `localhost` |
+| either | `extra_hosts:` (compose) or `--add-host name:IP` (podman) with the sibling's bridge address from `podman inspect <name> --format '{{.NetworkSettings.IPAddress}}'` |
+
+External names are unaffected: the guest resolves through the Mac's own
+resolver, so public names, VPN names, `/etc/hosts` entries and
+`host.containers.internal` all work inside a container. Published ports are
+unaffected too — `ports:`/`-p` still reaches the Mac through jm's forwarder.
 
 ## Docker Compose through `jdocker`
 
@@ -1362,10 +1441,21 @@ guest image installs `sysutils/catatonit` alongside `podman-suite`
 current image; on an older one, see
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
-`imagePullPolicy` matters here: podman follows Kubernetes' rule that an
-image tagged `:latest`, or tagged not at all, is pulled every time — which
+`imagePullPolicy: IfNotPresent` is worth writing down, but not for the reason
+the Kubernetes documentation would suggest. Kubernetes' rule is that an image
+tagged `:latest`, or tagged not at all, is pulled every time — which here
 would ask the registry for the FreeBSD variant again and undo the
-`--os=linux` pull. `IfNotPresent` uses the image already in the guest.
+`--os=linux` pull. **We could not reproduce that with podman 5.8.4 in the
+guest**: a manifest with no `imagePullPolicy` at all reused the local
+`linux/arm64` image and only warned about it —
+
+```
+WARNING: image platform (linux/arm64/v8) does not match the expected platform (freebsd/arm64)
+```
+
+— so the pod came up either way. Write `IfNotPresent` regardless: it is the
+explicit spelling, it costs nothing, and it does not depend on a pull-policy
+default that may differ between podman versions.
 
 `jpodman kube generate <container|pod>` writes a manifest out of what is
 already running, which is the quickest way to a file that works.
@@ -1528,8 +1618,17 @@ jail management (`jm jail ...`) is deliberately out of scope for the MVP.
 jm ssh -- bastille bootstrap 15.1-RELEASE
 jm ssh -- bastille create demo 15.1-RELEASE 10.17.89.10
 jm ssh -- bastille cmd demo pkg install -y curl
-jm ssh -- bastille list
+jm ssh -- bastille list all
+jm ssh -- bastille destroy -a -y demo
 ```
+
+Two flags are easy to get wrong with bastille 1.4.4, which is what the guest
+image ships:
+
+| Wrong | What happens | Right |
+|---|---|---|
+| `bastille list -a` | `[ERROR]: "-a" is deprecated. Use "all" instead.` | `bastille list all` |
+| `bastille destroy -f <jail>` | `-f` only forces mounted datasets to be unmounted, so the command still prompts, and over `jm ssh` there is nothing to answer with: `[ERROR]: Invalid input. Please answer 'y' or 'n'` | `bastille destroy -a -y <jail>` — `-y` assumes yes, `-a` stops the jail first if it is running |
 
 ## Resize the disk
 
@@ -1749,6 +1848,7 @@ and podman machine, in numbers, is [docs/COMPARISON.md](COMPARISON.md).
 
 | Limit | What it looks like / what instead |
 |---|---|
+| Resolving another container by its name | `nc: bad address 'redis'`. The guest's podman runs the CNI backend, `netavark` is not packaged for FreeBSD and neither is the CNI `dnsname` plugin, so `podman network inspect podman` reports `dns_enabled: false`. Use a Pod (`localhost`), `network_mode: "service:<name>"`, or `--add-host`/`extra_hosts`. Published ports are unaffected. See [Containers cannot resolve each other by name](#containers-cannot-resolve-each-other-by-name) and [#5](https://github.com/gabrielbelli/jailmachine/issues/5) |
 | busybox `nc -u -l` in a Linux container | Fails with `Address family not supported by protocol`. It is the only known casualty of FreeBSD returning at once from a zero-length `recvmsg()` where Linux blocks. UDP itself works — `apk add netcat-openbsd`, `socat`, or any real UDP server. See [UDP from a container](#udp-from-a-container) |
 | UDP datagrams over 8972 bytes | Dropped in silence: the gvproxy link does not fragment, and its MTU is 9000 by default. `jm doctor` states the limit per machine, and `JM_MTU` at `jm start` moves it (576–16384; `JM_MTU=1500` is Docker's link size and its 1472-byte cap). Keep datagrams under the limit, or use TCP. See [Datagrams are capped at 8972 bytes](#datagrams-are-capped-at-8972-bytes) |
 

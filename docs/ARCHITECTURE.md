@@ -212,6 +212,17 @@ as a pure forwarder with no cache.
   host answers. An alias round trip proves the alias table only — those names
   never reach the host resolver.
 
+> **Container names are outside this.** Parity is about names the *host* can
+> resolve. Resolving one container from another is the engine's job, and on
+> FreeBSD podman has no way to do it: it runs the CNI backend, `netavark` is
+> not packaged and neither is the CNI `dnsname` plugin, so the default
+> network reports `dns_enabled: false`. Use a Pod, `network_mode:
+> "service:<name>"`, or `--add-host`. Because jm already owns the guest's
+> `local_unbound`, closing this on our side means the forwarder pushing
+> `name -> IP` records into it —
+> [#5](https://github.com/gabrielbelli/jailmachine/issues/5),
+> [LIMITATIONS](LIMITATIONS.md#networking).
+
 > **Never** build with `-tags netgo` or set `GODEBUG=netdns=go`: the pure-Go
 > resolver loses scoped and `.local` names while public ones keep working,
 > which is an invisible regression. On darwin `net/cgo_unix.go` is compiled

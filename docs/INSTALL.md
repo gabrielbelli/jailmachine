@@ -60,12 +60,12 @@ brew install qemu podman
 go install github.com/gabrielbelli/jailmachine/cmd/jm@latest
 ```
 
-A binary installed this way reports the module version it was built from
-(`jm version` shows `0.1.1`, with an empty commit when the module proxy built
-it, or a pseudo-version and a `vcs.revision` when Go built it from a checkout);
-the Homebrew cask and the release archives carry the tag, commit and build date
-from the linker flags instead. `jpodman` and `jdocker` are not created for you: link them yourself (see
-below).
+A binary installed this way carries no linker flags, so it reports whatever
+Go recorded in the build info. See
+[what `jm version` reports](#what-jm-version-reports) for every case — in
+short, `go install …@latest` gives you the released tag, and a `go build` in
+a checkout gives you a pseudo-version, never `dev`. `jpodman` and
+`jdocker` are not created for you: link them yourself (see below).
 
 Then put the Go bin directory on your `PATH` and create the wrapper symlinks
 by hand:
@@ -110,7 +110,7 @@ a one-line fix for anything that is not `[ ok ]`. Real output on a healthy
 Mac with one running machine (2026-08-21):
 
 ```
-jm 0.1.2 (8a20dda, 2026-08-21T18:12:58Z)
+jm 0.1.2-0.20260821181258-8a20dda2181b (8a20dda, 2026-08-21T18:12:58Z)
 
 STATUS  CHECK                        DETAIL
 [ ok ]  host                         darwin/arm64
@@ -140,11 +140,25 @@ STATUS  CHECK                        DETAIL
 23 ok, 0 warning(s), 0 failure(s)
 ```
 
-The first line is the build identity: a Homebrew, release or `make install`
-binary prints its tag, short commit and build date from the linker flags, and
-a `go install` or `go build` from a checkout falls back to the module version
-and the VCS revision Go recorded. `jm dev (none, unknown)` appears only for a
-build that had neither.
+The first line is the build identity. Which form you get depends on how the
+binary was built, and that is the next section.
+
+### What `jm version` reports
+
+`jm` is stamped by the linker where it can be, and falls back to Go's own
+build info where it cannot. There is no fourth case, and `dev` is much rarer
+than it sounds:
+
+| How it was built | `jm version` | Why |
+|---|---|---|
+| Homebrew cask or a release archive | `0.1.2`, with the short commit and the build date | goreleaser passes `-ldflags -X …version.Version={{ .Version }}` |
+| `make install` / `make build` | whatever `git describe --tags --always --dirty` says, e.g. `v0.1.0-8-g52b48d8-dirty` | The `Makefile` stamps the same three variables from git |
+| `go install github.com/gabrielbelli/jailmachine/cmd/jm@latest` | the released tag, e.g. `0.1.2`, with an **empty commit and date** | The module proxy builds it outside a checkout, so `bi.Main.Version` is the tag and there is no `vcs.revision` to record |
+| `go install …@main`, or `go build ./cmd/jm` in a clone | a **pseudo-version**, e.g. `0.1.2-0.20260821181258-8a20dda2181b` (plus `+dirty` on a modified tree), with the short commit and the commit time | Go records `bi.Main.Version` and `vcs.revision`/`vcs.time`; `jm` reads them at start-up |
+| `go build -buildvcs=false`, or a build outside any repository | `dev`, `none`, `unknown` | Nothing was stamped and nothing was recorded. This is the only way to see `dev` |
+
+So a development build reports a pseudo-version, not `dev` — if you see
+`dev`, VCS stamping was switched off.
 
 The `machine …` rows only appear once you have created a machine. Failures
 carry a `fix:` line under the row:
@@ -267,11 +281,12 @@ the guest's `known_hosts` entry and deletes the machine directory, so steps
 interrupted. `rm -rf ~/.jailmachine` is otherwise a complete uninstall of
 all runtime state — nothing is stored anywhere else.
 
-`brew uninstall --cask jailmachine` removes `jm`, but **leaves the `jpodman`
-and `jdocker` symlinks behind**: Homebrew casks have no uninstall hook, so the
-symlink removal lives in the cask's zap stanza. Run
-`brew uninstall --zap --cask jailmachine` (or `brew zap --cask jailmachine`)
-to take it with you, or delete it by hand as in step 2 above.
+`brew uninstall --cask jailmachine` takes the `jpodman` and `jdocker`
+symlinks with it. The cask's post-install hook creates them, and because
+goreleaser's cask hooks have no uninstall phase, the cask carries an
+`uninstall: delete:` stanza naming both — which brew runs on a plain
+`uninstall`. The `zap` stanza lists them too, for zapping a cask whose files
+were already removed by hand, but you do not need `--zap` for this.
 
 Neither `qemu` nor `podman` is removed for you; uninstall them separately if
 nothing else uses them.

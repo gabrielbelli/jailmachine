@@ -93,7 +93,7 @@ spec:
   containers:
     - name: web
       image: ghcr.io/gabrielbelli/jm-demo-nginx-linuxulator
-      imagePullPolicy: IfNotPresent   # keep the image pulled with --os=linux above
+      imagePullPolicy: IfNotPresent   # explicit: use the image already in the guest
       ports:
         - containerPort: 80
           hostPort: 8082
@@ -103,9 +103,14 @@ curl -s --retry 10 --retry-connrefused localhost:8082/whoami.txt
 ```
 `podman kube play` is podman's **own** orchestrator: nothing is installed in
 the guest for it, and no compose provider runs on the Mac — which is why it
-is the FreeBSD-native answer to a compose file. The manifest's `hostPort`
-goes through the same forwarder as `-p`, so `jm ports` lists it beside the
-other two. The three orchestration routes are in
+is the FreeBSD-native answer to a compose file. A Pod is also the way around
+the fact that **containers cannot resolve each other by name** on FreeBSD
+(the guest runs podman's CNI backend and `netavark` is not packaged): pod
+mates share a network namespace, so `localhost` reaches them. See
+[LIMITATIONS](../docs/LIMITATIONS.md#networking) and
+[#5](https://github.com/gabrielbelli/jailmachine/issues/5). The manifest's
+`hostPort` goes through the same forwarder as `-p`, so `jm ports` lists it
+beside the other two. The three orchestration routes are in
 [`docs/USAGE.md`](../docs/USAGE.md#compose-and-kubernetes-yaml).
 
 ```bash

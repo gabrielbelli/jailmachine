@@ -36,4 +36,18 @@ Linux blocks, so it dies with `EAFNOSUPPORT`. Any other UDP server
 (`netcat-openbsd`, `socat`) works. A port published with a host address
 (`-p 127.0.0.1:8080:80`) binds that address on the Mac: the forwarder loads
 an `rdr` rule into the guest's own `rdr/jm` pf anchor to make it so, and
-`jm ports` shows the resulting mapping.
+`jm ports` shows the resulting mapping. A published port is reachable from
+the **Mac**, not from the guest's own loopback — `fetch
+http://127.0.0.1:<published>/` inside the guest times out, while the
+container's bridge address and `host.containers.internal:<published>` both
+work.
+
+Known podman-on-FreeBSD network limit: **containers cannot resolve each
+other by name.** podman here uses the **CNI** backend — `netavark` is not
+packaged for FreeBSD, and neither is the CNI `dnsname` plugin, so
+`podman network inspect podman --format '{{.DNSEnabled}}'` is `false` and a
+sibling lookup fails with `nc: bad address 'redis'`. `aardvark-dns` is in the
+package repo but does nothing without netavark. Use a Pod (pod mates share a
+network namespace and land in each other's `/etc/hosts`), compose's
+`network_mode: "service:<name>"`, or `--add-host`. Tracked as
+[#5](https://github.com/gabrielbelli/jailmachine/issues/5).

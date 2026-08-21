@@ -344,11 +344,14 @@ Three build-time limitations, jailmachine only:
 
 **No multi-container stack was run in this comparison.** What is measured is
 the supervision behaviour underneath one, and it is the strongest reason not
-to run a stack on jailmachine yet.
+to run a stack on jailmachine yet. One row was measured on jailmachine
+afterwards, while the tutorials were written, and is marked as not
+re-measured on the other two: container-to-container name resolution.
 
 | | jailmachine | podman machine | Docker Desktop |
 |---|---|---|---|
-| `docker compose` / `podman compose` | Works through `jdocker compose` / `jpodman compose` — the provider runs **on the Mac** and drives the guest's podman over `DOCKER_HOST`. Nothing compose-shaped is installed in the guest, because `podman-compose` is not packaged for FreeBSD | Native | Native, bundled |
+| `docker compose` / `podman compose` | Works through `jdocker compose` / `jpodman compose` — the provider runs **on the Mac** and drives the guest's podman over `DOCKER_HOST`. Nothing compose-shaped is installed in the guest, by choice rather than necessity: `py312-podman-compose` 1.5.0 *is* packaged for FreeBSD, but jm's compose story is host-side | Native | Native, bundled |
+| **Container name resolution between services** | **Does not work.** `nc: bad address 'redis'`; `podman network inspect podman --format '{{.DNSEnabled}}'` prints `false`. The guest runs podman's CNI backend — `netavark` is not packaged for FreeBSD, nor is the CNI `dnsname` plugin — so the default `depends_on` + `host: redis` shape of most compose files needs rewriting: a Pod (`localhost`), `network_mode: "service:<name>"`, or `extra_hosts`. Podman-on-FreeBSD's gap, not jm's ([#5](https://github.com/gabrielbelli/jailmachine/issues/5)) | Works — netavark + aardvark-dns, on by default (not re-measured here) | Works — the embedded DNS server on any user-defined network (not re-measured here) |
 | `podman kube play` | Works — the route podman implements itself, and the FreeBSD-native answer | Works | n/a |
 | Healthchecks | **Never fire.** `--health-cmd true --health-interval 2s`: after 20 s, status still `starting`, 0 log entries. `podman healthcheck run <name>` by hand returns `healthy` immediately | Work | Work |
 | Restart policies | **They work**: `--restart=always` on a container exiting 3 every 2 s took `RestartCount` 2→4→6→9→10 over 25 s; `--restart=on-failure:3` stopped at exactly 3; across `jm stop` + `jm start`, `always` came back `Up` while a `no` control stayed `Exited (143)`. The docs said otherwise and have been corrected | Work | Work |
@@ -384,7 +387,7 @@ no row to fill in for them.
 |---|---|---|---|
 | Native FreeBSD OCI images | **Works, no flag.** `ghcr.io/freebsd/freebsd-runtime:15.1` and `:14.3`, `dougrabson/freebsd15-minimal` and the project's own demo images all ran; `security.jail.jailed=1` inside | Impossible | Impossible |
 | Build a FreeBSD image (`pkg install` in a `Containerfile`) | Works | Impossible | Impossible |
-| `bastille` jails | Installed and configured in the guest (ZFS, `bastille0` loopback, NAT through `pf`), driven with `jm ssh -- bastille …`. **Not exercised in this comparison** | Impossible | Impossible |
+| `bastille` jails | Installed and configured in the guest (ZFS, `bastille0` loopback, NAT through `pf`), driven with `jm ssh -- bastille …` (`bastille list all` — `-a` is deprecated in 1.4.4; `bastille destroy -a -y <jail>` is the non-interactive removal, not `-f`). **Not exercised in this comparison** | Impossible | Impossible |
 | Host-side jail management (`jm jail …`) | Not implemented, deliberately out of MVP scope ([ADR 0006](adr/0006-scope-boundaries.md)) | — | — |
 
 Two honest qualifications. First, jails were **not run** during these
@@ -423,7 +426,7 @@ same job without jailmachine.
 | **Native FreeBSD OCI images and jails on a Mac** | Six FreeBSD images ran, including builds; the other two cannot do this at any speed. This is the entire reason the project exists |
 | **DNS that matches the Mac** | The only one of the three that turns a host `127.0.0.1` answer into an address a container can reach, and the only one that refuses to echo a `0.0.0.0` sinkhole. Hosts entries and mDNS names all resolve inside a container |
 | **One binary, no daemon, no login agent** | 6 host processes and 196 MiB idle against Docker Desktop's 12 and 1695 MiB; `rm -rf ~/.jailmachine` is a complete uninstall |
-| **Honest, inspectable plumbing** | `jm ports` reports a per-mapping error; `jm doctor` runs 23 checks with a fix per failure; `--publish-addr` is a machine property, so what binds your LAN is visible in `jm inspect` rather than implied by the shell that booted the machine |
+| **Honest, inspectable plumbing** | `jm ports` reports a per-mapping error; `jm doctor` checks every host tool and every machine, with a fix per failure; `--publish-addr` is a machine property, so what binds your LAN is visible in `jm inspect` rather than implied by the shell that booted the machine |
 | **Bind mounts at the identity path** | `-v ~/code:/app` and `-v ~/code:"$HOME/code"` both work from any directory, with no `/host_mnt` prefix and no argument rewriting — slow, but correct |
 
 ## Where it loses

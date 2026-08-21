@@ -56,9 +56,12 @@ machine. Note that it inspects the default state root
 | `docker compose up` → `no image found in image index for … OS "freebsd"` | Compose cannot ask for a platform, and the guest is FreeBSD | `jpodman pull --os=linux <image>` first, then `pull_policy: missing` on the service — or `platform: linux/arm64` on it. See [Compose and Kubernetes YAML](USAGE.md#compose-and-kubernetes-yaml) |
 | `jpodman compose …` → `command [ssh -l root … docker system dial-stdio] has exited with exit status 255` | podman's compose shim handed the external provider the machine's `ssh://` URI, so Compose went looking for a docker daemon **inside** the guest | Nothing on a current jm: a `compose` invocation is targeted at the machine's socket connection (`<name>-sock`) with `DOCKER_HOST` set to it. On an older binary, use `jdocker compose …`, or `eval "$(jm env)"` then `docker compose …`. See [Compose and Kubernetes YAML](USAGE.md#compose-and-kubernetes-yaml) |
 | `jpodman kube play` fails with an error naming `catatonit` | A pod's infra container needs `catatonit` as its init, and the guest image predates the package | `jm ssh -- pkg install -y catatonit`, or re-create the machine on a current image (`jm rm && jm init && jm start`), which installs it with `podman-suite` |
-| `-v /Users/me/src:/app` mounts an empty directory | The host path is outside the machine's share set, or it is under `/tmp` | `jm inspect` lists the shares; write `/private/tmp/...` not `/tmp/...`; add a root with `jm stop && jm set --mount <dir> && jm start`. See *a share is empty* below |
+| `-v /Users/me/src:/app` mounts an empty directory | The host path is outside the machine's share set, or it is under `/tmp`, **and** the same path happens to exist inside the guest — so the guest's own copy is bound | `jm inspect` lists the shares; write `/private/tmp/...` not `/tmp/...`; add a root with `jm stop && jm set --mount <dir> && jm start`. See *a share is empty* below |
+| `Error: OCI runtime error: ocijail: mounting {…}: source path does not exist: /x (create the directory first)`, exit `126` | The same cause, but the path exists nowhere in the guest either. podman does **not** invent an empty directory for a `-v` source it cannot find | As above. This, not an empty mount, is the usual outcome of a `-v` source outside the share set |
 | `Permission denied` writing inside a shared directory, or `git clone` into one dies with `Unable to create temporary file '….git/objects/pack/tmp_pack_XXXXXX'` | The machine was started with `JM_9P_SECURITY=none`, where the host end of the share acts as your unprivileged Mac user and cannot rewrite a file the container has just made read-only | Drop the override (the default is `mapped-xattr`) and `jm stop && jm start`. See *permission denied writing to a share* below |
-| `zsh: no such file or directory` from `jm set --mount $P:ro` | zsh reads a trailing `:ro` as a history modifier | Quote it: `jm set --mount "${P}:ro"`, and `-v "${P}:${P}:ro"` |
+| `jm set --mount $P:ro` prints nothing and adds no read-only share | zsh mangled the argument to `/Users/you/codeo` before jm saw it (`:ro` is a history modifier), and that path fell inside an already-shared root, so it was absorbed silently | **Braces, not quotes** — `"$P:ro"` is mangled too. `jm set --mount "${P}:ro"`, and `-v "${P}:${P}:ro"`. See *zsh eats a trailing `:ro`* below |
+| A container cannot reach another container by name — `nc: bad address 'redis'`, `getaddrinfo` / `EAI_NONAME` | Container DNS is off: the guest's podman uses the CNI backend, `netavark` is not packaged for FreeBSD and neither is the CNI `dnsname` plugin | Put them in a Pod and use `localhost`, or `network_mode: "service:<name>"`, or `--add-host`/`extra_hosts`. See *containers cannot resolve each other by name* below |
+| A published port works from the Mac but times out from inside the guest | `fetch http://127.0.0.1:<published>/` in the guest never completes; the CNI portmap redirect does not apply to the guest's own loopback | Use the container's bridge address, or `host.containers.internal:<published>`. See *a published port is not reachable from the guest* below |
 | A name resolves on the Mac but not in a container | The host resolver is down, or the guest was not pointed at it | `jm doctor`, then `resolver.log`. See *names do not resolve* below |
 | UDP datagrams over 8972 bytes never arrive | The gvproxy link does not fragment, and its MTU is 9000 by default | Keep datagrams under 8972 bytes, or use TCP; `jm doctor` states the limit, and `JM_MTU` at `jm start` moves it. See *UDP in a Linux container* below |
 | `nc -u -l` in a Linux container → `Address family not supported by protocol` | busybox's UDP listener peeks its peer with a zero-length `recvmsg()`, which returns at once on FreeBSD where Linux blocks | `apk add netcat-openbsd`, or `socat UDP4-RECVFROM:…`. UDP itself works; see *UDP in a Linux container* below |
@@ -236,15 +239,151 @@ without changing anything machine-wide, as it does under Docker Desktop.
 | The port answers on `localhost` but you did not expect it on the LAN | A plain `-p` binds `0.0.0.0` by default, as `docker run -p` does on Linux | `-p 127.0.0.1:8080:80` for that container, or `jm set --publish-addr 127.0.0.1` for the machine |
 | nothing at all | The container is not running, or publishes no ports | `jpodman ps` |
 
-> Inside the guest, `curl localhost:<published port>` answers nothing even
-> when the mapping works: the engine's own port reservation socket wins over
-> the redirect for guest-local traffic. Test from the Mac, not from
-> `jm ssh`.
+> A published port is reachable from the **Mac**, not from the guest's own
+> loopback. Test from the Mac, not from `jm ssh` — see
+> [a published port is not reachable from the guest](#a-published-port-is-not-reachable-from-the-guest)
+> for the alternatives that do work inside the guest.
 
 Mappings a container should have but the table lacks usually mean the
 forwarder cannot reach the engine; `forwarder.log` records every `podman ps`
 error. The forwarder only ever removes mappings it owns (tracked in
 `forwards.json`), so a restart rebuilds rather than loses the table.
+
+## A published port is not reachable from the guest
+
+`-p 8080:80` makes the container answer on the **Mac**. Inside the guest it
+does not, and the failure is a timeout rather than a refusal, so it looks
+like the container is broken when it is not.
+
+Measured on a running machine with one container published as `-p 18080:80`:
+
+| From | To | Result |
+|---|---|---|
+| the Mac | `http://127.0.0.1:18080/` | **200** — jm's forwarder is listening there |
+| the guest | `http://127.0.0.1:18080/` | `fetch: transfer timed out` |
+| the guest | `http://192.168.127.2:18080/` (its own address) | `fetch: transfer timed out` |
+| the guest | `http://<container bridge IP>:80/` | **works** |
+| the guest | `http://host.containers.internal:18080/` | **works** — out to the Mac's forwarder and back in |
+| another container | either of the last two | **works** |
+
+The CNI portmap plugin does install the redirect. Each published container
+gets its own anchor under `cni-rdr`, and the rule for the loopback is right
+there:
+
+```console
+$ jm ssh -- pfctl -a cni-rdr -s Anchors
+  cni-rdr/e656db1ca1987eaa7b414a6fbdf040f5
+$ jm ssh -- pfctl -a cni-rdr/e656db1ca1987eaa7b414a6fbdf040f5 -sn
+nat on cni-podman0 inet proto tcp from (lo0) to 10.88.0.13 port = http -> (cni-podman0) round-robin
+rdr pass inet proto tcp from any to 192.168.127.2 port = 18080 -> 10.88.0.13 port 80
+rdr pass inet proto tcp from any to 127.0.0.1 port = 18080 -> 10.88.0.13 port 80
+rdr pass inet proto tcp from any to 10.88.0.1 port = 18080 -> 10.88.0.13 port 80
+```
+
+It simply does not take effect for traffic the guest originates itself. This
+is podman-on-FreeBSD behaviour, not something jm installs or can undo from
+the host. (`pfctl -a 'cni-rdr/*' -sn` prints nothing — the anchor path has to
+be named in full, hence the two commands.)
+
+Use one of the two addresses that work:
+
+```bash
+# the container's own bridge address
+jpodman inspect <name> --format '{{.NetworkSettings.IPAddress}}'
+
+# or go back out through the Mac, from inside the guest
+jm ssh -- fetch -o - http://host.containers.internal:18080/
+```
+
+### It bites hardest with a registry in a container
+
+Pushing to a registry container is the common case, because the push is run
+by the **guest's** podman even when you typed `jpodman` on the Mac:
+
+```bash
+jpodman run -d --name reg -p 5555:5000 --os=linux docker.io/library/registry:2
+
+jpodman push --tls-verify=false localhost:5555/x:1                  # hangs
+jpodman push --tls-verify=false host.containers.internal:5555/x:1   # works
+```
+
+A registry name is part of the tag, so tag for the name you are going to push
+to — `jpodman tag <image> host.containers.internal:5555/x:1` — before
+pushing. The registry's own bridge address works just as well and does not
+leave the guest. Either way, `curl http://127.0.0.1:5555/v2/_catalog` from
+the Mac confirms what landed.
+
+> **Do not use host port 5000 on macOS.** AirPlay Receiver (`ControlCenter`)
+> listens on `*:5000` and answers every request with `403`, which reads like
+> a registry authentication failure:
+> `pinging container registry …: StatusCode: 403, ""`. `lsof -nP -iTCP:5000
+> -sTCP:LISTEN` names it. Publish the registry on another host port, or turn
+> AirPlay Receiver off in System Settings.
+
+## Containers cannot resolve each other by name
+
+```
+nc: bad address 'redis'
+```
+
+Container-to-container DNS does not work. The guest's podman runs the **CNI**
+network backend, and the pieces that would provide names are not there:
+`netavark` is not packaged for FreeBSD, the CNI `dnsname` plugin is not
+packaged either, and `aardvark-dns` — which *is* in the package repo — is
+useless without netavark. So the default network has DNS switched off:
+
+```console
+$ jm ssh -- podman network inspect podman --format '{{.DNSEnabled}}'
+false
+$ jm ssh -- ls /usr/local/libexec/cni/
+bridge
+firewall
+host-local
+loopback
+portmap
+static
+tuning
+```
+
+This is a **podman-on-FreeBSD** gap, not one of jm's: a bare-metal FreeBSD
+container host behaves the same way. Tracked as
+[#5](https://github.com/gabrielbelli/jailmachine/issues/5), which also
+sketches the fix — jm's resolver already owns name resolution for the guest,
+so it could push `name -> IP` records into the guest's `local_unbound` as the
+forwarder sees containers come and go.
+
+External names are unaffected — the guest resolves through the host's own
+resolver, so public names, VPN names, `/etc/hosts` and `host.containers.internal`
+all work inside a container. It is only sibling *container* names that fail.
+
+Three workarounds, all verified:
+
+| Approach | How | Notes |
+|---|---|---|
+| A **Pod** | `jpodman pod create --name app`, then `--pod app` on each container | They share one network namespace, so `localhost:6379` reaches the sibling. Podman also writes each pod mate's **container** name into `/etc/hosts`, so `--name redis` makes `redis` resolve — but `podman kube play` names containers `<pod>-<container>`, so there the manifest's bare `name:` does *not* resolve and `localhost` is what you want. `kube play` gives you the pod for nothing |
+| Shared namespace in compose | `network_mode: "service:<name>"` on the dependent service | Same mechanism as a Pod: `localhost` |
+| Static hosts entries | `--add-host redis:10.88.0.7` (podman) or `extra_hosts:` (compose) | Needs the sibling's bridge address — `jpodman inspect redis --format '{{.NetworkSettings.IPAddress}}'` — which changes when it is re-created |
+
+```bash
+# pod route, end to end
+jpodman pod create --name app
+jpodman run -d --pod app --name redis --os=linux docker.io/library/redis:alpine \
+  redis-server --ignore-warnings ARM64-COW-BUG
+jpodman run --rm --pod app --os=linux docker.io/library/alpine nc -z localhost 6379
+jpodman run --rm --pod app --os=linux docker.io/library/alpine nc -z redis 6379
+jpodman pod rm -f app
+```
+
+Both `nc` calls exit `0`. `localhost` works because the pod mates share one
+network namespace; `redis` works because podman wrote the *container* name
+into `/etc/hosts`. Outside a pod, neither does. Prefer `localhost` — it does
+not depend on what the containers were called, which matters under `kube
+play`, where they are named `<pod>-<container>`.
+
+Published ports are not affected by any of this: `ports:`/`-p` still reaches
+the Mac through jm's forwarder. The compose-shaped version of this, with the
+YAML, is
+[USAGE: containers cannot resolve each other by name](USAGE.md#containers-cannot-resolve-each-other-by-name).
 
 ## Linux images under the Linuxulator
 
@@ -464,8 +603,20 @@ mapping is retried every resync, so freeing the port is enough.
 ## A share is empty, or a `-v` mounts nothing
 
 Host directories appear in the guest **at the same absolute path** they have
-on the Mac, so `-v /Users/me/src:/app` works from anywhere. When it mounts an
-empty directory instead, it is one of four things:
+on the Mac, so `-v /Users/me/src:/app` works from anywhere.
+
+A `-v` source that is not shared usually **errors** rather than mounting
+anything:
+
+```
+Error: OCI runtime error: ocijail: mounting {…}: source path does not exist:
+/Users/me/src (create the directory first)
+```
+
+podman does not invent an empty directory for a path it cannot find. You only
+get a silently empty mount when that absolute path happens to exist inside
+the guest as well — `/tmp/...` and `/usr/local/...` are the ones that catch
+people. Either way it is one of four things:
 
 ```bash
 jm inspect | grep -i share    # what is actually shared
@@ -482,7 +633,7 @@ jm doctor                     # writes a host file and asserts a container sees 
 A share whose *guest* mount failed is logged rather than fatal — the machine
 boots regardless — so `jm doctor` and `jm start`'s warnings are what tell you.
 
-Two more things that look like bugs and are not:
+Three more things that look like bugs and are not:
 
 - **`utimes` is a silent no-op** on a 9p share, and guest-side ownership and
   modes live in host xattrs rather than on the host file. A build that sets
@@ -496,9 +647,25 @@ Two more things that look like bugs and are not:
   ([#4](https://github.com/gabrielbelli/jailmachine/issues/4)). Reads are
   coherent immediately, so a polling watcher works —
   `CHOKIDAR_USEPOLLING=1`, `nodemon --legacy-watch`, `--watch.usePolling`.
-- **zsh eats a trailing `:ro`.** `jm set --mount $P:ro` and
-  `-v $P:$P:ro` fail before the command runs, because zsh reads `:ro` as a
-  history modifier. Quote the whole value: `"${P}:ro"`, `"${P}:${P}:ro"`.
+- **zsh eats a trailing `:ro`, and quoting does not save you.** zsh reads
+  `:ro` on a parameter expansion as a *history modifier*: `:r` strips the
+  extension, the `o` is left over, and `$P:ro` **and** `"$P:ro"` both come
+  out as `/Users/you/codeo`. Only `${P}:ro` or `$P\:ro` survive; bash is
+  unaffected in all four forms.
+
+  Worse, via `jm set` the failure is **silent**. `jm set --mount $P:ro` on a
+  stopped machine exits `0` and adds nothing: the mangled path falls inside
+  `/Users/you`, which is already shared, so it is absorbed into that root and
+  the `:ro` is dropped. The only tell is the *absence* of output — a
+  `--mount` that took effect prints one `==> share:` line per root and
+  `==> the shared directories are attached on the next start`, while the
+  mangled call prints just the machine summary. `jm inspect` lists every
+  share with its mode, so check it after adding a read-only root.
+
+  ```bash
+  jm set --mount "${P}:ro"                                   # correct
+  jpodman run --rm --os=linux -v "${P}:${P}:ro" docker.io/alpine ls "$P"
+  ```
 
 ## Permission denied writing to a share, or `git clone` fails in one
 
