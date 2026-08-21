@@ -3,7 +3,9 @@ name: demo-images
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    # Every branch, not only main: a demo image or this workflow breaking is
+    # something to find on the branch that broke it, not after the merge.
+    branches: ["**"]
     paths:
       - 'demo/**'
       - '.github/workflows/demo-images.yml'
