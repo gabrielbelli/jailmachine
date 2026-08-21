@@ -86,9 +86,17 @@ jobs:
   # needed. This is what stops a release.yml change from being discovered
   # only when a tag is pushed, which is how the v0.1.0 release broke.
   release-dry-run:
-    uses: ./.github/workflows/release.yml
+    # Skipped for pull requests from forks: their GITHUB_TOKEN is capped at
+    # read, and a caller that grants less than the called workflow requests
+    # is a startup failure ("is requesting 'contents: write', but is only
+    # allowed 'contents: read'"), not a skipped job.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # release.yml declares contents:write because a real release creates one.
+    # A reusable workflow may not request more than its caller grants, so the
+    # grant is repeated here even though dry_run publishes nothing.
     permissions:
-      contents: read
+      contents: write
+    uses: ./.github/workflows/release.yml
     with:
       dry_run: true
     secrets: inherit
