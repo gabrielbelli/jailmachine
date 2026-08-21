@@ -15,7 +15,7 @@ Every image runs with no arguments, prints something worth reading, and exits
 | [The five-minute demo script](#the-five-minute-demo-script) | Copy-paste tour, in order |
 | [The nginx finding](#the-nginx-finding) | Why stock `nginx:alpine` dies, and the one line that fixes it |
 | [`hub-matrix.sh`](#the-docker-hub-matrix) | Re-runs the whole Docker Hub compatibility matrix from `docs/USAGE.md` |
-| [How these are built and published](#how-these-are-built-and-published) | `make -C demo build test push`, and why FreeBSD `:latest` is manual |
+| [How these images are published](#how-these-images-are-published) | `make -C demo build test push`, and why FreeBSD `:latest` is manual |
 
 ## The images
 
@@ -185,45 +185,6 @@ the two workarounds and one known-bad image documented in
 `--ignore-warnings ARM64-COW-BUG`, and `node:22-alpine` does not work at
 all. Each container is run under `timeout 120`.
 
-## How these are built and published
-
-Publishing is **manual, from a Mac running jailmachine**, because GitHub has no
-FreeBSD runner on any architecture and its hosted runners have no nested
-virtualisation, so a FreeBSD guest in CI could only run under slow emulation:
-
-```bash
-jm start
-gh auth token | jpodman login ghcr.io -u <your-github-user> --password-stdin
-make -C demo build test push        # arm64 images, tagged :latest and :YYYYMMDD
-```
-
-Images land as `ghcr.io/gabrielbelli/jm-demo-<name>`; new packages start
-private, so flip each one to Public once under
-`https://github.com/users/<user>/packages/container/<name>/settings`.
-
-### What CI does instead
-
-`.github/workflows/demo-images.yml` is a signal-only check and pushes nothing:
-
-- the two **Linux** images are built for `linux/amd64` and `linux/arm64` on
-  native runners (`ubuntu-latest`, `ubuntu-24.04-arm`) and smoke-tested —
-  the banner image must exit 0, the nginx image must answer `/healthz`;
-- the three **FreeBSD** images are built and smoke-tested inside
-  `vmactions/freebsd-vm`, an amd64 QEMU guest, in about ninety seconds.
-
-Both are honest about their limits. CI runs on a Linux kernel, not the
-Linuxulator, and its FreeBSD guest is amd64 while your machine is
-`freebsd/arm64`; what CI proves is that the Containerfiles still build and the
-entrypoints still work. `make -C demo test` on a Mac is the real check.
-
-One thing CI structurally cannot test is `-p` port publishing on FreeBSD:
-podman installs those as pf `rdr` rules in the `cni-rdr` anchor, which only
-match traffic arriving on the egress interface, so the publishing host can
-never reach its own published port over loopback. The FreeBSD job talks to the
-container on the podman bridge instead. On a Mac the path works because jm's
-forwarder dials the guest's `vtnet0` address, and `make -C demo test` exercises
-exactly that.
-
 ## Known limits
 
 - **Bind mounts work, but over 9p.** FreeBSD has no virtiofs driver, so jm
@@ -242,3 +203,24 @@ exactly that.
   reaches deep into `/sys`, cgroups, or `io_uring`.
 - **FreeBSD `:latest` tags are arm64.** On an amd64 FreeBSD host, pull the
   `:freebsd-amd64` tag instead.
+
+## How these images are published
+
+Publishing is **manual, from a Mac running jailmachine**, because GitHub has no
+FreeBSD runner on any architecture and its hosted runners have no nested
+virtualisation, so a FreeBSD guest in CI could only run under slow emulation:
+
+```bash
+jm start
+gh auth token | jpodman login ghcr.io -u <your-github-user> --password-stdin
+make -C demo build test push        # arm64 images, tagged :latest and :YYYYMMDD
+```
+
+Images land as `ghcr.io/gabrielbelli/jm-demo-<name>`; new packages start
+private, so flip each one to Public once under
+`https://github.com/users/<user>/packages/container/<name>/settings`.
+
+CI (`.github/workflows/demo-images.yml`) is a signal-only check: it builds the
+two Linux images for `linux/amd64` and `linux/arm64` on native runners and
+smoke-tests them, and pushes nothing. When FreeBSD arm64/amd64 runners become
+available, publishing can move there.

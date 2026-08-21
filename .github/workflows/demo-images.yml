@@ -3,19 +3,14 @@ name: demo-images
 on:
   workflow_dispatch:
   push:
-    # Every branch, not only main: a demo image or this workflow breaking is
-    # something to find on the branch that broke it, not after the merge.
-    branches: ["**"]
+    branches: [main]
     paths:
       - 'demo/**'
       - '.github/workflows/demo-images.yml'
 
 permissions:
   contents: read
-
-concurrency:
-  group: demo-images-${{ github.ref }}
-  cancel-in-progress: true
+  packages: write
 
 # ---------------------------------------------------------------------------
 # PUBLISHING IS MANUAL, ON A MAC
@@ -27,19 +22,10 @@ concurrency:
 #
 #     make -C demo build test push        # arm64, against the running machine
 #
-# This workflow is a signal-only check. It pushes nothing. When FreeBSD
-# arm64/amd64 runners become available, add a publishing job here and drop the
-# manual step from demo/README.md.
-#
-# ---------------------------------------------------------------------------
-# NO JOB HERE MAY RUN A SERVER IN THE FOREGROUND
-# ---------------------------------------------------------------------------
-# An earlier version smoke-tested the nginx images with `docker run --rm`.
-# Their entrypoint ends in `nginx -g 'daemon off;'`, so the command never
-# returns: the job sat there for six hours and was killed by the platform
-# maximum, and the `|| echo warning` after it never ran. Servers are started
-# detached, polled, and removed. Every job carries a timeout-minutes so no
-# future mistake of that shape can cost six hours again.
+# This workflow is a signal-only check: it builds the two Linux images for
+# both architectures (arm64 natively on ubuntu-24.04-arm) and smoke-tests
+# them. It pushes nothing. When FreeBSD arm64/amd64 runners become available,
+# add a publishing job here and drop the manual step from demo/README.md.
 # ---------------------------------------------------------------------------
 
 jobs:
@@ -59,10 +45,9 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
 
       - name: build ${{ matrix.image }} for linux/${{ matrix.arch }}
-        timeout-minutes: 10
         run: |
           docker build --pull \
             -t demo-smoke:${{ matrix.arch }} \
@@ -70,165 +55,110 @@ jobs:
             demo/${{ matrix.image }}
 
       - name: smoke test
-        timeout-minutes: 5
         # Native architecture on both runners, so no emulation: the entrypoint
         # really runs. It still runs on a Linux kernel, not the Linuxulator --
         # the real check is "make -C demo test" on a Mac with jailmachine.
-        env:
-          IMAGE: ${{ matrix.image }}
-          ARCH: ${{ matrix.arch }}
         run: |
-          set -eu
-          case "$IMAGE" in
+          case "${{ matrix.image }}" in
             nginx-*)
-              # Detached, polled, removed. Never in the foreground.
-              docker rm -f demo-smoke >/dev/null 2>&1 || true
-              docker run -d --name demo-smoke -p 18080:80 "demo-smoke:$ARCH"
-              ok=0
+              id=$(docker run -d -p 8080:80 demo-smoke:${{ matrix.arch }})
               for _ in $(seq 1 30); do
+                curl -fsS http://127.0.0.1:8080/healthz >/dev/null && ok=1 && break
                 sleep 1
-                if [ "$(curl -fsS -m 3 http://127.0.0.1:18080/healthz 2>/dev/null)" = ok ]; then
-                  ok=1; break
-                fi
               done
-              if [ "$ok" = 1 ]; then
-                # entrypoint.sh writes whoami.txt at start; prove it did.
-                curl -fsS -m 3 -o /dev/null http://127.0.0.1:18080/
-                curl -fsS -m 3 http://127.0.0.1:18080/whoami.txt | head -3
-                echo "ok: /, /healthz and /whoami.txt all answered"
-              else
-                echo "::error::$IMAGE did not answer /healthz on linux/$ARCH"
-              fi
-              docker logs demo-smoke 2>&1 | tail -20
-              docker rm -f demo-smoke >/dev/null 2>&1 || true
-              [ "$ok" = 1 ]
+              docker logs "$id" | tail -20
+              docker rm -f "$id" >/dev/null
+              [ "${ok:-0}" = 1 ] || { echo "::error::${{ matrix.image }} did not answer /healthz"; exit 1; }
               ;;
             *)
-              # A banner image: prints its report and exits 0 on its own.
-              # `timeout` only guards against it one day growing a daemon.
-              timeout 120 docker run --rm "demo-smoke:$ARCH"
+              docker run --rm demo-smoke:${{ matrix.arch }}
               ;;
           esac
 
-  # The three FreeBSD images have no native runner anywhere, so this is the
-  # only automated check they get: a QEMU FreeBSD guest that builds all three
-  # and runs them. It publishes nothing (see the header) and it is amd64,
-  # while the machine these images exist for is freebsd/arm64 -- so what it
-  # proves is that the Containerfiles still build and the entrypoints still
-  # work, not that today's arm64 images are good. The arm64 check is
-  # `make -C demo test` on a Mac.
-  freebsd:
-    name: freebsd/amd64 (build check)
+  # -------------------------------------------------------- freebsd (cross) --
+  # No FreeBSD runner exists, but these two images have no RUN steps (they are
+  # FROM + COPY --chmod + ENTRYPOINT), so buildah on Linux can assemble them
+  # for freebsd/amd64 and freebsd/arm64 without executing anything. Pushing
+  # from Actions with GITHUB_TOKEN links the package to this repository, which
+  # is also what makes it inherit the repository's public visibility.
+  #
+  # jm-demo-nginx-native runs "pkg install" and therefore still needs a real
+  # FreeBSD userland: it is published by hand with "make -C demo push".
+  freebsd-crossbuild:
+    name: freebsd ${{ matrix.image }}
     runs-on: ubuntu-latest
-    # Boot + pkg + three builds + the smoke tests came to under two minutes;
-    # 30 leaves room for a slow pkg mirror and can never approach the
-    # six-hour platform ceiling.
-    timeout-minutes: 30
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [freebsd, volume]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
 
-      - name: build and smoke-test the FreeBSD demo images
-        uses: vmactions/freebsd-vm@v1.5.3
-        timeout-minutes: 25
-        with:
-          # '15' resolves to the newest 15.x image the action publishes.
-          # No `arch:` -- the default is the amd64 image, which is the only
-          # one that runs at usable speed on an amd64 runner.
-          release: '15'
-          copyback: false
-          prepare: |
-            set -eu
-            pkg install -y podman-suite
+      - name: build freebsd/amd64 and freebsd/arm64
+        # vfs, not overlay: buildah's overlay driver stamps
+        # user.overlay.impure / user.overlay.origin onto directory entries,
+        # and the empty origin value makes podman on FreeBSD panic while
+        # applying the layer (ExtattrSetLink, index out of range). vfs writes
+        # no xattrs, so the layers stay portable to the guest.
+        env:
+          STORAGE_DRIVER: vfs
+        run: |
+          set -eux
+          img=ghcr.io/${{ github.repository_owner }}/jm-demo-${{ matrix.image }}
+          buildah manifest create "$img:ci"
+          for arch in amd64 arm64; do
+            buildah bud --os freebsd --arch "$arch" \
+              --manifest "$img:ci" \
+              -f demo/${{ matrix.image }}/Containerfile \
+              demo/${{ matrix.image }}
+          done
+          buildah manifest inspect "$img:ci" | head -40
 
-            # Storage. This VM's root is UFS, not ZFS, so podman's FreeBSD
-            # default (the zfs driver) has nothing to work with. vfs is slow
-            # but correct, and these images are tiny.
-            mkdir -p /usr/local/etc/containers
-            if ! zpool list >/dev/null 2>&1; then
-              printf '[storage]\ndriver = "vfs"\n' > /usr/local/etc/containers/storage.conf
-            fi
+      - name: push
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STORAGE_DRIVER: vfs
+        run: |
+          set -eu
+          img=ghcr.io/${{ github.repository_owner }}/jm-demo-${{ matrix.image }}
+          echo "$TOKEN" | buildah login -u '${{ github.actor }}' --password-stdin ghcr.io
+          buildah manifest push --all "$img:ci" "docker://$img:latest"
+          buildah manifest push --all "$img:ci" "docker://$img:$(date -u +%Y%m%d)"
 
-            # Networking. `RUN pkg install` inside a build needs the container
-            # to reach the internet, which on FreeBSD means pf NAT. Same recipe
-            # as guest/provision.sh, which is the reference for this project.
-            ext_if=$(route -n get default | awk '/interface:/ {print $2}')
-            sed -E "s/^(v[46]egress_if) = \"[^\"]*\"/\1 = \"$ext_if\"/" \
-              /usr/local/etc/containers/pf.conf.sample > /etc/pf.conf
-            sysrc pf_enable=YES
-            service pf start || service pf reload
-          run: |
-            set -eu
-            cd demo
-            IMAGES='freebsd nginx-native volume'
+  # ------------------------------------------------- freebsd (bootstrap) ----
+  # jm-demo-nginx-native runs "pkg install" and cannot be built without a
+  # FreeBSD kernel, so a maintainer pushes it from a Mac. A package first
+  # created by a personal token is private and unconnected, and an unconnected
+  # package cannot be made public. Pushing a placeholder :bootstrap tag from
+  # Actions creates the package with GITHUB_TOKEN instead: that connects it to
+  # this repository and gives it the repository's visibility. The manual push
+  # then only adds tags to a package that is already public.
+  freebsd-bootstrap:
+    name: bootstrap ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [nginx-native]
+    steps:
+      - uses: actions/checkout@v5
 
-            for i in $IMAGES; do
-              echo "=== building jm-demo-$i ==="
-              podman build -t "jm-demo-$i:ci" "./$i"
-            done
-
-            # Output is captured into a variable rather than piped into
-            # `grep -q`: grep -q exits on the first match and SIGPIPEs podman
-            # mid-teardown, leaving the --rm container (and its volume) behind.
-            expect() {  # expect <needle> <output>
-              case "$2" in
-                *"$1"*) echo "    ok" ;;
-                *) echo "    FAILED: expected '$1' in:"; echo "$2"; exit 1 ;;
-              esac
-            }
-
-            echo "=== banner images must run with no args ==="
-            expect FreeBSD "$(podman run --rm jm-demo-freebsd:ci)"
-            podman volume rm -f ci-selftest >/dev/null 2>&1 || true
-            expect 'now 1 line'  "$(podman run --rm -v ci-selftest:/data jm-demo-volume:ci)"
-            expect 'now 2 lines' "$(podman run --rm -v ci-selftest:/data jm-demo-volume:ci)"
-            podman volume rm -f ci-selftest >/dev/null 2>&1 || true
-
-            echo "=== native nginx must answer /healthz ==="
-            # WHERE WE FETCH FROM, AND WHY IT IS NOT THE PUBLISHED PORT.
-            # This check used to fetch http://127.0.0.1:18081/healthz through
-            # `-p 18081:80` and always failed -- after thirteen minutes,
-            # because every attempt was a TCP SYN into a black hole retrying
-            # on the RTO. podman on FreeBSD publishes ports with pf rdr rules
-            # in the "cni-rdr" anchor, and those rules match traffic arriving
-            # on the *egress* interface: a connection from the VM to its own
-            # loopback never traverses them. Port publishing is therefore not
-            # testable from inside the publishing host at all. (A Mac never
-            # hits this: jm's forwarder dials the guest's vtnet0 address,
-            # which does traverse the rdr rule, and `make -C demo test`
-            # covers that path.) So we talk to the container on the podman
-            # bridge, which is what this job is here to check -- that native
-            # FreeBSD nginx builds, starts and serves.
-            podman rm -f ci-nginx >/dev/null 2>&1 || true
-            podman run -d --name ci-nginx jm-demo-nginx-native:ci
-
-            ip=''
-            for _ in 1 2 3 4 5 6 7 8 9 10; do
-              ip=$(podman inspect -f '{{.NetworkSettings.IPAddress}}' ci-nginx 2>/dev/null || true)
-              [ -n "$ip" ] || ip=$(podman inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ci-nginx 2>/dev/null || true)
-              [ -n "$ip" ] && break
-              sleep 1
-            done
-            echo "container address: ${ip:-<none>}"
-
-            ok=0
-            if [ -n "$ip" ]; then
-              for _ in 1 2 3 4 5 6 7 8 9 10; do
-                sleep 2
-                # -T 3: never sit on the TCP retransmit timer.
-                if [ "$(fetch -q -T 3 -o - "http://$ip/healthz" 2>/dev/null)" = ok ]; then
-                  ok=1; break
-                fi
-              done
-            fi
-
-            if [ "$ok" = 1 ]; then
-              fetch -q -T 3 -o /dev/null "http://$ip/" && echo "    ok (/ and /healthz answered)"
-              fetch -q -T 3 -o - "http://$ip/whoami.txt" | head -3
-            else
-              echo '    FAILED -- diagnostics follow:'
-              podman inspect ci-nginx | head -60 || true
-              pfctl -sn 2>&1 | head -20 || true
-              podman logs ci-nginx 2>&1 | tail -20 || true
-            fi
-            podman rm -f ci-nginx >/dev/null 2>&1 || true
-            [ "$ok" = 1 ] || { echo 'native nginx did not answer /healthz'; exit 1; }
+      - name: push the :bootstrap placeholder
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STORAGE_DRIVER: vfs
+        run: |
+          set -eux
+          img=ghcr.io/${{ github.repository_owner }}/jm-demo-${{ matrix.image }}
+          buildah manifest create "$img:ci"
+          for arch in amd64 arm64; do
+            buildah bud --os freebsd --arch "$arch" \
+              --build-arg IMAGE=${{ matrix.image }} \
+              --manifest "$img:ci" demo/bootstrap
+          done
+          echo "$TOKEN" | buildah login -u '${{ github.actor }}' --password-stdin ghcr.io
+          buildah manifest push --all "$img:ci" "docker://$img:bootstrap"

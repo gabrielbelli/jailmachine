@@ -1,0 +1,17 @@
+# Bootstrap placeholder for demo images that cannot be built without a FreeBSD
+# kernel (they run pkg(8) at build time). CI cross-builds and pushes this to
+# the :bootstrap tag so the package is created by Actions: that connects it to
+# the repository and makes it public. The maintainer then pushes the real
+# image to :latest from a Mac with "make -C demo push".
+#
+# No RUN steps here, so buildah on Linux can assemble it for freebsd/*.
+FROM ghcr.io/freebsd/freebsd-runtime:15.1
+
+ARG IMAGE=unknown
+LABEL org.opencontainers.image.title="jm-demo-${IMAGE} (bootstrap)" \
+      org.opencontainers.image.description="Placeholder tag; pull :latest for the real image." \
+      org.opencontainers.image.source="https://github.com/gabrielbelli/jailmachine" \
+      org.opencontainers.image.licenses="BSD-2-Clause"
+
+COPY --chmod=0755 note.sh /usr/local/bin/note
+ENTRYPOINT ["/usr/local/bin/note"]

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"runtime/debug"
 	"strings"
 )
 
@@ -21,6 +22,34 @@ var (
 	// Date is the build time in RFC 3339, or "unknown".
 	Date = "unknown"
 )
+
+// fromBuildInfo fills the gaps left by an unstamped build. "go install
+// module@vX.Y.Z" has no linker flags, but the module version is recorded in
+// the binary; a "go build" inside a git checkout records the VCS revision
+// and time instead. Called once at start-up so the linker still wins.
+func init() { fromBuildInfo(debug.ReadBuildInfo) }
+
+func fromBuildInfo(read func() (*debug.BuildInfo, bool)) {
+	bi, ok := read()
+	if !ok {
+		return
+	}
+	if Version == "dev" && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		Version = strings.TrimPrefix(bi.Main.Version, "v")
+	}
+	for _, s := range bi.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			if Commit == "none" && len(s.Value) >= 7 {
+				Commit = s.Value[:7]
+			}
+		case "vcs.time":
+			if Date == "unknown" && s.Value != "" {
+				Date = s.Value
+			}
+		}
+	}
+}
 
 // Short returns the version on its own, for "jm --version".
 func Short() string { return Version }
