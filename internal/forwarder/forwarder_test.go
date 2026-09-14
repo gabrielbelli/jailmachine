@@ -8,9 +8,11 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -984,4 +986,51 @@ func mustLoad(t *testing.T, path string) *State {
 		t.Fatal(err)
 	}
 	return st
+}
+
+// Stop never signals the process it runs in, nor that process's group: a
+// recycled pid file can name either (the sleeper and the forwarder itself
+// call Stop).
+func TestProcessStopNeverSignalsSelf(t *testing.T) {
+	dir := t.TempDir()
+	p := Process{Dir: dir, Name: "dev", Root: "/r"}
+	child := exec.Command("sleep", "30") // shares the test's process group
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan struct{})
+	go func() { _ = child.Wait(); close(exited) }()
+	t.Cleanup(func() { _ = child.Process.Kill(); <-exited })
+	saved := commandLineOf
+	t.Cleanup(func() { commandLineOf = saved })
+	commandLineOf = func(pid int) string {
+		if pid == os.Getpid() || pid == child.Process.Pid {
+			return "/usr/local/bin/jm --state-root /r _forwarder dev"
+		}
+		return ""
+	}
+	pidFile := filepath.Join(dir, PIDFile)
+
+	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Stop(context.Background()); err == nil || !strings.Contains(err.Error(), "refusing") {
+		t.Fatalf("Stop with our own pid = %v, want a refusal", err)
+	}
+
+	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(child.Process.Pid)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-exited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("forwarder in our process group was not stopped")
+	}
+	if _, err := os.Stat(pidFile); !os.IsNotExist(err) {
+		t.Error("pid file not removed")
+	}
+	// Still running here: neither this process nor its group was signalled.
 }

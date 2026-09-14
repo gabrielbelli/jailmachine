@@ -32,6 +32,7 @@ func newInitCmd() *cobra.Command {
 		noMounts bool
 		pubAddr  string
 		arc      string
+		idle     string
 	)
 	cmd := &cobra.Command{
 		Use:   "init [name]",
@@ -47,6 +48,7 @@ func newInitCmd() *cobra.Command {
 		Example: `  jm init
   jm init --cpus 2 --memory 4096 dev
   jm init --arc 1GiB --memory 8192   # a larger ZFS cache for a larger machine
+  jm init --idle-suspend 2h          # or 0 to never suspend
   jm init --mount /work --mount /srv/data:ro
   jm init --no-mounts
   jm init --image official:` + image.DefaultRelease + ` --disk 32
@@ -57,6 +59,7 @@ func newInitCmd() *cobra.Command {
 			return runInit(cmd.Context(), args, initOpts{
 				image: imageRef, cpus: cpus, memory: memory, disk: disk, sshPort: sshPort,
 				mounts: mounts, noMounts: noMounts, publishAddr: pubAddr, arc: arc,
+				idleSuspend: idle,
 			})
 		},
 	}
@@ -70,6 +73,7 @@ func newInitCmd() *cobra.Command {
 	f.BoolVar(&noMounts, "no-mounts", false, "share no host directories at all")
 	f.StringVar(&pubAddr, "publish-addr", "", publishAddrFlagUsage)
 	f.StringVar(&arc, "arc", "", arcFlagUsage+" (default "+strconv.Itoa(d.ArcMiB)+", or half of a smaller --memory)")
+	f.StringVar(&idle, "idle-suspend", "", idleSuspendFlagUsage+" (default "+strconv.Itoa(d.IdleSuspendMin)+"m)")
 	cmd.Long += "\nThe network provider is chosen per host ($JM_NETWORK overrides; known: " +
 		strings.Join(netprov.Names(), ", ") + ").\n\n" +
 		"Host directories are shared with the guest at their own absolute path, so\n" +
@@ -100,6 +104,7 @@ type initOpts struct {
 	noMounts    bool
 	publishAddr string
 	arc         string
+	idleSuspend string
 }
 
 // shares resolves the --mount/--no-mounts flags into the machine's initial
@@ -137,6 +142,9 @@ func (o initOpts) validate() error {
 	if _, err := o.arcMiB(); err != nil {
 		return err
 	}
+	if _, err := o.idleSuspendMin(); err != nil {
+		return err
+	}
 	_, err := parsePublishAddr(o.publishAddr)
 	return err
 }
@@ -156,6 +164,15 @@ func (o initOpts) arcMiB() (int, error) {
 		return 0, usage(err)
 	}
 	return mib, nil
+}
+
+// idleSuspendMin parses --idle-suspend; without it a new machine gets
+// machine.DefaultIdleSuspendMin.
+func (o initOpts) idleSuspendMin() (int, error) {
+	if o.idleSuspend == "" {
+		return machine.DefaultIdleSuspendMin, nil
+	}
+	return ParseIdleSuspend(o.idleSuspend)
 }
 
 // imageSource maps a parsed --image reference to a provider and returns the
@@ -274,7 +291,8 @@ func runInit(ctx context.Context, args []string, o initOpts) error {
 	m.Image = ref.String()
 	m.CPUs = o.cpus
 	m.MemoryMiB = o.memory
-	m.ArcMiB, _ = o.arcMiB() // validated above
+	m.ArcMiB, _ = o.arcMiB()                 // validated above
+	m.IdleSuspendMin, _ = o.idleSuspendMin() // validated above
 	m.DiskGiB = o.disk
 	m.SSHPort = o.sshPort
 	m.PublishAddr, _ = parsePublishAddr(o.publishAddr) // validated above

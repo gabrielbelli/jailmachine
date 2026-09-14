@@ -1,13 +1,14 @@
 package qemu
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/gabrielbelli/jailmachine/internal/procx"
 )
 
 // readPID parses a qemu pid file. It returns os.ErrNotExist (wrapped) when
@@ -24,19 +25,10 @@ func readPID(path string) (int, error) {
 	return pid, nil
 }
 
-// processAlive is kill -0: true if the process exists (or exists but is not
-// ours). Only used to wait for an exit after State has confirmed the pid is
-// our QEMU; never to decide that a machine is running.
-func processAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	err := syscall.Kill(pid, 0)
-	if err == nil {
-		return true
-	}
-	return errors.Is(err, syscall.EPERM)
-}
+// processAlive is procx.Alive: kill -0 that treats a zombie as dead. Only
+// used to wait for an exit after State has confirmed the pid is our QEMU;
+// never to decide that a machine is running.
+func processAlive(pid int) bool { return procx.Alive(pid) }
 
 // commandLine returns the full argv of pid as reported by ps, or "" if there
 // is no such process. ps is used because it works unprivileged on macOS,

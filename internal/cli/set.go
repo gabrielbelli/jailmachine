@@ -49,13 +49,17 @@ func newSetCmd() *cobra.Command {
 			"started; 'jm ports' says so while the old one is still bound.\n\n" +
 			"--arc caps the guest's ZFS ARC (MiB, or with a unit; 0 restores the guest's\n" +
 			"default). On a running machine it applies at once; otherwise on the next\n" +
-			"'jm start'. The cap must be at least 64 MiB and below the memory.",
+			"'jm start'. The cap must be at least 64 MiB and below the memory.\n\n" +
+			"--idle-suspend sets how long a running machine may sit idle before it is\n" +
+			"suspended to disk; it wakes on first use. It can be changed in any state and\n" +
+			"needs no restart.",
 		Example: `  jm set --cpus 8 --memory 8GiB
   jm set --mount /work --mount /srv/data:ro
   jm set --unmount /srv/data
   jm set --no-mounts
   jm set --publish-addr 127.0.0.1   # keep published ports off the LAN
-  jm set --arc 1GiB                 # works while running`,
+  jm set --arc 1GiB                 # works while running
+  jm set --idle-suspend 2h          # or 0 to never suspend`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			o.cpusSet = cmd.Flags().Changed("cpus")
@@ -64,6 +68,7 @@ func newSetCmd() *cobra.Command {
 			o.sshPortSet = cmd.Flags().Changed("ssh-port")
 			o.publishAddrSet = cmd.Flags().Changed("publish-addr")
 			o.arcSet = cmd.Flags().Changed("arc")
+			o.idleSuspendSet = cmd.Flags().Changed("idle-suspend")
 			return runSet(cmd.Context(), args, o)
 		},
 	}
@@ -77,6 +82,7 @@ func newSetCmd() *cobra.Command {
 	f.BoolVar(&o.noMounts, "no-mounts", false, "share no host directories at all (drops every share)")
 	f.StringVar(&o.publishAddr, "publish-addr", "", publishAddrFlagUsage)
 	f.StringVar(&o.arc, "arc", "", arcFlagUsage)
+	f.StringVar(&o.idleSuspend, "idle-suspend", "", idleSuspendFlagUsage)
 	return cmd
 }
 
@@ -85,10 +91,11 @@ type setOpts struct {
 	memory                                  string
 	publishAddr                             string
 	arc                                     string
+	idleSuspend                             string
 	mount, unmount                          []string
 	noMounts                                bool
 	cpusSet, memorySet, diskSet, sshPortSet bool
-	publishAddrSet, arcSet                  bool
+	publishAddrSet, arcSet, idleSuspendSet  bool
 }
 
 // arcFlagUsage is the --arc help shared by init and set.
@@ -140,11 +147,15 @@ type changes struct {
 	// machine, so it needs no stop either.
 	arcMiB int
 	arcSet bool
+	// idleSuspendMin is the idle time before a suspend; it is a record
+	// setting read live, so it is allowed in every state.
+	idleSuspendMin int
+	idleSuspendSet bool
 }
 
 // any reports whether at least one flag was given.
 func (c changes) any() bool {
-	return c.cpusSet || c.memorySet || c.diskSet || c.sshPortSet || c.sharesSet || c.publishAddrSet || c.arcSet
+	return c.cpusSet || c.memorySet || c.diskSet || c.sshPortSet || c.sharesSet || c.publishAddrSet || c.arcSet || c.idleSuspendSet
 }
 
 // needsStopped reports whether the changes require a stopped machine. The
@@ -158,11 +169,18 @@ func (c changes) needsStopped() bool {
 func (o setOpts) validate(m *machine.Machine) (changes, error) {
 	c := changes{
 		cpusSet: o.cpusSet, memorySet: o.memorySet, diskSet: o.diskSet, sshPortSet: o.sshPortSet,
-		publishAddrSet: o.publishAddrSet, arcSet: o.arcSet,
+		publishAddrSet: o.publishAddrSet, arcSet: o.arcSet, idleSuspendSet: o.idleSuspendSet,
 		sharesSet: len(o.mount) > 0 || len(o.unmount) > 0 || o.noMounts,
 	}
 	if !c.any() {
-		return c, errors.New("nothing to set (use --cpus, --memory, --disk, --ssh-port, --publish-addr, --arc, --mount, --unmount or --no-mounts)")
+		return c, errors.New("nothing to set (use --cpus, --memory, --disk, --ssh-port, --publish-addr, --arc, --idle-suspend, --mount, --unmount or --no-mounts)")
+	}
+	if o.idleSuspendSet {
+		mins, err := ParseIdleSuspend(o.idleSuspend)
+		if err != nil {
+			return c, err
+		}
+		c.idleSuspendMin = mins
 	}
 	if o.publishAddrSet {
 		addr, err := parsePublishAddr(o.publishAddr)
@@ -303,6 +321,10 @@ func runSet(ctx context.Context, args []string, o setOpts) error {
 	if arcChanged {
 		logf(stdout, "zfs arc cap: %s -> %s", arcWord(m.ArcMiB), arcWord(c.arcMiB))
 		m.ArcMiB = c.arcMiB
+	}
+	if c.idleSuspendSet && c.idleSuspendMin != m.IdleSuspendMin {
+		logf(stdout, "idle suspend: %s -> %s", idleSuspendWord(m.IdleSuspendMin), idleSuspendWord(c.idleSuspendMin))
+		m.IdleSuspendMin = c.idleSuspendMin
 	}
 	if c.diskSet && c.diskGiB != m.DiskGiB {
 		var resizer backend.Resizer

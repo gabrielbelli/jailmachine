@@ -6,7 +6,7 @@
 // host->guest port mappings over an HTTP control API.
 //
 // gvproxy must be up before QEMU starts and must outlive it, so it runs
-// detached (own session) with a pid file, log file and the same
+// detached (launched through procx) with a pid file, log file and the same
 // pid-plus-argv liveness rule as the qemu backend.
 //
 // gvproxy's own -forward-sock is deliberately not used: gvproxy 0.8.x
@@ -32,6 +32,7 @@ import (
 	"github.com/gabrielbelli/jailmachine/internal/backend"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
 	"github.com/gabrielbelli/jailmachine/internal/netprov"
+	"github.com/gabrielbelli/jailmachine/internal/procx"
 )
 
 // Name is the identifier stored in the machine record.
@@ -294,28 +295,17 @@ func (pr Provider) Start(ctx context.Context, m *machine.Machine) (backend.NetAt
 		return backend.NetAttachment{}, netprov.Endpoint{}, fmt.Errorf("gvproxy: removing stale sockets: %w", err)
 	}
 
-	logf, err := os.OpenFile(p.Log, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	// Detached through procx, so gvproxy outlives this jm invocation and is
+	// reaped by launchd rather than left a zombie of it.
+	pid, err := procx.StartDetached(bin, Args(m, p), nil, p.Log, true)
 	if err != nil {
-		return backend.NetAttachment{}, netprov.Endpoint{}, fmt.Errorf("gvproxy: opening %s: %w", p.Log, err)
-	}
-	defer logf.Close()
-	// Not CommandContext: gvproxy must outlive this jm invocation.
-	cmd := exec.Command(bin, Args(m, p)...)
-	cmd.Stdout = logf
-	cmd.Stderr = logf
-	cmd.Stdin = nil
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
 		return backend.NetAttachment{}, netprov.Endpoint{}, fmt.Errorf("gvproxy: failed to start: %w", err)
 	}
-	pid := cmd.Process.Pid
-	// Reap in the background so an early exit does not leave a zombie; we
-	// never Wait on it synchronously.
-	exited := make(chan error, 1)
-	go func() { exited <- cmd.Wait() }()
-
-	if err := waitSockets(ctx, exited, p.Net, p.API); err != nil {
-		_ = syscall.Kill(pid, syscall.SIGKILL)
+	if err := waitSockets(ctx, pid, p.Net, p.API); err != nil {
+		if procx.Alive(pid) {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+			procx.WaitExit(context.Background(), pid, stopTimeout)
+		}
 		_ = removeAll(append(p.Sockets(), p.PID)...)
 		return backend.NetAttachment{}, netprov.Endpoint{}, fmt.Errorf("gvproxy: %w: %s", err, tailOf(p.Log))
 	}
@@ -329,9 +319,9 @@ func (pr Provider) Start(ctx context.Context, m *machine.Machine) (backend.NetAt
 	return attachment(m, p), ep, nil
 }
 
-// waitSockets polls until every socket exists, the process exits, the
-// timeout lapses or ctx is cancelled.
-func waitSockets(ctx context.Context, exited <-chan error, socks ...string) error {
+// waitSockets polls until every socket exists, the process pid is no longer
+// alive, the timeout lapses or ctx is cancelled.
+func waitSockets(ctx context.Context, pid int, socks ...string) error {
 	deadline := time.Now().Add(startTimeout)
 	for {
 		missing := ""
@@ -344,15 +334,16 @@ func waitSockets(ctx context.Context, exited <-chan error, socks ...string) erro
 		if missing == "" {
 			return nil
 		}
-		select {
-		case err := <-exited:
-			return fmt.Errorf("exited before creating %s (%v)", filepath.Base(missing), err)
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(pollInterval):
+		if !procx.Alive(pid) {
+			return fmt.Errorf("exited before creating %s", filepath.Base(missing))
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("timed out waiting for %s", filepath.Base(missing))
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(pollInterval):
 		}
 	}
 }
@@ -373,12 +364,12 @@ func (pr Provider) Stop(ctx context.Context, m *machine.Machine) error {
 	if err != nil {
 		return err
 	}
-	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && processAlive(pid) {
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && procx.Alive(pid) {
 		return fmt.Errorf("gvproxy: SIGTERM pid %d: %w", pid, err)
 	}
-	if !waitExit(ctx, pid, stopTimeout) {
+	if !procx.WaitExit(ctx, pid, stopTimeout) {
 		_ = syscall.Kill(pid, syscall.SIGKILL)
-		if !waitExit(ctx, pid, stopTimeout) {
+		if !procx.WaitExit(ctx, pid, stopTimeout) {
 			return fmt.Errorf("gvproxy: pid %d did not exit after SIGKILL", pid)
 		}
 	}

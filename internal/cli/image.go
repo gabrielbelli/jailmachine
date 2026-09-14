@@ -110,10 +110,8 @@ func runImageBuild(ctx context.Context, o imageBuildOpts) error {
 	defer restorePodmanDefault(ctx, prevDefault)
 
 	// Stage: init + start, exactly as a user would, against the work root.
-	// The build guest keeps the stock ZFS ARC ("--arc 0"), so no cap is
-	// written to the loader.conf that ships in the image.
 	sub := func(args ...string) error { return runSubcommand(ctx, work, args...) }
-	if err := sub("init", "--image", "official:"+o.release, "--ssh-port", fmt.Sprint(imageBuildSSHPort), "--arc", "0", imageBuildName); err != nil {
+	if err := sub(imageBuildInitArgs(o.release)...); err != nil {
 		return fmt.Errorf("image build: init: %w", err)
 	}
 	if err := sub("start", imageBuildName); err != nil {
@@ -150,6 +148,16 @@ func runImageBuild(ctx context.Context, o imageBuildOpts) error {
 	}
 	logf(stdout, "done: publish %s and %s.sha256 as assets of release guest-%s", target, target, image.GuestVersion)
 	return nil
+}
+
+// imageBuildInitArgs is the "jm init" invocation of an image build. The
+// build guest keeps the stock ZFS ARC ("--arc 0"), so no cap is written to
+// the loader.conf that ships in the image, and it is never suspended
+// ("--idle-suspend 0"): a build that waits on the guest must not find it
+// asleep.
+func imageBuildInitArgs(release string) []string {
+	return []string{"init", "--image", "official:" + release, "--ssh-port", fmt.Sprint(imageBuildSSHPort),
+		"--arc", "0", "--idle-suspend", "0", imageBuildName}
 }
 
 // runSubcommand executes "jm --state-root <root> <args...>" in-process, so

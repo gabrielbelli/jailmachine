@@ -690,3 +690,54 @@ func TestDoctorMachineChecks(t *testing.T) {
 	}
 	fakeBE.state, fakeNet.state = backend.Stopped, backend.Stopped
 }
+
+func TestImageBuildPassesIdleSuspendZero(t *testing.T) {
+	args := imageBuildInitArgs(image.DefaultRelease)
+	if len(args) == 0 || args[0] != "init" || args[len(args)-1] != imageBuildName {
+		t.Fatalf("init args = %q", args)
+	}
+	found := false
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--idle-suspend" && args[i+1] == "0" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("image build init args lack --idle-suspend 0: %q", args)
+	}
+	// The same arguments must get past init's validation: a build machine
+	// is created never to be suspended.
+	cmd := NewRootCmd()
+	initCmd, rest, err := cmd.Find(args)
+	if err != nil || initCmd.Name() != "init" {
+		t.Fatalf("find init: %v", err)
+	}
+	if err := initCmd.ParseFlags(rest); err != nil {
+		t.Fatalf("parse %q: %v", rest, err)
+	}
+	if v, _ := initCmd.Flags().GetString("idle-suspend"); v != "0" {
+		t.Errorf("--idle-suspend parsed as %q", v)
+	}
+}
+
+func TestInitIdleSuspendFlag(t *testing.T) {
+	base := initOpts{cpus: 4, memory: 2048, disk: 64, sshPort: 2222}
+	for flag, want := range map[string]int{"": machine.DefaultIdleSuspendMin, "0": 0, "off": 0, "45": 45, "2h": 120} {
+		o := base
+		o.idleSuspend = flag
+		if err := o.validate(); err != nil {
+			t.Errorf("init --idle-suspend %q: %v", flag, err)
+		}
+		if got, err := o.idleSuspendMin(); err != nil || got != want {
+			t.Errorf("init --idle-suspend %q = %d, %v; want %d", flag, got, err, want)
+		}
+	}
+	root := t.TempDir()
+	_, err := run(t, root, "init", "--idle-suspend", "1.5h")
+	if err == nil || exitCode(err) != ExitUsage || !strings.Contains(err.Error(), "--idle-suspend must") {
+		t.Errorf("init --idle-suspend 1.5h: %v (exit %d)", err, exitCode(err))
+	}
+	if entries, _ := os.ReadDir(filepath.Join(root, "machines")); len(entries) != 0 {
+		t.Errorf("validation failures must not create state: %v", entries)
+	}
+}

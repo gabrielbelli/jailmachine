@@ -65,13 +65,14 @@ func TestArgs(t *testing.T) {
 		{"-device", "virtio-net-pci,netdev=n0,mac=5a:94:ef:e4:0c:ee"},
 		{"-device", "virtio-rng-pci"},
 		{"-display", "none"},
-		{"-serial", "file:" + p.Console},
+		{"-chardev", "file,id=jmcon,path=" + p.Console + ",append=on"},
+		{"-serial", "chardev:jmcon"},
 		{"-qmp", "unix:" + p.QMP + ",server,nowait"},
 		{"-pidfile", p.PID},
 	}
 	var got [][2]string
 	for i := 0; i < len(args)-1; i++ {
-		if strings.HasPrefix(args[i], "-") && args[i] != "-daemonize" {
+		if strings.HasPrefix(args[i], "-") {
 			got = append(got, [2]string{args[i], args[i+1]})
 			i++
 		}
@@ -79,8 +80,8 @@ func TestArgs(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("argv mismatch\n got: %q\nwant: %q", got, want)
 	}
-	if !slices.Contains(args, "-daemonize") {
-		t.Fatal("missing -daemonize")
+	if slices.Contains(args, "-daemonize") {
+		t.Fatal("argv must not daemonise QEMU")
 	}
 	if slices.Contains(args, p.Log) {
 		t.Fatal("qemu.log must not be passed to qemu")
@@ -101,7 +102,7 @@ func TestArgsEscapesCommasAndHostFwdAddr(t *testing.T) {
 	if !slices.Contains(args, "file=/state/ma,,chines/test/disk.raw,format=raw,if=virtio,cache=writeback,discard=unmap") {
 		t.Fatalf("comma in disk path not escaped: %q", args)
 	}
-	if !slices.Contains(args, "file:/state/ma,,chines/test/console.log") {
+	if !slices.Contains(args, "file,id=jmcon,path=/state/ma,,chines/test/console.log,append=on") {
 		t.Fatalf("comma in serial path not escaped: %q", args)
 	}
 	if !slices.Contains(args, "unix:/state/ma,,chines/test/qmp.sock,server,nowait") {

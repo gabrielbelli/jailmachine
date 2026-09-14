@@ -114,7 +114,9 @@ state is read from the hypervisor and the network provider on every call.
 
   name, state (running|stopped|broken), backend_state, network_state,
   backend, network, image, cpus, memory_mib, arc_mib (the guest's ZFS ARC
-  cap in MiB; 0 is the guest's own default), disk_gib, mac, ssh_port,
+  cap in MiB; 0 is the guest's own default), idle_suspend_min (minutes a
+  running machine may sit idle before it is suspended to disk; 0 never
+  suspends; always present), disk_gib, mac, ssh_port,
   ssh_user, guest_ip, ssh (host:port), ssh_key, podman_uri,
   podman_sock_uri, api_socket, dns, console, network_logs, dir,
   provisioned, image_trusted (false for a BYO image without a .sha256 sidecar),
@@ -164,6 +166,7 @@ func newInspectCmd() *cobra.Command {
 			row("CPUs", i.CPUs)
 			row("Memory", fmt.Sprintf("%d MiB", i.MemoryMiB))
 			row("ZFS ARC cap", arcWord(i.ArcMiB))
+			row("Idle suspend", idleSuspendRow(i.IdleSuspendMin))
 			row("Disk", fmt.Sprintf("%d GiB", i.DiskGiB))
 			row("MAC", i.MAC)
 			if i.GuestIP != "" {

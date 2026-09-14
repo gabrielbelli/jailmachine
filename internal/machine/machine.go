@@ -33,6 +33,26 @@ const (
 	DefaultArcMiB = 512
 	// MinArcMiB is the smallest cap OpenZFS accepts for vfs.zfs.arc.max.
 	MinArcMiB = 64
+
+	// DefaultIdleSuspendMin is how long a new machine may sit idle before
+	// it is suspended to disk (ADR 0009); MinIdleSuspendMin and
+	// MaxIdleSuspendMin bound a non-zero setting (5 minutes to a week).
+	DefaultIdleSuspendMin = 30
+	MinIdleSuspendMin     = 5
+	MaxIdleSuspendMin     = 10080
+
+	// Idle suspend (ADR 0009). SuspendJournalFile is the journal of a
+	// suspend in progress or complete; SuspendImageFile is the saved guest
+	// state. SleeperStatusFile is the sleeper's last reported status,
+	// ActivityFile an empty file whose mtime host clients bump, WakeLogFile
+	// the log of detached wakes, and ResumeFailedLogFile the hypervisor log
+	// kept when a saved state was refused.
+	SuspendJournalFile  = "suspend.json"
+	SuspendImageFile    = "suspend.state"
+	SleeperStatusFile   = "sleeper.json"
+	ActivityFile        = "activity"
+	WakeLogFile         = "wake.log"
+	ResumeFailedLogFile = "qemu.resume-failed.log"
 )
 
 // DefaultArcFor is the ZFS ARC cap a machine with memoryMiB gets when none
@@ -55,6 +75,12 @@ const (
 	GuestProvisionFailed = "/var/db/jm-provision-failed"
 	GuestProvisionLog    = "/var/log/jm-provision.log"
 	GuestPodmanSocket    = "/var/run/podman/podman.sock"
+	// GuestSuspendMounts lists the 9p mounts unmounted before a suspend,
+	// so they are remounted after a wake or a rolled-back suspend.
+	GuestSuspendMounts = "/var/run/jm-suspend.mounts"
+	// GuestNoSleep, while it exists, keeps an idle machine from being
+	// suspended; it lives on /var/run, so a guest reboot clears it.
+	GuestNoSleep = "/var/run/jm-nosleep"
 )
 
 // Machine is the backend-neutral description of a VM. Backend-specific
@@ -75,10 +101,14 @@ type Machine struct {
 	// at every start. 0 leaves the guest's own default. It has no
 	// omitempty: an explicit 0 must survive a save and load, and records
 	// written before the field existed load as DefaultArcMiB.
-	ArcMiB  int    `json:"arc_mib"`
-	MAC     string `json:"mac"`
-	SSHPort int    `json:"ssh_port"`
-	SSHUser string `json:"ssh_user"`
+	ArcMiB int `json:"arc_mib"`
+	// IdleSuspendMin is how many minutes a running machine may sit idle before
+	// it is suspended to disk and its host memory is returned; it wakes on first
+	// use (ADR 0009). 0 never suspends. No omitempty: an explicit 0 must survive.
+	IdleSuspendMin int    `json:"idle_suspend_min"`
+	MAC            string `json:"mac"`
+	SSHPort        int    `json:"ssh_port"`
+	SSHUser        string `json:"ssh_user"`
 	// Network is the network provider that created the machine's
 	// attachment (ADR 0004). Records written before providers existed have
 	// it empty, which means the slirp "user" provider.
@@ -119,17 +149,18 @@ type Machine struct {
 // host OS; this package stays hypervisor-neutral, ADR 0002).
 func Defaults() Machine {
 	return Machine{
-		Version:      Version,
-		Name:         DefaultName,
-		Image:        DefaultImage,
-		CPUs:         4,
-		MemoryMiB:    2048,
-		ArcMiB:       DefaultArcMiB,
-		DiskGiB:      64,
-		MAC:          "5a:94:ef:e4:0c:ee",
-		SSHPort:      2222,
-		SSHUser:      "root",
-		ImageTrusted: true,
-		BackendOpts:  map[string]string{},
+		Version:        Version,
+		Name:           DefaultName,
+		Image:          DefaultImage,
+		CPUs:           4,
+		MemoryMiB:      2048,
+		ArcMiB:         DefaultArcMiB,
+		IdleSuspendMin: DefaultIdleSuspendMin,
+		DiskGiB:        64,
+		MAC:            "5a:94:ef:e4:0c:ee",
+		SSHPort:        2222,
+		SSHUser:        "root",
+		ImageTrusted:   true,
+		BackendOpts:    map[string]string{},
 	}
 }

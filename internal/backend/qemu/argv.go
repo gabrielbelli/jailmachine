@@ -32,7 +32,14 @@ const (
 	LogFile     = "qemu.log" // qemu's stdout/stderr
 	PIDFile     = "qemu.pid" // written by -pidfile
 	QMPSockFile = "qmp.sock" // QMP unix socket (see QMPSocket)
+	// ArgvFile holds the exact argv of the last launch, argv[0] included,
+	// as a JSON array. It is written atomically before every launch, so a
+	// running QEMU never has a stale one.
+	ArgvFile = "qemu.argv"
 )
+
+// ConsoleChardevID is the -chardev id of the serial console.
+const ConsoleChardevID = "jmcon"
 
 // MaxSocketPath is backend.MaxSocketPath, kept for callers of this package.
 const MaxSocketPath = backend.MaxSocketPath
@@ -117,9 +124,15 @@ func Args(m *machine.Machine, net backend.NetAttachment, p Paths) []string {
 	args = append(args, shareArgs(m, p)...)
 	args = append(args,
 		"-display", "none",
-		"-serial", "file:"+escapeComma(p.Console),
+		// The console appends: Start truncates console.log itself, so a
+		// later launch of the same machine can keep the log that
+		// "jm console -f" is following.
+		"-chardev", "file,id="+ConsoleChardevID+",path="+escapeComma(p.Console)+",append=on",
+		"-serial", "chardev:"+ConsoleChardevID,
 		"-qmp", "unix:"+escapeComma(p.QMP)+",server,nowait",
-		"-daemonize",
+		// No -daemonize: QEMU forks without exec when it daemonises, and
+		// under HVF a migration of such a process aborts. procx detaches
+		// it instead. -pidfile stays, for State.
 		"-pidfile", p.PID,
 	)
 	return args

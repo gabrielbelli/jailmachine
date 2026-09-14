@@ -1,6 +1,7 @@
 // Package qemu implements backend.Backend with QEMU (HVF on macOS, KVM on
 // Linux later): -M virt, EDK2 pflash, virtio-blk/net/rng, serial console to
-// console.log, QMP socket for graceful power-down.
+// console.log, QMP socket for readiness and graceful power-down. QEMU is
+// launched detached through procx, never with -daemonize.
 //
 // The backend finds a machine's files through Machine.Dir, which the machine
 // store fills in on load (ADR 0005); it knows nothing about the state root.
@@ -8,16 +9,18 @@ package qemu
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gabrielbelli/jailmachine/internal/backend"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
+	"github.com/gabrielbelli/jailmachine/internal/procx"
 )
 
 // Name is the identifier stored in Machine.Backend.
@@ -27,7 +30,6 @@ const Name = "qemu"
 const (
 	gracefulTimeout = 30 * time.Second
 	termTimeout     = 5 * time.Second
-	pollInterval    = 200 * time.Millisecond
 )
 
 // ErrRunning is returned by Start when the machine is already running.
@@ -144,8 +146,16 @@ func removeAll(paths ...string) error {
 	return errors.Join(errs...)
 }
 
-// Start implements backend.Backend: daemonises qemu-system-aarch64 with the
-// PoC argv and returns once the pid file exists.
+// launchReadyTimeout bounds how long Start waits for a launched QEMU to
+// write its pid file and answer QMP. A variable so tests can shorten it.
+var launchReadyTimeout = 15 * time.Second
+
+// launchPollInterval is how often Start checks a launched QEMU.
+const launchPollInterval = 50 * time.Millisecond
+
+// Start implements backend.Backend: launches qemu-system-aarch64 detached
+// (procx, no -daemonize) and returns once its pid file names the launched
+// process and QMP answers query-status with "prelaunch" or "running".
 func (b Backend) Start(ctx context.Context, m *machine.Machine, net backend.NetAttachment) error {
 	st, err := b.State(m)
 	if err != nil {
@@ -195,24 +205,116 @@ func (b Backend) Start(ctx context.Context, m *machine.Machine, net backend.NetA
 	}
 
 	args := Args(&run, net, p)
-	logf, err := os.OpenFile(p.Log, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	// The console chardev appends, so a cold boot starts the log afresh
+	// here, as -serial file: used to.
+	if err := truncateFile(p.Console); err != nil {
+		return err
+	}
+	// Written before the launch, so a live QEMU never has a stale argv.
+	if err := writeArgv(filepath.Join(m.Dir, ArgvFile), append([]string{bin}, args...)); err != nil {
+		return err
+	}
+	pid, err := procx.StartDetached(bin, args, nil, p.Log, true)
 	if err != nil {
-		return fmt.Errorf("qemu: opening %s: %w", p.Log, err)
+		return fmt.Errorf("qemu: failed to start: %w", err)
 	}
-	cmd := exec.CommandContext(ctx, bin, args...)
-	cmd.Stdout = logf
-	cmd.Stderr = logf
-	runErr := cmd.Run()
-	_ = logf.Close()
-	if runErr != nil {
-		return fmt.Errorf("qemu: failed to start (%v): %s", runErr, tailOf(p.Log))
+	return waitLaunched(ctx, pid, p, launchReadyTimeout)
+}
+
+// launchKill and launchKillTimeout are how waitLaunched kills a QEMU that
+// failed to start and how long it waits for it to go. Variables so tests can
+// simulate a process that outlives SIGKILL.
+var (
+	launchKill        = kill
+	launchKillTimeout = termTimeout
+)
+
+// waitLaunched polls a freshly launched QEMU until its pid file names pid
+// and QMP reports "prelaunch" or "running". An early exit is reported with
+// the tail of qemu.log; on a timeout or a cancelled ctx the process is
+// killed. Once the process is confirmed gone the pid file and QMP socket are
+// removed, so a failed Start leaves the machine stopped. A process that does
+// not exit after SIGKILL stays tracked instead: the pid file is made to name
+// it, so State does not report Stopped and 'jm stop' can still reach it.
+func waitLaunched(ctx context.Context, pid int, p Paths, timeout time.Duration) error {
+	fail := func(err error) error {
+		if procx.Alive(pid) {
+			_ = launchKill(pid)
+			if !procx.WaitExit(context.Background(), pid, launchKillTimeout) {
+				if got, rerr := readPID(p.PID); rerr != nil || got != pid {
+					_ = writeAtomic(p.PID, []byte(strconv.Itoa(pid)+"\n"), 0o600)
+				}
+				return fmt.Errorf("%w; pid %d did not exit after SIGKILL and is still recorded in %s", err, pid, p.PID)
+			}
+		}
+		_ = removeAll(p.PID, p.QMP)
+		return err
 	}
-	// With -daemonize qemu only exits 0 once the child has written the pid
-	// file, but be defensive: a missing pid file means nothing is running.
-	if _, err := readPID(p.PID); err != nil {
-		return fmt.Errorf("qemu: exited without writing %s: %s", p.PID, tailOf(p.Log))
+	deadline := time.Now().Add(timeout)
+	for {
+		if !procx.Alive(pid) {
+			return fail(fmt.Errorf("qemu: exited during startup: %s", tailOf(p.Log)))
+		}
+		if ready(ctx, pid, p) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fail(fmt.Errorf("qemu: not ready after %s (no pid file or QMP answer); killed it: %s", timeout, tailOf(p.Log)))
+		}
+		select {
+		case <-ctx.Done():
+			return fail(fmt.Errorf("qemu: waiting for startup: %w", ctx.Err()))
+		case <-time.After(launchPollInterval):
+		}
 	}
-	return nil
+}
+
+// ready reports whether QEMU has written pid to its pid file and answers
+// query-status with a state it reaches only after initialising.
+func ready(ctx context.Context, pid int, p Paths) bool {
+	if got, err := readPID(p.PID); err != nil || got != pid {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	q, err := DialMonitor(ctx, p.QMP)
+	if err != nil {
+		return false
+	}
+	defer q.Close()
+	status, err := q.QueryStatus(ctx)
+	return err == nil && (status == "prelaunch" || status == "running")
+}
+
+// truncateFile empties path, creating it with mode 0600 when absent.
+func truncateFile(path string) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("qemu: truncating %s: %w", path, err)
+	}
+	return f.Close()
+}
+
+// writeArgv records argv in path as a JSON array, atomically.
+func writeArgv(path string, argv []string) error {
+	data, err := json.Marshal(argv)
+	if err != nil {
+		return fmt.Errorf("qemu: encoding argv: %w", err)
+	}
+	return writeAtomic(path, append(data, '\n'), 0o600)
+}
+
+// ReadArgv returns the argv recorded in a machine directory's ArgvFile.
+func ReadArgv(dir string) ([]string, error) {
+	data, err := os.ReadFile(filepath.Join(dir, ArgvFile))
+	if err != nil {
+		return nil, err
+	}
+	var argv []string
+	if err := json.Unmarshal(data, &argv); err != nil {
+		return nil, fmt.Errorf("qemu: reading %s: %w", ArgvFile, err)
+	}
+	return argv, nil
 }
 
 // writeShareTable publishes the share table into the directory exported to
@@ -258,6 +360,12 @@ func ensureEFIVars(src, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return err
 	}
+	return writeAtomic(dst, data, 0o600)
+}
+
+// writeAtomic writes data to a temporary sibling of dst, syncs it and
+// renames it into place, so a reader never sees a partial file.
+func writeAtomic(dst string, data []byte, perm os.FileMode) error {
 	tmp, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".*.tmp")
 	if err != nil {
 		return fmt.Errorf("qemu: writing %s: %w", dst, err)
@@ -275,7 +383,7 @@ func ensureEFIVars(src, dst string) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("qemu: writing %s: %w", dst, err)
 	}
-	if err := os.Chmod(tmpName, 0o600); err != nil {
+	if err := os.Chmod(tmpName, perm); err != nil {
 		return err
 	}
 	if err := os.Rename(tmpName, dst); err != nil {
@@ -369,21 +477,8 @@ func (b Backend) Cleanup(m *machine.Machine) error {
 	return removeAll(qmp)
 }
 
-// waitExit polls until the process is gone, the timeout lapses or ctx is
-// cancelled. It returns true if the process exited.
+// waitExit polls until the process is gone (a zombie counts as gone), the
+// timeout lapses or ctx is cancelled. It returns true if the process exited.
 func waitExit(ctx context.Context, pid int, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for {
-		if !processAlive(pid) {
-			return true
-		}
-		if time.Now().After(deadline) {
-			return false
-		}
-		select {
-		case <-ctx.Done():
-			return !processAlive(pid)
-		case <-time.After(pollInterval):
-		}
-	}
+	return procx.WaitExit(ctx, pid, timeout)
 }

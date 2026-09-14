@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gabrielbelli/jailmachine/internal/backend"
 	"github.com/gabrielbelli/jailmachine/internal/forwarder"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
 	"github.com/gabrielbelli/jailmachine/internal/netprov/gvproxy"
@@ -264,4 +265,112 @@ func TestSetNoMountsDropsEveryShare(t *testing.T) {
 	if _, err := (setOpts{noMounts: true, mount: []string{"/tmp"}}).validate(m); err == nil {
 		t.Error("--no-mounts with --mount should be rejected")
 	}
+}
+
+func TestIdleSuspendFlagParse(t *testing.T) {
+	good := map[string]int{
+		"0": 0, "off": 0, "OFF": 0, "never": 0, "Never": 0, "0m": 0, "0h": 0,
+		"30": 30, "45": 45, "5": 5, "30m": 30, "30M": 30, "30min": 30, "30MIN": 30,
+		"2h": 120, "2H": 120, "168h": 10080, "10080": 10080, "10080m": 10080, " 1h ": 60,
+	}
+	for in, want := range good {
+		got, err := ParseIdleSuspend(in)
+		if err != nil || got != want {
+			t.Errorf("ParseIdleSuspend(%q) = %d, %v; want %d", in, got, err, want)
+		}
+	}
+	const msg = "--idle-suspend must be 0 (never) or between 5m and 168h"
+	for _, in := range []string{
+		"", "4", "4m", "10081", "169h", "-30", "-1h", "1.5h", "0.5", "30s", "2d", "h", "m", "min",
+		"thirty", "30 m", "+30", "99999999999999999999", "99999999h",
+	} {
+		got, err := ParseIdleSuspend(in)
+		if err == nil {
+			t.Errorf("ParseIdleSuspend(%q) = %d, want error", in, got)
+			continue
+		}
+		if err.Error() != msg || exitCode(err) != ExitUsage {
+			t.Errorf("ParseIdleSuspend(%q): %q (exit %d), want %q (exit %d)", in, err, exitCode(err), msg, ExitUsage)
+		}
+	}
+	for mins, want := range map[int]string{0: "off", 30: "30 min"} {
+		if got := idleSuspendWord(mins); got != want {
+			t.Errorf("idleSuspendWord(%d) = %q, want %q", mins, got, want)
+		}
+	}
+
+	m := machine.Defaults()
+	c, err := setOpts{idleSuspend: "2h", idleSuspendSet: true}.validate(&m)
+	if err != nil || c.idleSuspendMin != 120 || !c.any() || c.needsStopped() {
+		t.Errorf("set --idle-suspend 2h: %+v, %v", c, err)
+	}
+	if _, err := (setOpts{idleSuspend: "1m", idleSuspendSet: true}).validate(&m); err == nil || !strings.Contains(err.Error(), "--idle-suspend must") {
+		t.Errorf("set --idle-suspend 1m: %v", err)
+	}
+	if _, err := (setOpts{}).validate(&m); err == nil || !strings.Contains(err.Error(), "--idle-suspend") {
+		t.Errorf("nothing to set should name --idle-suspend: %v", err)
+	}
+}
+
+// TestSetIdleSuspendEveryState: the idle time is a record setting read
+// live, so "jm set --idle-suspend" is accepted whatever the machine is
+// doing and never asks for a restart.
+func TestSetIdleSuspendEveryState(t *testing.T) {
+	t.Cleanup(func() { fakeBE.state, fakeNet.state = backend.Stopped, backend.Stopped })
+	for _, tc := range []struct {
+		name   string
+		be, nw backend.State
+	}{
+		{"stopped", backend.Stopped, backend.Stopped},
+		{"running", backend.Running, backend.Running},
+		{"broken", backend.Running, backend.Stopped},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			seedFakeRecord(t, root, "idle")
+			fakeBE.state, fakeNet.state = tc.be, tc.nw
+			if st, err := currentState(mustLoad(t, root, "idle")); err != nil || string(st) != tc.name {
+				t.Fatalf("state = %v, %v; want %s", st, err, tc.name)
+			}
+			beStops, netStops := len(fakeBE.stops), fakeNet.stops
+			out, err := run(t, root, "set", "idle", "--idle-suspend", "off")
+			if err != nil {
+				t.Fatalf("%v\n%s", err, out)
+			}
+			if !strings.Contains(out, "idle suspend: 30 min -> off") {
+				t.Errorf("output lacks the change line:\n%s", out)
+			}
+			for _, bad := range []string{"next start", "jm stop", "restart"} {
+				if strings.Contains(out, bad) {
+					t.Errorf("output should not ask for a restart (%q):\n%s", bad, out)
+				}
+			}
+			if m := mustLoad(t, root, "idle"); m.IdleSuspendMin != 0 {
+				t.Errorf("record not updated: %d", m.IdleSuspendMin)
+			}
+			out, err = run(t, root, "set", "idle", "--idle-suspend", "2h")
+			if err != nil || !strings.Contains(out, "idle suspend: off -> 120 min") {
+				t.Errorf("set 2h = %q, %v", out, err)
+			}
+			if m := mustLoad(t, root, "idle"); m.IdleSuspendMin != 120 {
+				t.Errorf("record not updated: %d", m.IdleSuspendMin)
+			}
+			if len(fakeBE.stops) != beStops || fakeNet.stops != netStops || fakeBE.state != tc.be || fakeNet.state != tc.nw {
+				t.Errorf("set stopped a component: backend %v, provider %d", fakeBE.stops[beStops:], fakeNet.stops-netStops)
+			}
+			_, err = run(t, root, "set", "idle", "--idle-suspend", "3")
+			if err == nil || exitCode(err) != ExitUsage {
+				t.Errorf("set --idle-suspend 3: %v (exit %d), want a usage error", err, exitCode(err))
+			}
+		})
+	}
+}
+
+func mustLoad(t *testing.T, root, name string) *machine.Machine {
+	t.Helper()
+	m, err := machine.NewStore(root).Load(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
 }
