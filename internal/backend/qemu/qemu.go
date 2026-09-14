@@ -47,10 +47,11 @@ func init() { backend.Register(Backend{}) }
 // Name implements backend.Backend.
 func (Backend) Name() string { return Name }
 
-// Capabilities implements backend.Backend: a serial console, and host
-// filesystem sharing over virtio-9p (ADR 0007).
+// Capabilities implements backend.Backend: a serial console, host
+// filesystem sharing over virtio-9p (ADR 0007), and suspend to a file
+// (ADR 0009).
 func (Backend) Capabilities() backend.Capabilities {
-	return backend.Capabilities{SerialConsole: true, FileSharing: true}
+	return backend.Capabilities{SerialConsole: true, FileSharing: true, Suspend: true}
 }
 
 // Preflight implements backend.Backend: the emulator and its firmware must
@@ -96,16 +97,49 @@ func (b Backend) paths(m *machine.Machine) Paths {
 	}
 }
 
-// State implements backend.Backend: computed from the pid file and the
-// process behind it, never cached. A pid that is alive but is not our QEMU
-// (pid recycled after a reboot or crash) is Broken, so Start repairs and
-// Stop never signals a foreign process.
+// State implements backend.Backend: computed from the pid file, the
+// process behind it and the suspend journal, never cached and never over
+// QMP. A pid that is alive but is not our QEMU (pid recycled after a reboot
+// or crash) is not running, so Start repairs and Stop never signals a
+// foreign process.
 func (b Backend) State(m *machine.Machine) (backend.State, error) {
 	if m.Dir == "" {
 		return "", ErrNoDir
 	}
 	pidFile := b.paths(m).PID
-	return stateFromPIDFile(pidFile, func(pid int) bool { return isOurQEMU(pid, pidFile) })
+	sp := suspendPaths(m.Dir)
+	return stateFromFiles(pidFile, sp.Journal, sp.Image, func(pid int) bool { return isOurQEMU(pid, pidFile) })
+}
+
+// stateFromFiles is the pure core of State (ADR 0009 state table):
+//
+//	qemu.pid         journal       image             state
+//	live, ours       any           -                 running
+//	absent or stale  saved         valid             suspended
+//	absent or stale  saved         missing or short  broken
+//	absent or stale  saving        -                 broken
+//	absent or stale  unparseable   -                 broken
+//	absent           none          any               stopped
+//	stale            none          -                 broken
+//
+// A running machine with a journal is a transition in flight or interrupted;
+// callers that need a usable guest check for the journal too.
+func stateFromFiles(pidFile, journal, image string, ours func(pid int) bool) (backend.State, error) {
+	pidState, err := stateFromPIDFile(pidFile, ours)
+	if err != nil || pidState == backend.Running {
+		return pidState, err
+	}
+	j, jerr := readJournal(journal)
+	switch {
+	case errors.Is(jerr, os.ErrNotExist):
+		return pidState, nil // stopped, or broken for a stale pid file
+	case jerr != nil:
+		return backend.Broken, nil
+	case j.Phase == backend.SuspendSaved && validImage(image, j):
+		return backend.Suspended, nil
+	default:
+		return backend.Broken, nil
+	}
 }
 
 // stateFromPIDFile is the pure core of State, shared with tests. ours
@@ -127,13 +161,52 @@ func stateFromPIDFile(pidFile string, ours func(pid int) bool) (backend.State, e
 }
 
 // Repair removes stale runtime files left behind by a dead QEMU (ADR 0005
-// "broken" -> "stopped").
+// "broken" -> "stopped"). A valid saved pair (a "saved" journal whose image
+// has the committed size) is kept, so a suspended machine with a stale pid
+// file repairs to suspended. Anything else of a suspend is discarded: an
+// unparseable journal is kept aside as suspend.json.bad, and a "saving" or
+// invalid "saved" journal is removed before its image. It must not be
+// called while QEMU runs.
 func (b Backend) Repair(m *machine.Machine) error {
 	if m.Dir == "" {
 		return ErrNoDir
 	}
 	p := b.paths(m)
-	return removeAll(p.PID, p.QMP)
+	if err := removeAll(p.PID, p.QMP); err != nil {
+		return err
+	}
+	return repairSuspend(suspendPaths(m.Dir))
+}
+
+// repairSuspend keeps a valid saved pair and discards everything else. A
+// journal or image that cannot be read (an I/O or permission error, as
+// opposed to one that was read and is invalid) changes nothing: the error is
+// returned, because discarding would destroy a saved state that may be fine.
+func repairSuspend(sp journalPaths) error {
+	j, err := readJournal(sp.Journal)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return removeImages(sp) // orphans of a finished or discarded suspend
+	case errors.Is(err, errBadJournal):
+		if rerr := os.Rename(sp.Journal, sp.Bad); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+			return fmt.Errorf("qemu: setting aside a bad suspend journal: %w", rerr)
+		}
+		if err := syncDir(filepath.Dir(sp.Journal)); err != nil {
+			return err
+		}
+		return removeImages(sp)
+	case err != nil:
+		return fmt.Errorf("qemu: reading the suspend journal (nothing was changed): %w", err)
+	}
+	valid, err := checkImage(sp.Image, j)
+	switch {
+	case err != nil:
+		return fmt.Errorf("%w (nothing was changed)", err)
+	case j.Phase == backend.SuspendSaved && valid:
+		return removeAll(sp.Tmp)
+	default:
+		return discardJournalThenImage(sp)
+	}
 }
 
 func removeAll(paths ...string) error {
@@ -164,13 +237,29 @@ func (b Backend) Start(ctx context.Context, m *machine.Machine, net backend.NetA
 	switch st {
 	case backend.Running:
 		return ErrRunning
+	case backend.Suspended:
+		return backend.ErrSuspended
 	case backend.Broken:
 		if err := b.Repair(m); err != nil {
 			return fmt.Errorf("qemu: repairing stale state: %w", err)
 		}
+		// A suspended machine with a stale pid file repairs to suspended.
+		if st, err := b.State(m); err != nil {
+			return err
+		} else if st == backend.Suspended {
+			return backend.ErrSuspended
+		}
 	}
 
 	p := b.paths(m)
+	// With no journal, a saved image is an orphan of an interrupted
+	// discard or wake; a cold boot makes it meaningless.
+	sp := suspendPaths(m.Dir)
+	if _, err := os.Stat(sp.Journal); errors.Is(err, os.ErrNotExist) {
+		if err := removeImages(sp); err != nil {
+			return fmt.Errorf("qemu: removing an orphan suspend image: %w", err)
+		}
+	}
 	if _, err := os.Stat(p.Disk); err != nil {
 		return fmt.Errorf("qemu: disk image missing (run 'jm init'): %w", err)
 	}

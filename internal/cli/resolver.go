@@ -331,7 +331,7 @@ var errNoResolver = errors.New("no host resolver is running for this machine")
 //     came back.
 func resolverParityCheck(ctx context.Context, m *machine.Machine) (doctor.Result, bool) {
 	res := doctor.Result{Name: "resolver " + m.Name}
-	if resolverState(m) != backend.Running {
+	if resolverState(m) != backend.Running || suspendInProgress(m) {
 		return res, false
 	}
 	pr := resolverProcess(m)
@@ -443,7 +443,7 @@ func sameAddrs(got []string, want []netip.Addr) bool {
 // reports the loss afterwards (ADR 0008).
 func guestResolverParityCheck(ctx context.Context, m *machine.Machine) (doctor.Result, bool) {
 	res := doctor.Result{Name: "guest resolver " + m.Name}
-	if st, err := currentState(m); err != nil || st != backend.Running {
+	if st, err := currentState(m); err != nil || !ready(m, st) {
 		return res, false
 	}
 	ep, err := endpointOf(m)

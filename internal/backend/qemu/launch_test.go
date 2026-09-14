@@ -23,7 +23,9 @@ import (
 
 // fakeQEMUEnv switches the test binary into a fake qemu-system-aarch64 (see
 // TestMain): "ready" writes the pid file at once and answers QMP after
-// $JM_FAKE_QEMU_DELAY_MS, "exit" fails at once, "hang" never gets ready.
+// $JM_FAKE_QEMU_DELAY_MS, "exit" fails at once, "hang" never gets ready,
+// "unsupported" fails the way QEMU does on an unknown machine type. The QMP
+// side is serveFakeQEMU (fake_qemu_test.go).
 const (
 	fakeQEMUEnv      = "JM_FAKE_QEMU"
 	fakeQEMUDelayEnv = "JM_FAKE_QEMU_DELAY_MS"
@@ -74,39 +76,7 @@ func fakeQEMUMain(mode string, args []string) int {
 	case "hang":
 		select {}
 	}
-	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	delay, _ := strconv.Atoi(os.Getenv(fakeQEMUDelayEnv))
-	time.Sleep(time.Duration(delay) * time.Millisecond)
-	ln, err := net.Listen("unix", qmp)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			return 1
-		}
-		go func() {
-			defer conn.Close()
-			enc, dec := json.NewEncoder(conn), json.NewDecoder(conn)
-			_ = enc.Encode(map[string]any{"QMP": map[string]any{"version": map[string]any{}, "capabilities": []string{}}})
-			for {
-				var c qmpCommand
-				if dec.Decode(&c) != nil {
-					return
-				}
-				if c.Execute == "query-status" {
-					_ = enc.Encode(map[string]any{"return": map[string]any{"status": "prelaunch", "running": false}})
-					continue
-				}
-				_ = enc.Encode(map[string]any{"return": map[string]any{}})
-			}
-		}()
-	}
+	return serveFakeQEMU(mode, args, pidFile, qmp)
 }
 
 // fakeQEMUInstall puts a qemu-system-aarch64 script that execs this test

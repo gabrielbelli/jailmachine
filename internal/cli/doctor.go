@@ -92,6 +92,9 @@ func machineChecks(ctx context.Context) []doctor.Result {
 			if res, ok := datagramLimitCheck(m); ok {
 				out = append(out, res)
 			}
+			if res, ok := suspendReadinessCheck(m); ok {
+				out = append(out, res)
+			}
 		}
 	}
 	return out
@@ -153,6 +156,29 @@ func checkMachine(name string) doctor.Result {
 		return res
 	}
 	res.Detail = fmt.Sprintf("%s (%s, %s)", st, b.Name(), p.Name())
+	switch {
+	case st == backend.Suspended:
+		// Reported from the journal alone: doctor never wakes a machine.
+		res.Status = doctor.OK
+		res.Detail = "suspended"
+		if s, ok := b.(backend.Suspender); ok {
+			if ss, err := s.SuspendStatus(m); err == nil {
+				if !ss.SavedAt.IsZero() {
+					res.Detail += " since " + ss.SavedAt.Local().Format("2006-01-02 15:04")
+				}
+				if ss.AllocatedBytes > 0 {
+					res.Detail += ", image " + humanBytes(ss.AllocatedBytes)
+				}
+			}
+		}
+		res.Detail += fmt.Sprintf(" (wakes on first use; %s, %s)", b.Name(), p.Name())
+		return res
+	case st == backend.Running && suspendInProgress(m):
+		res.Status = doctor.Warn
+		res.Detail = fmt.Sprintf("a suspend or wake is in progress or was interrupted (%s, %s)", b.Name(), p.Name())
+		res.Fix = "if no jm command is running, 'jm start " + name + "' resolves it"
+		return res
+	}
 	if st == backend.Broken {
 		res.Status = doctor.Warn
 		res.Fix = fmt.Sprintf("stale hypervisor or network state; 'jm stop %s' repairs it (%s)", name, consoleHint(m, b))
@@ -160,6 +186,45 @@ func checkMachine(name string) doctor.Result {
 	}
 	res.Status = doctor.OK
 	return res
+}
+
+// suspendReadinessCheck warns, for a running machine with idle suspend on,
+// about what would keep it from being suspended: a hypervisor started by an
+// older jm, which cannot be saved without crashing it, or a volume without
+// room for the saved state (ADR 0009). It reads files and the process table
+// only.
+func suspendReadinessCheck(m *machine.Machine) (doctor.Result, bool) {
+	res := doctor.Result{Name: "suspend " + m.Name}
+	if m.IdleSuspendMin == 0 {
+		return res, false
+	}
+	b, p, err := components(m)
+	if err != nil {
+		return res, false
+	}
+	if st, err := stateOf(m, b, p); err != nil || !ready(m, st) {
+		return res, false
+	}
+	if _, ok := b.(backend.Suspender); !ok || !b.Capabilities().Suspend {
+		return res, false
+	}
+	// A provider that cannot be parked makes suspend unsupported, not
+	// something to fix: no row, as for a backend without the capability.
+	if _, ok := p.(netprov.APIForwarder); !ok || !p.Capabilities().Supervised {
+		return res, false
+	}
+	if err := suspendPreflight(m, b, p); err != nil {
+		res.Status, res.Detail = doctor.Warn, err.Error()
+		switch {
+		case strings.Contains(err.Error(), "free"):
+			res.Fix = "free space on the volume holding " + m.Dir + ", or lower --memory"
+		case strings.Contains(err.Error(), "older jm"):
+			res.Fix = "jm stop " + m.Name + " && jm start " + m.Name
+		}
+		return res, true
+	}
+	res.Status, res.Detail = doctor.OK, "can be suspended ('jm suspend "+m.Name+"')"
+	return res, true
 }
 
 // datagramLimitCheck states the one silent limit of the host<->guest link:

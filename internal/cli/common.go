@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/gabrielbelli/jailmachine/internal/backend"
@@ -83,10 +84,17 @@ func components(m *machine.Machine) (backend.Backend, netprov.Provider, error) {
 // neither does, broken when either is broken or they disagree. An
 // unsupervised provider (slirp) lives inside the hypervisor and reports
 // "running" regardless, so it cannot disagree with a stopped backend.
+//
+// A suspended hypervisor makes the machine suspended whatever the provider
+// says (ADR 0009): the provider is stopped while a machine sleeps, and runs
+// in the window of a wake between the network coming up and the guest being
+// restored, or after a wake that was interrupted there, which recovery parks.
 func combineState(bs, ps backend.State, supervised bool) backend.State {
 	switch {
 	case bs == backend.Broken || ps == backend.Broken:
 		return backend.Broken
+	case bs == backend.Suspended:
+		return backend.Suspended
 	case bs == backend.Running && ps == backend.Running:
 		return backend.Running
 	case bs == backend.Stopped && ps == backend.Stopped:
@@ -95,6 +103,25 @@ func combineState(bs, ps backend.State, supervised bool) backend.State {
 		return backend.Stopped
 	}
 	return backend.Broken
+}
+
+// suspendInProgress reports whether m has a suspend journal (ADR 0009). The
+// hypervisor is alive during a transition, so the machine reads running;
+// every check that is about to use the guest or the engine asks for
+// "running and no journal", because a paused guest takes a connection and
+// never answers it. It is a stat, so read commands can afford it.
+func suspendInProgress(m *machine.Machine) bool {
+	if m.Dir == "" {
+		return false
+	}
+	_, err := os.Lstat(filepath.Join(m.Dir, machine.SuspendJournalFile))
+	return err == nil
+}
+
+// ready reports whether st and m's files say the guest can be used now:
+// running, with no suspend or wake in flight.
+func ready(m *machine.Machine, st backend.State) bool {
+	return st == backend.Running && !suspendInProgress(m)
 }
 
 // currentState computes the runtime state; it is never cached (ADR 0005).
@@ -124,6 +151,11 @@ func stateOf(m *machine.Machine, b backend.Backend, p netprov.Provider) (backend
 // running (e.g. the provider died under a live guest) and graceful is
 // set, the guest is asked to power off rather than having the plug
 // pulled; only a dead or stale hypervisor is torn down forcibly.
+//
+// A valid saved state survives the repair: the backend keeps it, so the
+// caller must recompute the state afterwards, since a repaired machine may
+// be suspended rather than stopped (ADR 0009). The per-machine helper that
+// holds a suspended machine's endpoints is not stopped here either.
 func repairBroken(ctx context.Context, m *machine.Machine, b backend.Backend, p netprov.Provider, graceful bool) error {
 	stopForwarder(ctx, m, p)
 	stopResolver(ctx, m)

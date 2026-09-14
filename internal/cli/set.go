@@ -52,7 +52,10 @@ func newSetCmd() *cobra.Command {
 			"'jm start'. The cap must be at least 64 MiB and below the memory.\n\n" +
 			"--idle-suspend sets how long a running machine may sit idle before it is\n" +
 			"suspended to disk; it wakes on first use. It can be changed in any state and\n" +
-			"needs no restart.",
+			"needs no restart.\n\n" +
+			"A suspended machine keeps the hardware it was saved with: --cpus, --memory,\n" +
+			"--ssh-port, the shares and --disk are refused until 'jm stop' (or, for --disk,\n" +
+			"'jm start'). --arc and --publish-addr are recorded and applied when it wakes.",
 		Example: `  jm set --cpus 8 --memory 8GiB
   jm set --mount /work --mount /srv/data:ro
   jm set --unmount /srv/data
@@ -277,6 +280,13 @@ func runSet(ctx context.Context, args []string, o setOpts) error {
 		return err
 	}
 	stopHint := "stop the machine first: jm stop" + nameHint(m.Name)
+	if st == backend.Running && suspendInProgress(m) && (c.needsStopped() || c.diskSet || c.arcSet) {
+		return withHint(fmt.Errorf("a suspend or wake of %s is in progress or was interrupted", m.Name), "'jm start"+nameHint(m.Name)+"' finishes it")
+	}
+	if st == backend.Suspended && c.needsStopped() {
+		return withHint(fmt.Errorf("%s is suspended; cpus, memory, the ssh port and the shared directories change only on a stopped machine", m.Name),
+			"'jm stop"+nameHint(m.Name)+"' restores it and shuts it down")
+	}
 	if st != backend.Stopped && c.needsStopped() {
 		return withHint(fmt.Errorf("%s is %s; cpus, memory, the ssh port and the shared directories change only on a stopped machine", m.Name, st), stopHint)
 	}
@@ -330,6 +340,10 @@ func runSet(ctx context.Context, args []string, o setOpts) error {
 		var resizer backend.Resizer
 		switch st {
 		case backend.Stopped:
+		case backend.Suspended:
+			// The saved state holds the old disk size.
+			return withHint(fmt.Errorf("%s is suspended; its disk grows only while it runs or is stopped", m.Name),
+				"run 'jm start"+nameHint(m.Name)+"' first (it grows live), or 'jm stop"+nameHint(m.Name)+"'")
 		case backend.Running:
 			b, err := backendFor(m)
 			if err != nil {
@@ -379,6 +393,8 @@ func runSet(ctx context.Context, args []string, o setOpts) error {
 			if err := applyArcLive(ctx, m); err != nil {
 				return fmt.Errorf("ZFS ARC cap recorded but not applied to the running guest (retried on the next start): %w", err)
 			}
+		} else if st == backend.Suspended {
+			logf(stdout, "the ZFS ARC cap is applied when %s wakes", m.Name)
 		} else {
 			logf(stdout, "the ZFS ARC cap is applied on the next start: jm start%s", nameHint(m.Name))
 		}

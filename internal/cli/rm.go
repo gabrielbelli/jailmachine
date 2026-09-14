@@ -16,7 +16,7 @@ func newRmCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "rm [name]",
 		Short: "Remove a machine and all its state",
-		Long:  "Stop the machine if needed, forget its podman connection and host key, and delete its directory. Always converges to \"gone\".",
+		Long:  "Stop the machine if needed, forget its podman connection and host key, and delete its directory. Always converges to \"gone\". A suspended machine's saved state is discarded, not restored.",
 		Example: `  jm rm
   jm rm --force dev`,
 		Args: cobra.MaximumNArgs(1),
@@ -74,7 +74,9 @@ func newRmCmd() *cobra.Command {
 					}
 				}
 			} else {
-				if err := stopMachine(ctx, m, !force); err != nil {
+				// A suspended machine is discarded, never restored only
+				// to be deleted.
+				if err := stopMachine(ctx, m, !force, true); err != nil {
 					if !force {
 						return withHint(err, "use 'jm rm --force"+nameHint(name)+"' to remove anyway")
 					}

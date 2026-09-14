@@ -99,7 +99,23 @@ func (c Capabilities) MaxDatagram() int {
 // be up first. "jm start" calls it after the guest is provisioned; Stop
 // must tear the helper down as well.
 type APIForwarder interface {
+	// StartAPIForward starts the helper. It replaces whatever socket file
+	// is at the path without a moment where the path is missing, and
+	// returns once a socket that was not there before answers.
 	StartAPIForward(ctx context.Context, m *machine.Machine) error
+	// StopAPIForward stops the helper and leaves the socket path alone:
+	// by then it may belong to someone holding the endpoint while the
+	// machine is suspended (ADR 0009).
+	StopAPIForward(ctx context.Context, m *machine.Machine) error
+}
+
+// Parker is an optional Provider interface for a stop that keeps the host
+// engine socket when something else serves it. A machine being suspended
+// parks its provider (ADR 0009): the provider's processes and runtime files
+// go, and a stand-in may keep answering at the engine socket. Park is
+// idempotent.
+type Parker interface {
+	Park(ctx context.Context, m *machine.Machine) error
 }
 
 // ErrUnsupported is returned by providers that have no port-mapping API

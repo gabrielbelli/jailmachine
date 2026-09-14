@@ -100,6 +100,9 @@ const (
 	LogFile        = "gvproxy.log"
 	ForwardPIDFile = "forward.pid" // ssh -L helper serving podman.sock
 	ForwardLogFile = "forward.log"
+	// ForwardInoFile records the inode of the podman.sock the helper bound,
+	// so a stop removes that socket and never one that replaced it.
+	ForwardInoFile = "forward.ino"
 )
 
 // Timeouts.
@@ -124,6 +127,7 @@ type Paths struct {
 	Log    string // gvproxy.log
 	FwdPID string // forward.pid
 	FwdLog string // forward.log
+	FwdIno string // forward.ino
 }
 
 // PathsFor returns the paths for a machine directory.
@@ -137,21 +141,28 @@ func PathsFor(dir string) Paths {
 		Log:    filepath.Join(dir, LogFile),
 		FwdPID: filepath.Join(dir, ForwardPIDFile),
 		FwdLog: filepath.Join(dir, ForwardLogFile),
+		FwdIno: filepath.Join(dir, ForwardInoFile),
 	}
 }
 
 // Sockets lists the unix sockets, the ones that may live out of tree.
 func (p Paths) Sockets() []string { return []string{p.Net, p.API, p.Podman} }
 
-// Args builds the gvproxy argument vector.
+// Args builds the gvproxy argument vector. The link size is the one recorded
+// on the machine when it has one, so a restart (a wake from suspend, whose
+// guest keeps its configured MTU) never reads $JM_MTU; MTU() otherwise.
 func Args(m *machine.Machine, p Paths) []string {
+	mtu := m.MTU
+	if mtu <= 0 {
+		mtu = MTU()
+	}
 	return []string{
 		"-listen-qemu", "unix://" + p.Net,
 		"-listen", "unix://" + p.API,
 		"-ssh-port", strconv.Itoa(m.SSHPort),
 		"-pid-file", p.PID,
 		"-log-file", p.Log,
-		"-mtu", strconv.Itoa(MTU()),
+		"-mtu", strconv.Itoa(mtu),
 	}
 }
 
@@ -255,7 +266,7 @@ func (Provider) Repair(m *machine.Machine) error {
 		return ErrNoDir
 	}
 	p := PathsFor(m.Dir)
-	return errors.Join(stopForward(context.Background(), p), removeAll(append(p.Sockets(), p.PID)...))
+	return errors.Join(stopForward(context.Background(), p, false), removeAll(append(p.Sockets(), p.PID)...))
 }
 
 // Start implements netprov.Provider: launches gvproxy detached and waits
@@ -359,7 +370,15 @@ func (pr Provider) Stop(ctx context.Context, m *machine.Machine) error {
 	if st != backend.Running {
 		return pr.Repair(m)
 	}
-	p := PathsFor(m.Dir)
+	if err := terminate(ctx, PathsFor(m.Dir)); err != nil {
+		return err
+	}
+	return pr.Repair(m)
+}
+
+// terminate ends the gvproxy recorded in the pid file: SIGTERM, wait,
+// SIGKILL. The caller has checked that the pid is ours.
+func terminate(ctx context.Context, p Paths) error {
 	pid, err := readPID(p.PID)
 	if err != nil {
 		return err
@@ -373,7 +392,43 @@ func (pr Provider) Stop(ctx context.Context, m *machine.Machine) error {
 			return fmt.Errorf("gvproxy: pid %d did not exit after SIGKILL", pid)
 		}
 	}
-	return pr.Repair(m)
+	return nil
+}
+
+// Park implements netprov.Parker for a suspend (ADR 0009): gvproxy and the
+// podman socket forward are stopped and their runtime files removed, but
+// podman.sock is removed only when nothing answers on it, so a stand-in
+// holding the endpoint keeps it. forwards.json is not this provider's and
+// is left alone.
+func (pr Provider) Park(ctx context.Context, m *machine.Machine) error {
+	if m.Dir == "" {
+		return ErrNoDir
+	}
+	st, err := pr.State(m)
+	if err != nil {
+		return err
+	}
+	p := PathsFor(m.Dir)
+	if st == backend.Running {
+		if err := terminate(ctx, p); err != nil {
+			return err
+		}
+	}
+	errs := []error{stopForward(ctx, p, true)}
+	if staleSocket(p.Podman) {
+		errs = append(errs, removeAll(p.Podman))
+	}
+	errs = append(errs, removeAll(p.Net, p.API, p.PID))
+	return errors.Join(errs...)
+}
+
+// StopAPIForward implements netprov.APIForwarder: the podman socket forward
+// is stopped and podman.sock is left where it is.
+func (Provider) StopAPIForward(ctx context.Context, m *machine.Machine) error {
+	if m.Dir == "" {
+		return ErrNoDir
+	}
+	return stopForward(ctx, PathsFor(m.Dir), true)
 }
 
 // StartAPIForward implements netprov.APIForwarder: serve podman.sock on
