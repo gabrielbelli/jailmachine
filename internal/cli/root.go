@@ -92,6 +92,7 @@ func NewRootCmd() *cobra.Command {
 		newInitCmd(),
 		newStartCmd(),
 		newStopCmd(),
+		newSuspendCmd(),
 		newSSHCmd(),
 		newInspectCmd(),
 		newRmCmd(),
@@ -102,6 +103,8 @@ func NewRootCmd() *cobra.Command {
 		newPortsCmd(),
 		newForwarderCmd(),
 		newResolverCmd(),
+		newSleeperCmd(),
+		newWakeCmd(),
 		newDoctorCmd(),
 		newSetCmd(),
 		newConsoleCmd(),
@@ -154,6 +157,11 @@ guest, so VPN and split-horizon records, /etc/hosts entries and .local names
 all work inside a container, and the host itself is host.docker.internal
 (host.containers.internal).
 
+"jm suspend" saves a running machine to its directory and gives its memory
+back to macOS; jpodman, jdocker, "jm start" and "jm ssh" wake it in seconds
+with its processes intact. "jm stop" restores a suspended machine and shuts it
+down; "jm stop --force" and "jm rm" discard the saved state.
+
 Published ports bind every host interface by default, as docker does on
 Linux; "jm init/set --publish-addr 127.0.0.1" keeps them on loopback.
 
@@ -164,6 +172,7 @@ does not exist and exactly one machine does, that one is used. Exit codes:
 const rootExample = `  jm init && jm start
   jm list
   jm ssh -- uname -a
+  jm suspend && jpodman ps     # save to disk, then wake on first use
   jm stop && jm rm`
 
 // Execute runs the root command and exits with ExitOK, ExitFailure or

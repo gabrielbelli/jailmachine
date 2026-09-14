@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -414,48 +416,171 @@ func TestHelpListsEnv(t *testing.T) {
 
 // fakeBackend and fakeProvider let the broken-state repair be exercised
 // without a hypervisor: their states are scripted and Stop calls recorded.
+// The backend also implements backend.Suspender and the provider the
+// optional netprov interfaces, scripted the same way, and both record what
+// they were asked to do in fakeEvents.
 type fakeBackend struct {
 	state    backend.State
 	stops    []bool
 	stopArgs *[]bool
+
+	// Suspender scripting.
+	suspendable string
+	commitErr   error
+	resumeErr   error
+	// resumeLeavesRunning makes a failing Resume fail after the journal is
+	// gone and the guest runs, as a failed cont does.
+	resumeLeavesRunning bool
+	recoverAction       backend.RecoverAction
+	recoverErr          error
+	savedAt             time.Time
+	allocated           int64
+	meta                map[string]string
+	// onPrepare runs once PrepareSuspend has written the journal.
+	onPrepare func(m *machine.Machine)
 }
 
 func (f *fakeBackend) Name() string     { return "fakebe" }
 func (f *fakeBackend) Preflight() error { return nil }
 func (f *fakeBackend) Start(context.Context, *machine.Machine, backend.NetAttachment) error {
+	fakeEvent("boot")
+	f.state = backend.Running
 	return nil
 }
 func (f *fakeBackend) Stop(_ context.Context, _ *machine.Machine, graceful bool) error {
 	f.stops = append(f.stops, graceful)
-	f.state = backend.Stopped
+	fakeEvent(fmt.Sprintf("stop graceful=%v", graceful))
+	// Like the real backend, a stop keeps a valid saved state.
+	if f.state != backend.Suspended {
+		f.state = backend.Stopped
+	}
 	return nil
 }
 func (f *fakeBackend) State(*machine.Machine) (backend.State, error) { return f.state, nil }
 func (f *fakeBackend) ConsolePath(*machine.Machine) string           { return "" }
 func (f *fakeBackend) Logs(*machine.Machine) []string                { return nil }
-func (f *fakeBackend) Capabilities() backend.Capabilities            { return backend.Capabilities{} }
+func (f *fakeBackend) Capabilities() backend.Capabilities {
+	return backend.Capabilities{Suspend: true}
+}
+
+func fakeJournal(m *machine.Machine) string { return filepath.Join(m.Dir, machine.SuspendJournalFile) }
+
+func (f *fakeBackend) Suspendable(*machine.Machine) string { return f.suspendable }
+func (f *fakeBackend) SuspendStatus(m *machine.Machine) (backend.SuspendStatus, error) {
+	data, err := os.ReadFile(fakeJournal(m))
+	if err != nil {
+		return backend.SuspendStatus{}, nil
+	}
+	return backend.SuspendStatus{
+		Phase: backend.SuspendPhase(strings.TrimSpace(string(data))), SavedAt: f.savedAt,
+		ImagePath: filepath.Join(m.Dir, machine.SuspendImageFile), AllocatedBytes: f.allocated, Meta: f.meta,
+	}, nil
+}
+func (f *fakeBackend) PrepareSuspend(_ context.Context, m *machine.Machine, plan backend.SuspendPlan) error {
+	fakeEvent("prepare")
+	f.meta = plan.Meta
+	if err := os.WriteFile(fakeJournal(m), []byte("saving"), 0o600); err != nil {
+		return err
+	}
+	if f.onPrepare != nil {
+		f.onPrepare(m)
+	}
+	return nil
+}
+func (f *fakeBackend) CommitSuspend(_ context.Context, m *machine.Machine, abort func() bool) error {
+	fakeEvent("commit")
+	if abort() {
+		return backend.ErrSuspendAborted
+	}
+	if f.commitErr != nil {
+		return f.commitErr
+	}
+	f.state = backend.Suspended
+	return os.WriteFile(fakeJournal(m), []byte("saved"), 0o600)
+}
+func (f *fakeBackend) CancelSuspend(m *machine.Machine) error {
+	fakeEvent("cancel")
+	_ = os.Remove(fakeJournal(m))
+	return nil
+}
+func (f *fakeBackend) Recover(context.Context, *machine.Machine) (backend.RecoverAction, error) {
+	if f.recoverErr != nil {
+		fakeEvent("recover")
+		return backend.RecoverNone, f.recoverErr
+	}
+	if f.recoverAction == "" {
+		return backend.RecoverNone, nil
+	}
+	fakeEvent("recover")
+	return f.recoverAction, nil
+}
+func (f *fakeBackend) Resume(_ context.Context, m *machine.Machine, _ backend.NetAttachment) error {
+	fakeEvent("resume")
+	if f.resumeErr != nil {
+		if f.resumeLeavesRunning {
+			f.state = backend.Running
+			_ = os.Remove(fakeJournal(m))
+		}
+		return f.resumeErr
+	}
+	f.state = backend.Running
+	_ = os.Remove(fakeJournal(m))
+	return nil
+}
+func (f *fakeBackend) DiscardSuspend(m *machine.Machine, _ string) error {
+	fakeEvent("discard")
+	_ = os.Remove(fakeJournal(m))
+	if f.state == backend.Suspended {
+		f.state = backend.Stopped
+	}
+	return nil
+}
 
 type fakeProvider struct {
 	state backend.State
 	stops int
+	// endpoint, when set, replaces the default 127.0.0.1:2222 endpoint, so
+	// a test can point the machine's sshd at an in-process server.
+	endpoint *netprov.Endpoint
+	mtu      int
 }
 
 func (f *fakeProvider) Name() string                   { return "fakenet" }
 func (f *fakeProvider) Preflight() error               { return nil }
 func (f *fakeProvider) Logs(*machine.Machine) []string { return nil }
 func (f *fakeProvider) Capabilities() netprov.Capabilities {
-	return netprov.Capabilities{Supervised: true}
+	return netprov.Capabilities{Supervised: true, MTU: f.mtu}
 }
-func (f *fakeProvider) Start(context.Context, *machine.Machine) (backend.NetAttachment, netprov.Endpoint, error) {
-	return backend.NetAttachment{}, netprov.Endpoint{}, nil
+func (f *fakeProvider) Start(_ context.Context, m *machine.Machine) (backend.NetAttachment, netprov.Endpoint, error) {
+	fakeEvent("net-start")
+	f.state = backend.Running
+	ep, _ := f.Endpoint(m)
+	return backend.NetAttachment{}, ep, nil
 }
 func (f *fakeProvider) Stop(context.Context, *machine.Machine) error {
 	f.stops++
+	fakeEvent("net-stop")
 	f.state = backend.Stopped
+	return nil
+}
+func (f *fakeProvider) Park(context.Context, *machine.Machine) error {
+	fakeEvent("park")
+	f.state = backend.Stopped
+	return nil
+}
+func (f *fakeProvider) StartAPIForward(context.Context, *machine.Machine) error {
+	fakeEvent("api-forward")
+	return nil
+}
+func (f *fakeProvider) StopAPIForward(context.Context, *machine.Machine) error {
+	fakeEvent("api-unforward")
 	return nil
 }
 func (f *fakeProvider) State(*machine.Machine) (backend.State, error) { return f.state, nil }
 func (f *fakeProvider) Endpoint(*machine.Machine) (netprov.Endpoint, error) {
+	if f.endpoint != nil {
+		return *f.endpoint, nil
+	}
 	return netprov.Endpoint{SSHHost: machine.SSHHost, SSHPort: 2222}, nil
 }
 func (f *fakeProvider) Expose(context.Context, *machine.Machine, netprov.Mapping) error {
@@ -471,7 +596,26 @@ func (f *fakeProvider) List(context.Context, *machine.Machine) ([]netprov.Mappin
 var (
 	fakeBE  = &fakeBackend{}
 	fakeNet = &fakeProvider{}
+
+	fakeEventsMu sync.Mutex
+	fakeEvents   []string
 )
+
+// fakeEvent records one thing a fake was asked to do.
+func fakeEvent(e string) {
+	fakeEventsMu.Lock()
+	defer fakeEventsMu.Unlock()
+	fakeEvents = append(fakeEvents, e)
+}
+
+// takeFakeEvents returns the recorded events and clears the record.
+func takeFakeEvents() []string {
+	fakeEventsMu.Lock()
+	defer fakeEventsMu.Unlock()
+	out := fakeEvents
+	fakeEvents = nil
+	return out
+}
 
 func init() {
 	backend.Register(fakeBE)
@@ -683,4 +827,55 @@ func TestDoctorMachineChecks(t *testing.T) {
 		t.Errorf("doctor table:\n%s", out)
 	}
 	fakeBE.state, fakeNet.state = backend.Stopped, backend.Stopped
+}
+
+func TestImageBuildPassesIdleSuspendZero(t *testing.T) {
+	args := imageBuildInitArgs(image.DefaultRelease)
+	if len(args) == 0 || args[0] != "init" || args[len(args)-1] != imageBuildName {
+		t.Fatalf("init args = %q", args)
+	}
+	found := false
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--idle-suspend" && args[i+1] == "0" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("image build init args lack --idle-suspend 0: %q", args)
+	}
+	// The same arguments must get past init's validation: a build machine
+	// is created never to be suspended.
+	cmd := NewRootCmd()
+	initCmd, rest, err := cmd.Find(args)
+	if err != nil || initCmd.Name() != "init" {
+		t.Fatalf("find init: %v", err)
+	}
+	if err := initCmd.ParseFlags(rest); err != nil {
+		t.Fatalf("parse %q: %v", rest, err)
+	}
+	if v, _ := initCmd.Flags().GetString("idle-suspend"); v != "0" {
+		t.Errorf("--idle-suspend parsed as %q", v)
+	}
+}
+
+func TestInitIdleSuspendFlag(t *testing.T) {
+	base := initOpts{cpus: 4, memory: 2048, disk: 64, sshPort: 2222}
+	for flag, want := range map[string]int{"": machine.DefaultIdleSuspendMin, "0": 0, "off": 0, "45": 45, "2h": 120} {
+		o := base
+		o.idleSuspend = flag
+		if err := o.validate(); err != nil {
+			t.Errorf("init --idle-suspend %q: %v", flag, err)
+		}
+		if got, err := o.idleSuspendMin(); err != nil || got != want {
+			t.Errorf("init --idle-suspend %q = %d, %v; want %d", flag, got, err, want)
+		}
+	}
+	root := t.TempDir()
+	_, err := run(t, root, "init", "--idle-suspend", "1.5h")
+	if err == nil || exitCode(err) != ExitUsage || !strings.Contains(err.Error(), "--idle-suspend must") {
+		t.Errorf("init --idle-suspend 1.5h: %v (exit %d)", err, exitCode(err))
+	}
+	if entries, _ := os.ReadDir(filepath.Join(root, "machines")); len(entries) != 0 {
+		t.Errorf("validation failures must not create state: %v", entries)
+	}
 }

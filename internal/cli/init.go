@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,6 +31,8 @@ func newInitCmd() *cobra.Command {
 		mounts   []string
 		noMounts bool
 		pubAddr  string
+		arc      string
+		idle     string
 	)
 	cmd := &cobra.Command{
 		Use:   "init [name]",
@@ -43,7 +46,9 @@ func newInitCmd() *cobra.Command {
 			"https URL to a .raw, .raw.xz or .raw.zst is used as is, verified against a\n" +
 			"sibling .sha256 when one exists and marked untrusted otherwise.",
 		Example: `  jm init
-  jm init --cpus 2 --memory 2048 dev
+  jm init --cpus 2 --memory 4096 dev
+  jm init --arc 1GiB --memory 8192   # a larger ZFS cache for a larger machine
+  jm init --idle-suspend 2h          # or 0 to never suspend
   jm init --mount /work --mount /srv/data:ro
   jm init --no-mounts
   jm init --image official:` + image.DefaultRelease + ` --disk 32
@@ -53,7 +58,8 @@ func newInitCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runInit(cmd.Context(), args, initOpts{
 				image: imageRef, cpus: cpus, memory: memory, disk: disk, sshPort: sshPort,
-				mounts: mounts, noMounts: noMounts, publishAddr: pubAddr,
+				mounts: mounts, noMounts: noMounts, publishAddr: pubAddr, arc: arc,
+				idleSuspend: idle,
 			})
 		},
 	}
@@ -66,6 +72,8 @@ func newInitCmd() *cobra.Command {
 	f.StringArrayVar(&mounts, "mount", nil, mountFlagUsage)
 	f.BoolVar(&noMounts, "no-mounts", false, "share no host directories at all")
 	f.StringVar(&pubAddr, "publish-addr", "", publishAddrFlagUsage)
+	f.StringVar(&arc, "arc", "", arcFlagUsage+" (default "+strconv.Itoa(d.ArcMiB)+", or half of a smaller --memory)")
+	f.StringVar(&idle, "idle-suspend", "", idleSuspendFlagUsage+" (default "+strconv.Itoa(d.IdleSuspendMin)+"m)")
 	cmd.Long += "\nThe network provider is chosen per host ($JM_NETWORK overrides; known: " +
 		strings.Join(netprov.Names(), ", ") + ").\n\n" +
 		"Host directories are shared with the guest at their own absolute path, so\n" +
@@ -79,7 +87,10 @@ func newInitCmd() *cobra.Command {
 		"shared by default and needs nothing.\n\n" +
 		"Container ports published with '-p' bind every host interface by default, as\n" +
 		"docker does on Linux, which puts them on your LAN; --publish-addr 127.0.0.1\n" +
-		"keeps them on the loopback."
+		"keeps them on the loopback.\n\n" +
+		"--arc caps the guest's ZFS ARC, which FreeBSD otherwise lets grow to nearly\n" +
+		"all of the guest's memory; QEMU keeps every page the guest touches, so an\n" +
+		"uncapped idle machine slowly takes its whole memory size from the host."
 	return cmd
 }
 
@@ -92,6 +103,8 @@ type initOpts struct {
 	mounts      []string
 	noMounts    bool
 	publishAddr string
+	arc         string
+	idleSuspend string
 }
 
 // shares resolves the --mount/--no-mounts flags into the machine's initial
@@ -126,8 +139,40 @@ func (o initOpts) validate() error {
 	case o.sshPort < 1 || o.sshPort > 65535:
 		return usagef("--ssh-port must be between 1 and 65535")
 	}
+	if _, err := o.arcMiB(); err != nil {
+		return err
+	}
+	if _, err := o.idleSuspendMin(); err != nil {
+		return err
+	}
 	_, err := parsePublishAddr(o.publishAddr)
 	return err
+}
+
+// arcMiB parses and range-checks --arc against --memory. Without --arc the
+// cap follows the memory (machine.DefaultArcFor), so "jm init --memory 512"
+// is not refused over a flag nobody gave.
+func (o initOpts) arcMiB() (int, error) {
+	if o.arc == "" {
+		return machine.DefaultArcFor(o.memory), nil
+	}
+	mib, err := ParseMemoryMiB(o.arc)
+	if err != nil {
+		return 0, usagef("--arc: %v", err)
+	}
+	if err := validateArc(mib, o.memory); err != nil {
+		return 0, usage(err)
+	}
+	return mib, nil
+}
+
+// idleSuspendMin parses --idle-suspend; without it a new machine gets
+// machine.DefaultIdleSuspendMin.
+func (o initOpts) idleSuspendMin() (int, error) {
+	if o.idleSuspend == "" {
+		return machine.DefaultIdleSuspendMin, nil
+	}
+	return ParseIdleSuspend(o.idleSuspend)
 }
 
 // imageSource maps a parsed --image reference to a provider and returns the
@@ -246,6 +291,8 @@ func runInit(ctx context.Context, args []string, o initOpts) error {
 	m.Image = ref.String()
 	m.CPUs = o.cpus
 	m.MemoryMiB = o.memory
+	m.ArcMiB, _ = o.arcMiB()                 // validated above
+	m.IdleSuspendMin, _ = o.idleSuspendMin() // validated above
 	m.DiskGiB = o.disk
 	m.SSHPort = o.sshPort
 	m.PublishAddr, _ = parsePublishAddr(o.publishAddr) // validated above

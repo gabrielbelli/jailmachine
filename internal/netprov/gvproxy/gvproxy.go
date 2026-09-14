@@ -6,7 +6,7 @@
 // host->guest port mappings over an HTTP control API.
 //
 // gvproxy must be up before QEMU starts and must outlive it, so it runs
-// detached (own session) with a pid file, log file and the same
+// detached (launched through procx) with a pid file, log file and the same
 // pid-plus-argv liveness rule as the qemu backend.
 //
 // gvproxy's own -forward-sock is deliberately not used: gvproxy 0.8.x
@@ -19,6 +19,8 @@ package gvproxy
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -32,6 +34,7 @@ import (
 	"github.com/gabrielbelli/jailmachine/internal/backend"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
 	"github.com/gabrielbelli/jailmachine/internal/netprov"
+	"github.com/gabrielbelli/jailmachine/internal/procx"
 )
 
 // Name is the identifier stored in the machine record.
@@ -99,6 +102,9 @@ const (
 	LogFile        = "gvproxy.log"
 	ForwardPIDFile = "forward.pid" // ssh -L helper serving podman.sock
 	ForwardLogFile = "forward.log"
+	// ForwardInoFile records the inode of the podman.sock the helper bound,
+	// so a stop removes that socket and never one that replaced it.
+	ForwardInoFile = "forward.ino"
 )
 
 // Timeouts.
@@ -123,11 +129,15 @@ type Paths struct {
 	Log    string // gvproxy.log
 	FwdPID string // forward.pid
 	FwdLog string // forward.log
+	FwdIno string // forward.ino
+	// FwdSock is where the forward binds before it is renamed over
+	// podman.sock, so the path is never missing while it is taken back.
+	FwdSock string
 }
 
 // PathsFor returns the paths for a machine directory.
 func PathsFor(dir string) Paths {
-	return Paths{
+	p := Paths{
 		Net:    backend.SocketPath(dir, NetSockFile),
 		API:    backend.SocketPath(dir, APISockFile),
 		Podman: backend.SocketPath(dir, PodmanSockFile),
@@ -136,21 +146,40 @@ func PathsFor(dir string) Paths {
 		Log:    filepath.Join(dir, LogFile),
 		FwdPID: filepath.Join(dir, ForwardPIDFile),
 		FwdLog: filepath.Join(dir, ForwardLogFile),
+		FwdIno: filepath.Join(dir, ForwardInoFile),
 	}
+	p.FwdSock = forwardBesidePath(p.Podman)
+	return p
+}
+
+// forwardBesidePath is the name the forward binds under before the socket is
+// renamed over podman: in the same directory (rename is atomic only there),
+// shorter than podman.sock so it fits wherever that fits, and distinct per
+// path, because a socket that fell back to the shared temp directory sits
+// next to other machines' sockets.
+func forwardBesidePath(podman string) string {
+	sum := sha256.Sum256([]byte(podman))
+	return filepath.Join(filepath.Dir(podman), ".jmf"+hex.EncodeToString(sum[:2]))
 }
 
 // Sockets lists the unix sockets, the ones that may live out of tree.
 func (p Paths) Sockets() []string { return []string{p.Net, p.API, p.Podman} }
 
-// Args builds the gvproxy argument vector.
+// Args builds the gvproxy argument vector. The link size is the one recorded
+// on the machine when it has one, so a restart (a wake from suspend, whose
+// guest keeps its configured MTU) never reads $JM_MTU; MTU() otherwise.
 func Args(m *machine.Machine, p Paths) []string {
+	mtu := m.MTU
+	if mtu <= 0 {
+		mtu = MTU()
+	}
 	return []string{
 		"-listen-qemu", "unix://" + p.Net,
 		"-listen", "unix://" + p.API,
 		"-ssh-port", strconv.Itoa(m.SSHPort),
 		"-pid-file", p.PID,
 		"-log-file", p.Log,
-		"-mtu", strconv.Itoa(MTU()),
+		"-mtu", strconv.Itoa(mtu),
 	}
 }
 
@@ -254,7 +283,35 @@ func (Provider) Repair(m *machine.Machine) error {
 		return ErrNoDir
 	}
 	p := PathsFor(m.Dir)
-	return errors.Join(stopForward(context.Background(), p), removeAll(append(p.Sockets(), p.PID)...))
+	return errors.Join(stopForward(context.Background(), p, false), removeRuntime(p))
+}
+
+// removeRuntime removes gvproxy's own sockets and pid file. podman.sock is
+// not gvproxy's and is never touched here: while a machine is suspended the
+// stand-in holds it (ADR 0009). Its owner is told by inode, never by a dial,
+// because a dial to a stand-in is a held connection that wakes the machine
+// (stopForward, removeForwardLeftover).
+func removeRuntime(p Paths) error {
+	return removeAll(p.Net, p.API, p.PID)
+}
+
+// removeForwardLeftover removes a podman.sock that a dead forward left
+// behind (its recorded inode), or a file there that is not a socket at all.
+// A socket of anyone else stays.
+func removeForwardLeftover(p Paths) error {
+	if _, alive := forwardAlive(p); alive {
+		return nil
+	}
+	cur, exists := fileInode(p.Podman)
+	if !exists {
+		return removeAll(p.FwdIno)
+	}
+	want, recorded := readInode(p.FwdIno)
+	_, isSocket := socketInode(p.Podman)
+	if (recorded && cur == want) || !isSocket {
+		return removeAll(p.Podman, p.FwdIno)
+	}
+	return nil
 }
 
 // Start implements netprov.Provider: launches gvproxy detached and waits
@@ -289,34 +346,24 @@ func (pr Provider) Start(ctx context.Context, m *machine.Machine) (backend.NetAt
 			return backend.NetAttachment{}, netprov.Endpoint{}, fmt.Errorf("gvproxy: socket path %q is %d bytes; unix sockets are limited to %d (use a shorter --state-root or $TMPDIR)", s, len(s), backend.MaxSocketPath)
 		}
 	}
-	// gvproxy refuses to start over stale sockets.
-	if err := removeAll(p.Sockets()...); err != nil {
+	// gvproxy refuses to start over stale sockets. podman.sock is not
+	// gvproxy's: only a dead forward's own leftover goes.
+	if err := errors.Join(removeRuntime(p), removeForwardLeftover(p)); err != nil {
 		return backend.NetAttachment{}, netprov.Endpoint{}, fmt.Errorf("gvproxy: removing stale sockets: %w", err)
 	}
 
-	logf, err := os.OpenFile(p.Log, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	// Detached through procx, so gvproxy outlives this jm invocation and is
+	// reaped by launchd rather than left a zombie of it.
+	pid, err := procx.StartDetached(bin, Args(m, p), nil, p.Log, true)
 	if err != nil {
-		return backend.NetAttachment{}, netprov.Endpoint{}, fmt.Errorf("gvproxy: opening %s: %w", p.Log, err)
-	}
-	defer logf.Close()
-	// Not CommandContext: gvproxy must outlive this jm invocation.
-	cmd := exec.Command(bin, Args(m, p)...)
-	cmd.Stdout = logf
-	cmd.Stderr = logf
-	cmd.Stdin = nil
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
 		return backend.NetAttachment{}, netprov.Endpoint{}, fmt.Errorf("gvproxy: failed to start: %w", err)
 	}
-	pid := cmd.Process.Pid
-	// Reap in the background so an early exit does not leave a zombie; we
-	// never Wait on it synchronously.
-	exited := make(chan error, 1)
-	go func() { exited <- cmd.Wait() }()
-
-	if err := waitSockets(ctx, exited, p.Net, p.API); err != nil {
-		_ = syscall.Kill(pid, syscall.SIGKILL)
-		_ = removeAll(append(p.Sockets(), p.PID)...)
+	if err := waitSockets(ctx, pid, p.Net, p.API); err != nil {
+		if procx.Alive(pid) {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+			procx.WaitExit(context.Background(), pid, stopTimeout)
+		}
+		_ = removeRuntime(p)
 		return backend.NetAttachment{}, netprov.Endpoint{}, fmt.Errorf("gvproxy: %w: %s", err, tailOf(p.Log))
 	}
 	// gvproxy writes -pid-file itself; make sure State agrees before we
@@ -329,9 +376,9 @@ func (pr Provider) Start(ctx context.Context, m *machine.Machine) (backend.NetAt
 	return attachment(m, p), ep, nil
 }
 
-// waitSockets polls until every socket exists, the process exits, the
-// timeout lapses or ctx is cancelled.
-func waitSockets(ctx context.Context, exited <-chan error, socks ...string) error {
+// waitSockets polls until every socket exists, the process pid is no longer
+// alive, the timeout lapses or ctx is cancelled.
+func waitSockets(ctx context.Context, pid int, socks ...string) error {
 	deadline := time.Now().Add(startTimeout)
 	for {
 		missing := ""
@@ -344,15 +391,16 @@ func waitSockets(ctx context.Context, exited <-chan error, socks ...string) erro
 		if missing == "" {
 			return nil
 		}
-		select {
-		case err := <-exited:
-			return fmt.Errorf("exited before creating %s (%v)", filepath.Base(missing), err)
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(pollInterval):
+		if !procx.Alive(pid) {
+			return fmt.Errorf("exited before creating %s", filepath.Base(missing))
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("timed out waiting for %s", filepath.Base(missing))
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(pollInterval):
 		}
 	}
 }
@@ -368,21 +416,59 @@ func (pr Provider) Stop(ctx context.Context, m *machine.Machine) error {
 	if st != backend.Running {
 		return pr.Repair(m)
 	}
-	p := PathsFor(m.Dir)
+	if err := terminate(ctx, PathsFor(m.Dir)); err != nil {
+		return err
+	}
+	return pr.Repair(m)
+}
+
+// terminate ends the gvproxy recorded in the pid file: SIGTERM, wait,
+// SIGKILL. The caller has checked that the pid is ours.
+func terminate(ctx context.Context, p Paths) error {
 	pid, err := readPID(p.PID)
 	if err != nil {
 		return err
 	}
-	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && processAlive(pid) {
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && procx.Alive(pid) {
 		return fmt.Errorf("gvproxy: SIGTERM pid %d: %w", pid, err)
 	}
-	if !waitExit(ctx, pid, stopTimeout) {
+	if !procx.WaitExit(ctx, pid, stopTimeout) {
 		_ = syscall.Kill(pid, syscall.SIGKILL)
-		if !waitExit(ctx, pid, stopTimeout) {
+		if !procx.WaitExit(ctx, pid, stopTimeout) {
 			return fmt.Errorf("gvproxy: pid %d did not exit after SIGKILL", pid)
 		}
 	}
-	return pr.Repair(m)
+	return nil
+}
+
+// Park implements netprov.Parker for a suspend (ADR 0009): gvproxy and the
+// podman socket forward are stopped and their runtime files removed, but
+// podman.sock is left alone: a machine is parked while a stand-in holds that
+// endpoint. forwards.json is not this provider's and is left alone too.
+func (pr Provider) Park(ctx context.Context, m *machine.Machine) error {
+	if m.Dir == "" {
+		return ErrNoDir
+	}
+	st, err := pr.State(m)
+	if err != nil {
+		return err
+	}
+	p := PathsFor(m.Dir)
+	if st == backend.Running {
+		if err := terminate(ctx, p); err != nil {
+			return err
+		}
+	}
+	return errors.Join(stopForward(ctx, p, true), removeRuntime(p))
+}
+
+// StopAPIForward implements netprov.APIForwarder: the podman socket forward
+// is stopped and podman.sock is left where it is.
+func (Provider) StopAPIForward(ctx context.Context, m *machine.Machine) error {
+	if m.Dir == "" {
+		return ErrNoDir
+	}
+	return stopForward(ctx, PathsFor(m.Dir), true)
 }
 
 // StartAPIForward implements netprov.APIForwarder: serve podman.sock on
@@ -409,7 +495,8 @@ func (Provider) Cleanup(m *machine.Machine) error {
 		return ErrNoDir
 	}
 	var out []string
-	for _, s := range PathsFor(m.Dir).Sockets() {
+	p := PathsFor(m.Dir)
+	for _, s := range append(p.Sockets(), p.FwdSock) {
 		if !backend.InTree(m.Dir, s) {
 			out = append(out, s)
 		}

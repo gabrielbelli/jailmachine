@@ -11,21 +11,23 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/gabrielbelli/jailmachine/internal/procx"
 )
 
-// The forwarder runs as a detached "jm _forwarder <name>" (own session,
-// pid file, log file) so it outlives the "jm start" that launched it, and
-// is recognised by pid plus argv like the hypervisor and gvproxy: pid files
-// survive reboots and pids are recycled (ADR 0005).
+// The forwarder runs as a detached "jm _forwarder <name>" (launched through
+// procx, with a pid file and a log file) so it outlives the "jm start" that
+// launched it, and is recognised by pid plus argv like the hypervisor and
+// gvproxy: pid files survive reboots and pids are recycled (ADR 0005).
 
 // Command is the hidden subcommand name.
 const Command = "_forwarder"
 
-// Timeouts for Stop.
-const (
-	termTimeout  = 5 * time.Second
-	pollInterval = 100 * time.Millisecond
-)
+// termTimeout bounds each wait in Stop.
+const termTimeout = 5 * time.Second
+
+// commandLineOf is commandLine, replaced in tests.
+var commandLineOf = commandLine
 
 // Process locates one machine's forwarder.
 type Process struct {
@@ -52,7 +54,7 @@ func (p Process) Alive() (int, bool) {
 	if err != nil {
 		return 0, false
 	}
-	return pid, isOurs(commandLine(pid), p)
+	return pid, isOurs(commandLineOf(pid), p)
 }
 
 // isOurs matches argv against the substrings that identify this machine's
@@ -72,23 +74,12 @@ func (p Process) Start(exe string) error {
 		return nil
 	}
 	_ = os.Remove(p.pidFile())
-	logf, err := os.OpenFile(p.LogPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	// Detached through procx: the forwarder must outlive this jm invocation
+	// and must not become a zombie of a wrapper that execs podman.
+	pid, err := procx.StartDetached(exe, p.Args(), nil, p.LogPath(), false)
 	if err != nil {
-		return fmt.Errorf("forwarder: opening %s: %w", p.LogPath(), err)
-	}
-	defer logf.Close()
-	// Not CommandContext: the forwarder must outlive this jm invocation.
-	cmd := exec.Command(exe, p.Args()...)
-	cmd.Stdout = logf
-	cmd.Stderr = logf
-	cmd.Stdin = nil
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("forwarder: failed to start: %w", err)
 	}
-	pid := cmd.Process.Pid
-	// Reap in the background so an early exit does not leave a zombie.
-	go func() { _ = cmd.Wait() }()
 	if err := os.WriteFile(p.pidFile(), []byte(strconv.Itoa(pid)+"\n"), 0o600); err != nil {
 		_ = syscall.Kill(pid, syscall.SIGKILL)
 		return fmt.Errorf("forwarder: writing %s: %w", p.pidFile(), err)
@@ -98,16 +89,22 @@ func (p Process) Start(exe string) error {
 
 // Stop terminates a live forwarder (SIGTERM, wait, SIGKILL) and removes the
 // pid file. A dead or absent one is just tidied away. Signals go to the
-// forwarder's process group (it is a session leader, so pgid == pid) so
-// that children still in the group go with it.
+// forwarder's process group, so children still in the group go with it
+// (procx.SignalGroup). Stop refuses to signal this process, and never
+// signals its caller's process group.
 func (p Process) Stop(ctx context.Context) error {
 	if pid, ok := p.Alive(); ok {
-		if err := signalGroup(pid, syscall.SIGTERM); err != nil && processAlive(pid) {
-			return fmt.Errorf("forwarder: SIGTERM pid %d: %w", pid, err)
+		if err := procx.SignalGroup(pid, syscall.SIGTERM); err != nil {
+			if errors.Is(err, procx.ErrSelf) {
+				return fmt.Errorf("forwarder: %s names this process (pid %d); refusing to signal it", PIDFile, pid)
+			}
+			if procx.Alive(pid) {
+				return fmt.Errorf("forwarder: SIGTERM pid %d: %w", pid, err)
+			}
 		}
-		if !waitExit(ctx, pid, termTimeout) {
-			_ = signalGroup(pid, syscall.SIGKILL)
-			if !waitExit(ctx, pid, termTimeout) {
+		if !procx.WaitExit(ctx, pid, termTimeout) {
+			_ = procx.SignalGroup(pid, syscall.SIGKILL)
+			if !procx.WaitExit(ctx, pid, termTimeout) {
 				return fmt.Errorf("forwarder: pid %d did not exit after SIGKILL", pid)
 			}
 		}
@@ -116,15 +113,6 @@ func (p Process) Stop(ctx context.Context) error {
 		return err
 	}
 	return nil
-}
-
-// signalGroup sends sig to pid's process group, falling back to pid alone
-// when it is not a group leader.
-func signalGroup(pid int, sig syscall.Signal) error {
-	if err := syscall.Kill(-pid, sig); err == nil {
-		return nil
-	}
-	return syscall.Kill(pid, sig)
 }
 
 func readPID(path string) (int, error) {
@@ -139,17 +127,6 @@ func readPID(path string) (int, error) {
 	return pid, nil
 }
 
-func processAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	err := syscall.Kill(pid, 0)
-	if err == nil {
-		return true
-	}
-	return errors.Is(err, syscall.EPERM)
-}
-
 // commandLine returns the argv of pid as reported by ps, "" if none.
 func commandLine(pid int) string {
 	if pid <= 0 {
@@ -160,21 +137,4 @@ func commandLine(pid int) string {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
-}
-
-func waitExit(ctx context.Context, pid int, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for {
-		if !processAlive(pid) {
-			return true
-		}
-		if time.Now().After(deadline) {
-			return false
-		}
-		select {
-		case <-ctx.Done():
-			return !processAlive(pid)
-		case <-time.After(pollInterval):
-		}
-	}
 }

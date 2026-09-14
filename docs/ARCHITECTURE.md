@@ -43,18 +43,22 @@ directory is a complete uninstall.
 | `machine.json`, `machine.lock` | `internal/machine` (record; one advisory lock per machine) |
 | `disk.raw`, `seed.iso`, `efivars.fd` | `internal/image`, `internal/seed`, `internal/backend/qemu` |
 | `ssh/id_ed25519{,.pub}` | `internal/cli` at `init` |
-| `qemu.pid`, `qemu.log`, `console.log`, `qmp.sock` | `internal/backend/qemu` |
+| `qemu.pid`, `qemu.log`, `console.log`, `qmp.sock`, `qemu.argv` | `internal/backend/qemu` (`qemu.argv` is the exact command line of the last launch, which a resume reuses) |
+| `suspend.json`, `suspend.state`, `qemu.resume-failed.log` | `internal/backend/qemu` (the suspend journal, the saved guest state, and `qemu.log` kept when a restore was refused) |
 | `gvproxy.pid`, `gvproxy.log`, `net.sock`, `api.sock`, `podman.sock`, `forward.pid`, `forward.log` | `internal/netprov/gvproxy` |
 | `forwarder.pid`, `forwarder.log`, `forwards.json` | `internal/forwarder` |
 | `resolver.pid`, `resolver.log`, `resolver.addr`, `resolver.port` | `internal/resolver` (`resolver.port` is reused across restarts, so a rebooted guest resolves before `jm start` reaches it) |
 | `guest/shares.tab` | `internal/machine` (the share table, itself exported to the guest read-only as the `jmconf` 9p share) |
+| `sleeper.pid`, `sleeper.log`, `sleeper.sock`, `sleeper.json`, `wake.log` | `internal/sleeper`, `internal/cli/sleeper.go` (the idle-suspend helper, its control socket and status, and the log of the wakes it spawns) |
+| `activity` | `internal/cli` (an empty file whose mtime the wrappers, `jm ssh` and a wake bump, for the idle monitor) |
 
 The record is the source of *configuration*; the source of *runtime state*
 is the processes themselves. `State()` is always computed — pid plus argv
-liveness, sockets answering — never cached. States are
-`stopped ⇄ running`, plus `broken` when the hypervisor and the network
-provider disagree (half of the machine is up, or a pid file outlives its
-process). `jm stop` converges a broken machine back to stopped.
+liveness, sockets answering, the suspend journal. It is never cached. States are
+`stopped ⇄ running ⇄ suspended`, plus `broken` when the hypervisor and the
+network provider disagree (half of the machine is up, or a pid file outlives
+its process). `jm stop` converges a broken machine back to stopped. See
+[Idle suspend and wake](#idle-suspend-and-wake) for `suspended`.
 
 `sun_path` is 104 bytes including the terminating NUL, so jm caps a unix
 socket path at **103** (`backend.MaxSocketPath`, the number `jm doctor`
@@ -70,7 +74,8 @@ graceful)`, `State`, `ConsolePath`, `Logs`, `Capabilities`. It owns
 hypervisor processes, firmware variables and the console log — not
 networking, not images. Optional behaviour is an optional interface
 (`Resizer` for live disk growth via QMP `block_resize`, `Cleaner` for
-out-of-tree sockets), never a new required method.
+out-of-tree sockets, `Suspender` for suspend and resume, with
+`Capabilities.Suspend`), never a new required method.
 
 `Capabilities` carries `FileSharing` (ADR 0007): a backend that can export
 host paths takes share descriptors at `Start`, and one that cannot is
@@ -79,8 +84,15 @@ share request up front instead of letting a mount fail inside a container.
 
 The only implementation is `internal/backend/qemu`:
 `qemu-system-aarch64 -M virt,accel=hvf -cpu host`, EDK2 pflash, virtio
-disk/seed/NIC/RNG, serial to `console.log`, `-daemonize -pidfile`, control
-via QMP. `JM_QEMU_ACCEL=tcg` swaps in pure emulation (and `-cpu
+disk/seed/NIC/RNG, serial to `console.log` through a file chardev with
+`append=on` (a resume must not truncate the log `jm console -f` is
+following), `-pidfile`, control via QMP. QEMU is **not** started with
+`-daemonize`: under HVF a daemonized QEMU aborts when its state is saved.
+Like every detached helper it is launched through a `/bin/sh` intermediate
+that backgrounds it and exits (`internal/procx`), so it is reparented to
+launchd and never becomes a zombie of a wrapper that later execs podman or
+docker. The exact argv is written to `qemu.argv`, and `Start` returns once
+the pid file and a QMP `query-status` answer are both there. `JM_QEMU_ACCEL=tcg` swaps in pure emulation (and `-cpu
 cortex-a72`) for CI; `stageTimeout` multiplies every start timeout by 8
 when it detects TCG.
 
@@ -119,6 +131,15 @@ served by a detached `ssh -N -L` helper (`forward.go`, the
 `netprov.APIForwarder` interface) started only once the guest is
 provisioned. `internal/netprov/user` keeps QEMU slirp as a fallback with no
 API socket and no port publishing.
+
+Across a suspend the provider is restarted, not preserved. `netprov.Parker`
+stops gvproxy without removing a `podman.sock` that someone else serves, and
+`APIForwarder.StopAPIForward` ends the `ssh -N -L` helper while leaving the
+socket path in place. The sleeper binds its own socket beside `podman.sock`
+and renames it over the path; `ssh -L` takes the path back the same way
+(`StreamLocalBindUnlink=yes`), and the launcher waits for a different inode
+that answers. A client dialling `podman.sock` therefore never finds the path
+missing.
 
 ## Guest contract and image sources
 
@@ -237,7 +258,107 @@ demand (`internal/cli/autostart.go`), waiting on a blocking per-machine lock
 so that concurrent wrappers queue rather than fail. `JM_AUTOSTART=0`,
 `JM_NO_AUTOSTART=1` or a leading `--no-autostart` opts out. A launchd
 `KeepAlive` agent would loop: `jm start` is one-shot and leaves qemu,
-gvproxy, the forwarder and the resolver detached.
+gvproxy, the forwarder, the resolver and the sleeper detached.
+
+The opt-outs govern **stopped** machines only. A suspended machine, or one
+with a suspend or wake in flight, is running as far as the user is concerned,
+so the wrappers wake it regardless; a suspend that has not frozen the guest
+yet is cancelled (the `abort` control request) rather than waited for. Every
+wrapper call and `jm ssh` bumps the machine's `activity` file, which the idle
+monitor reads.
+
+## Idle suspend and wake
+
+[ADR 0009](adr/0009-idle-suspend-and-wake-on-use.md) adds the `suspended`
+state. A machine idle for `idle_suspend_min` minutes (30 by default) is saved
+to its directory with QEMU migration to a file, every host process of the
+machine except one helper ends, and its memory goes back to macOS. The first
+use restores it.
+
+```mermaid
+stateDiagram-v2
+    [*] --> stopped: jm init
+    stopped --> running: jm start
+    running --> stopped: jm stop
+    running --> suspended: idle timer or jm suspend
+    suspended --> running: first use
+    suspended --> stopped: jm stop restores then powers off, or a discard
+    running --> broken: a component dies
+    broken --> stopped: jm stop
+```
+
+A discard is `jm stop --force`, `jm rm`, or a saved state the hypervisor
+cannot restore, which is followed by a cold boot in the same command.
+
+**How the state is computed.** `qemu.Backend.State` reads files only, never
+QMP: a live QEMU of ours is `running` (with `suspend.json` present, a
+transition is in flight or was interrupted, and every "is it ready" check
+treats that as not ready); no QEMU with a `saved` journal and a complete
+`suspend.state` is `suspended`; a `saving` journal, a short image or an
+unparseable journal with no QEMU is `broken`, and repair discards it.
+`combineState` reads a suspended backend as `suspended` whether the provider
+is stopped, still running (a wake between gvproxy and QEMU) or unsupervised.
+
+**Recovery first.** `recoverInterruptedTransition` (`internal/cli/recover.go`,
+`Suspender.Recover`) runs under the lock before `start`, `stop`, `_wake` and a
+suspend compute anything. An interrupted suspend returns to running when the
+guest can continue and to stopped otherwise; an interrupted wake goes back
+to suspended and is retried; a guest whose journal says `saved` is never
+continued.
+
+**The sleeper.** `jm _sleeper <name>` (`internal/sleeper`,
+`internal/cli/sleeper.go`) is one helper per machine, started by the
+`sleeper` stage of `jm start` and by a wake when the backend implements
+`Suspender` and the provider is supervised with an API forward. `jm stop`
+and `jm rm` stop it first. It has four modes:
+
+| Mode | When | Does |
+|---|---|---|
+| `monitor` | running, no journal, no endpoint held | Every 15 s, one SSH exec of the idle probe (`internal/idle`) plus the host signals; a `Tracker` decides; a due suspend runs `suspendMachine` in-process under a non-waiting lock |
+| `hold` | from taking `podman.sock` during a suspend, while suspended, or on start against a suspended machine | Holds `podman.sock` and `127.0.0.1:<ssh port>`; each connection is held unread (256 at most, 120 s each); the first one spawns a detached `jm _wake <name>`, at most one at a time, with a 10 s back-off after a failed one |
+| `hand-over` | the journal is gone, the machine is running and the new endpoints answer | Splices every held connection to the real endpoint byte for byte, closes its listeners without unlinking, returns to `monitor` |
+| `exit` | the machine is stopped, with no journal, in two evaluations in a row and no jm command mid-transition | Closes what it holds, unlinks its own socket only if the inode is still its own, and exits |
+
+The sleeper never runs a wake itself. Wrappers, `jm start` and `jm ssh` wake
+in their own process, the sleeper spawns `jm _wake` for held connections,
+and all of them coordinate through the machine lock and the control socket
+`sleeper.sock` (`abort`, `release-tcp <pid>`, `woke`, `suspend [force]`,
+`status`). Its status goes to `sleeper.json`, which `jm inspect` and
+`jm doctor` read without asking it.
+
+**Suspend** (`internal/cli/suspend.go`, `CommitSuspend` in
+`internal/backend/qemu/suspend.go`): preflight (capabilities, a hypervisor
+not started with `-daemonize`, the guest's memory plus 2 GiB free); lock; a
+strict re-probe; QMP preflight and the `saving` journal; stop the
+forwarder; the sleeper takes `podman.sock`; the guest quiesce script
+(activity counted twice, file systems synced, 9p shares unmounted without
+force); stop the `ssh -L` forward; migration capabilities and
+`blocked-reasons`; the last abort check; QMP `stop`; `migrate` to
+`suspend.state.tmp`; `F_FULLFSYNC` and rename; the `saved` journal, which is
+the commit point; `quit`; park gvproxy; stop the resolver; the sleeper takes
+the SSH port. A client or a wrapper arriving before `stop` rolls everything
+back and is served; a failed migration sends `cont` and rolls back.
+
+**Wake** (`internal/cli/resume.go`, `Resume` in the backend): validate the
+journal, fingerprints and hardware against the record; `release-tcp` to the
+sleeper; gvproxy and the resolver; QEMU from the saved `qemu.argv` with the
+machine type pinned and `-incoming defer`; `migrate-incoming`; delete the
+journal, **then** `cont`; SSH; one post-resume guest script (clock step,
+share remount, ARC cap if changed, DNS search list); the `ssh -L` forward;
+`woke` to the sleeper; the forwarder and, if needed, the sleeper. The
+podman connections and the known-hosts entry are left as they were.
+
+While suspended:
+
+| Component | State |
+|---|---|
+| QEMU | exited; guest RAM in `suspend.state`, sparse |
+| gvproxy | exited; dynamic mappings gone, `forwards.json` kept for the forwarder's resync |
+| `ssh -N -L` forward, forwarder, resolver | exited; the resolver's port stays in `resolver.port` |
+| sleeper | alive; owns `podman.sock`, `127.0.0.1:<ssh port>` and `sleeper.sock` |
+| podman connections `<name>`, `<name>-sock` | untouched |
+| 9p shares | unmounted in the saved guest; the devices stay in the saved argv |
+| pf anchor, sshd, podman service, containers | preserved in the saved RAM |
 
 ## Port publishing is a reconciliation loop
 
@@ -300,7 +421,10 @@ records the amendment.
 ## `jm start`, stage by stage
 
 Start is staged, idempotent and resumable: on a running machine it skips
-the boot and re-checks the rest; on a broken one it repairs first. Every
+the boot and re-checks the rest; on a broken one it repairs first. Before
+any stage it resolves an interrupted suspend or wake, and a suspended
+machine is woken instead of booted (see
+[Idle suspend and wake](#idle-suspend-and-wake)). Every
 failure is a `machine.StageError` naming the stage and the log to read.
 
 | Stage | Does | Fails on |
@@ -313,6 +437,7 @@ failure is a `machine.StageError` naming the stage and the log to read.
 | `dns` (host half, between `network` and `backend`) | launch the detached host resolver | → `resolver.log`; a failure warns and carries on with the guest's previous resolution |
 | `dns` (guest half, after `provision`) | give the guest one nameserver — the host resolver — and push the search domains | as above |
 | `forwarder` | launch the detached reconciliation loop | → `forwarder.log`; skipped when the provider has no guest IP |
+| `sleeper` | launch the detached helper that suspends an idle machine and holds its endpoints while it is suspended | → `sleeper.log`; skipped when the backend or provider cannot suspend |
 
 Shares are reconciled before the `backend` stage — a host path that has
 vanished is dropped with one warning rather than refusing the boot — and a
@@ -332,6 +457,7 @@ sequenceDiagram
     participant P as host podman
     participant F as jm _forwarder
     participant R as jm _resolver
+    participant S as jm _sleeper
     U->>JM: jm start
     JM->>GV: network: start detached (net.sock, api.sock)
     GV-->>JM: attachment plus endpoint (guest 192.168.127.2, ssh 127.0.0.1:2222)
@@ -349,6 +475,7 @@ sequenceDiagram
     JM->>F: forwarder: start detached
     F->>G: podman ps and podman events (over the ssh connection)
     F->>GV: expose 0.0.0.0:8080 to 192.168.127.2:8080
+    JM->>S: sleeper: start detached (sleeper.sock)
     JM-->>U: ready
 ```
 
@@ -364,6 +491,8 @@ sequenceDiagram
 | Host directory sharing | `internal/machine/share.go` (record), `internal/cli/share.go` (defaults and CLI), `internal/backend/qemu/argv.go` (9p devices), `guest/provision.sh` (the `jm_shares` rc script) |
 | Name resolution | `internal/resolver` (host resolver, guest push, aliases) |
 | Autostart | `internal/cli/autostart.go`, used by `podman.go` and `docker.go` |
+| Idle suspend and wake | `internal/backend/qemu/suspend.go`, `journal.go`, `argvpin.go` (save, restore, recovery table); `internal/cli/suspend.go`, `resume.go`, `recover.go` (the CLI sequences); `internal/sleeper` and `internal/cli/sleeper.go` (the helper and the stand-in); `internal/idle` (the probe and the tracker) |
+| Launching detached helpers | `internal/procx` |
 | Commands, flags, output | `internal/cli` (one file per subcommand) |
 
 New work enters scope only if it fits an existing interface, or comes with a

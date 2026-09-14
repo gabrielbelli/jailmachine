@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/gabrielbelli/jailmachine/internal/backend"
 	"github.com/gabrielbelli/jailmachine/internal/doctor"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
 	"github.com/gabrielbelli/jailmachine/internal/sshx"
@@ -90,7 +89,7 @@ func clockChecks(ctx context.Context) []doctor.Result {
 	}
 	var out []doctor.Result
 	for _, m := range ms {
-		if st, err := currentState(m); err != nil || st != backend.Running {
+		if st, err := currentState(m); err != nil || !ready(m, st) {
 			continue
 		}
 		out = append(out, clockCheck(ctx, m))

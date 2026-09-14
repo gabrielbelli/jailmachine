@@ -58,3 +58,24 @@ so implement the optional `Resizer` hook (QEMU: QMP `block_resize`), and
 the guest-side grow verifies the presented size before touching the
 partition, so `set` cannot report success while the pool is unchanged.
 Backends without `Resizer` require the machine stopped for `--disk`.
+
+## Addendum (2026-09-14): suspended is a lifecycle state
+
+Per **ADR 0009**, lifecycle states become `defined → stopped ⇄ running ⇄
+suspended`, with `suspended → stopped` by `stop` (resume, then shut down) or by
+a discard (`stop --force`, `rm`, or a saved state the hypervisor rejects);
+`broken` is unchanged. `suspended` is computed from a saved-state journal
+validated against processes and file sizes, like a pid file, with no hypervisor
+round trip; read commands still never block and never resume a machine. While a
+transition runs the hypervisor is alive and the machine reads `running`;
+commands that need the engine treat a present journal as not ready.
+
+Every mutating command resolves an interrupted transition first, under the lock,
+before anything else. The idle supervisor takes the lock only for a transition,
+never waits for it, and never holds it while the machine is idle or suspended.
+`start` recomputes the state after repairing a broken machine, because a
+repaired machine may be suspended. A resume that succeeds up to the guest
+running but fails later leaves the machine running, and the next `start`
+finishes the remaining stages, as for any interrupted start. `rm -rf` of the
+directory remains a complete uninstall: the saved state and the supervisor's
+files live in it.

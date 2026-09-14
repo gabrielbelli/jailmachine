@@ -33,6 +33,26 @@ JM_E2E=1 make e2e # end-to-end on a Mac with qemu + podman installed
 themselves VMs without nested virtualisation, so HVF is unavailable and
 QEMU cannot boot the guest. Run it locally before tagging a release.
 
+`make e2e` runs `go test -v -timeout 120m`: the suite boots real machines and
+takes well over go test's default ten minutes. These variables tune it:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `JM_E2E=1` | unset | Required; without it every e2e test skips |
+| `JM_E2E_DISK` | `12` | Disk size in GiB for each test machine. `jm init` writes far more real disk than the image holds (see `docs/LIMITATIONS.md`), so keep it small on a volume with little free space. The live grow step grows the disk to this plus 4 GiB |
+| `JM_E2E_IMAGE` | `official:15.1-RELEASE` | Image passed to `jm init` |
+| `JM_E2E_SLOW=1` | unset | Also run the idle-timer subtest: a command session must hold off the idle monitor, which must then suspend the machine. It adds about 15 minutes |
+
+```bash
+JM_E2E=1 JM_E2E_DISK=16 make e2e
+JM_E2E=1 JM_E2E_SLOW=1 go test -v -timeout 120m -tags e2e -run TestSuspend ./e2e/...
+```
+
+> Each test removes its machine when it ends, but a run killed from outside
+> (Ctrl-C, or `-timeout` itself, which skips cleanups) leaves it running on
+> SSH port 2223 or 2224. Find the state root in `ps -ax -o pid,command` and
+> run `jm --state-root <root> rm --force e2e-suspend` (or `e2e`).
+
 ### Debugging backends
 
 | Variable | Effect |

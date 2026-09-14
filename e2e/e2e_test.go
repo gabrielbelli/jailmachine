@@ -3,11 +3,8 @@
 package e2e
 
 import (
-	"bytes"
-	"encoding/json"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -18,52 +15,32 @@ import (
 // run, stop, a warm start and rm. It needs qemu, podman and network access;
 // run it with "make build && JM_E2E=1 make e2e".
 func TestLifecycle(t *testing.T) {
-	if os.Getenv("JM_E2E") != "1" {
-		t.Skip("set JM_E2E=1 to run the end-to-end test")
-	}
-	bin, err := filepath.Abs("../jm")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(bin); err != nil {
-		t.Fatalf("%s not built (run make build): %v", bin, err)
-	}
-	root := t.TempDir()
-	const name = "e2e"
-
+	cfg := requireE2E(t)
+	h := &harness{bin: cfg.bin, root: t.TempDir(), name: "e2e"}
+	name := h.name
 	jm := func(args ...string) string {
 		t.Helper()
-		cmd := exec.Command(bin, append([]string{"--state-root", root}, args...)...)
-		out, err := cmd.CombinedOutput()
-		t.Logf("$ jm %s\n%s", strings.Join(args, " "), out)
-		if err != nil {
-			t.Fatalf("jm %s: %v", strings.Join(args, " "), err)
-		}
-		return string(out)
+		return h.jm(t, args...)
 	}
 	// Converge on a clean slate whatever happens.
+	// rm --force also takes the guest's containers and both podman
+	// connections with it, under its own limit.
 	t.Cleanup(func() {
-		cmd := exec.Command(bin, "--state-root", root, "rm", "--force", name)
-		out, _ := cmd.CombinedOutput()
-		t.Logf("cleanup: %s", out)
+		runCmdFor(t, h.command("rm", "--force", name), cleanupTimeout)
 	})
 
-	jm("init", name, "--image", "official:15.1-RELEASE", "--ssh-port", "2223")
-	jm("start", name)
+	h.jmFor(t, provisionTimeout, "init", name, "--image", cfg.image, "--disk", strconv.Itoa(cfg.diskGiB), "--ssh-port", "2223")
+	h.jmFor(t, provisionTimeout, "start", name)
 
 	// podman writes image-pull progress to stderr; only stdout must be "hi".
 	podmanHi := func(connection string) {
 		t.Helper()
-		run := exec.Command("podman", "--connection", connection, "run", "--rm", "--os=linux", "docker.io/alpine", "echo", "hi")
-		var podmanErr bytes.Buffer
-		run.Stderr = &podmanErr
-		out, err := run.Output()
-		t.Logf("podman --connection %s run stdout: %s\nstderr: %s", connection, out, podmanErr.String())
-		if err != nil {
-			t.Fatalf("podman --connection %s run: %v", connection, err)
+		r := runCmd(t, exec.Command("podman", "--connection", connection, "run", "--rm", "--os=linux", "docker.io/alpine", "echo", "hi"))
+		if r.err != nil {
+			t.Fatalf("podman --connection %s run: %v", connection, r.err)
 		}
-		if strings.TrimSpace(string(out)) != "hi" {
-			t.Fatalf("podman --connection %s run printed %q on stdout, want hi", connection, out)
+		if strings.TrimSpace(r.stdout) != "hi" {
+			t.Fatalf("podman --connection %s run printed %q on stdout, want hi", connection, r.stdout)
 		}
 	}
 	// Over SSH (the default connection) and over the provider's proxied
@@ -72,20 +49,13 @@ func TestLifecycle(t *testing.T) {
 	podmanHi(name + "-sock")
 
 	// The proxied socket answers the libpod API directly.
-	var insp struct {
-		APISocket string `json:"api_socket"`
-	}
-	if err := json.Unmarshal([]byte(jm("--json", "inspect", name)), &insp); err != nil {
-		t.Fatal(err)
-	}
+	insp := h.inspect(t)
 	if insp.APISocket == "" {
 		t.Fatal("inspect reports no api_socket")
 	}
-	ping := exec.Command("curl", "-sf", "--unix-socket", insp.APISocket, "http://d/v5.0.0/libpod/_ping")
-	out, err := ping.CombinedOutput()
-	t.Logf("curl _ping: %s", out)
-	if err != nil || strings.TrimSpace(string(out)) != "OK" {
-		t.Fatalf("libpod _ping over %s: %q, %v", insp.APISocket, out, err)
+	ping := runCmd(t, exec.Command("curl", "-sf", "--max-time", "60", "--unix-socket", insp.APISocket, "http://d/v5.0.0/libpod/_ping"))
+	if ping.err != nil || strings.TrimSpace(ping.stdout) != "OK" {
+		t.Fatalf("libpod _ping over %s: %q, %v", insp.APISocket, ping.stdout, ping.err)
 	}
 
 	if out := jm("env", name); !strings.Contains(out, "DOCKER_HOST=") {
@@ -95,40 +65,13 @@ func TestLifecycle(t *testing.T) {
 	// Port publishing (ADR 0004): a -p container becomes reachable on the
 	// host through the forwarder, disappears when the container goes, and
 	// comes back after a machine restart.
-	podman := func(args ...string) string {
-		t.Helper()
-		cmd := exec.Command("podman", append([]string{"--connection", name}, args...)...)
-		out, err := cmd.CombinedOutput()
-		t.Logf("$ podman --connection %s %s\n%s", name, strings.Join(args, " "), out)
-		if err != nil {
-			t.Fatalf("podman %s: %v", strings.Join(args, " "), err)
-		}
-		return string(out)
-	}
-	curlOK := func(url string) bool {
-		out, err := exec.Command("curl", "-fsS", "--max-time", "3", url).Output()
-		return err == nil && strings.TrimSpace(string(out)) == "ok"
-	}
 	waitCurl := func(url string, want bool, timeout time.Duration) {
 		t.Helper()
-		deadline := time.Now().Add(timeout)
-		for time.Now().Before(deadline) {
-			if curlOK(url) == want {
-				return
-			}
-			time.Sleep(2 * time.Second)
+		if !waitFor(timeout, 2*time.Second, func() bool { return curlOK(url) == want }) {
+			t.Fatalf("curl %s reachable=%v still not true after %s\nports: %s", url, want, timeout, jm("ports", name))
 		}
-		t.Fatalf("curl %s reachable=%v still not true after %s\nports: %s", url, want, timeout, jm("ports", name))
 	}
-	t.Cleanup(func() {
-		_ = exec.Command("podman", "--connection", name, "rm", "-f", "web", "web2").Run()
-	})
-	// busybox httpd rather than nginx: nginx's workers need Linux AIO
-	// (io_setup), which the Linuxulator does not implement, so nginx
-	// accepts connections but never answers them.
-	httpd := []string{"--os=linux", "docker.io/busybox", "sh", "-c",
-		"mkdir -p /www && echo ok > /www/index.html && exec httpd -f -p 80 -h /www"}
-	podman(append([]string{"run", "-d", "--name", "web", "-p", "8080:80"}, httpd...)...)
+	podman(t, name, append([]string{"run", "-d", "--name", "web", "-p", "8080:80"}, httpdArgs...)...)
 	waitCurl("http://127.0.0.1:8080/", true, 90*time.Second)
 	// Published on every host interface, as docker is on Linux: the same
 	// port answers over IPv6 loopback, which is what "localhost" resolves
@@ -137,20 +80,21 @@ func TestLifecycle(t *testing.T) {
 	if out := jm("ports", name); !strings.Contains(out, "0.0.0.0:8080") {
 		t.Fatalf("jm ports does not list 0.0.0.0:8080:\n%s", out)
 	}
-	podman("rm", "-f", "web")
+	podman(t, name, "rm", "-f", "web")
 	waitCurl("http://127.0.0.1:8080/", false, 30*time.Second)
 
-	podman(append([]string{"run", "-d", "--name", "web2", "-p", "8081:80"}, httpd...)...)
+	podman(t, name, append([]string{"run", "-d", "--name", "web2", "-p", "8081:80"}, httpdArgs...)...)
 	waitCurl("http://127.0.0.1:8081/", true, 90*time.Second)
 
 	// Live disk grow: the hypervisor is told (QMP block_resize) and the guest
-	// pool must actually be bigger afterwards, not just the record.
-	jm("set", name, "--disk", "80")
-	if out := jm("ssh", name, "--", "zpool", "list", "-Hp", "-o", "size", "zroot"); func() bool {
-		n, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
-		return err != nil || n < 70<<30
-	}() {
-		t.Fatalf("zroot not grown after live set --disk 80: %q", out)
+	// pool must actually be bigger afterwards, not just the record. The
+	// margin below the new size allows for the partition table and ZFS's
+	// own reservation.
+	grown := cfg.diskGiB + 4
+	jm("set", name, "--disk", strconv.Itoa(grown))
+	pool := h.run(t, "ssh", name, "--", "zpool list -Hp -o size zroot")
+	if n, err := strconv.ParseInt(strings.TrimSpace(pool.stdout), 10, 64); pool.err != nil || err != nil || n < int64(cfg.diskGiB+2)<<30 {
+		t.Fatalf("zroot not grown to at least %d GiB after live set --disk %d: %q (%v)", cfg.diskGiB+2, grown, pool.stdout, pool.err)
 	}
 
 	jm("stop", name)
@@ -168,12 +112,12 @@ func TestLifecycle(t *testing.T) {
 	}
 	// podman restarts web2 with the guest (restart policy aside, the
 	// forwarder must republish whatever is running after the warm start).
-	podman("start", "web2")
+	podman(t, name, "start", "web2")
 	waitCurl("http://127.0.0.1:8081/", true, 60*time.Second)
-	podman("rm", "-f", "web2")
+	podman(t, name, "rm", "-f", "web2")
 
 	jm("rm", name)
-	if _, err := os.Stat(filepath.Join(root, "machines", name)); !os.IsNotExist(err) {
+	if _, err := os.Stat(h.dir()); !os.IsNotExist(err) {
 		t.Fatalf("machine directory still present after rm")
 	}
 }

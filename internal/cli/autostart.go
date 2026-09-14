@@ -80,15 +80,33 @@ func clientOnly(args []string) bool {
 // of two racing wrappers finds the machine running by the time it gets in.
 //
 // With autostart off, a machine that is not running is an error naming the
-// command that would fix it.
+// command that would fix it. Autostart governs stopped machines only: a
+// suspended machine, or one with a suspend or wake in flight, is running as
+// far as the user is concerned and is woken regardless (ADR 0009).
 func ensureRunning(ctx context.Context, name string, autostart bool) error {
 	m, err := store().Load(name)
 	if err != nil {
 		return err
 	}
+	// However short the command, it is use: the sleeper's idle monitor
+	// reads the activity file's mtime (ADR 0009).
+	bumpActivity(m)
 	st, err := currentState(m)
-	if err == nil && st == backend.Running && engineReachable(m) {
+	if err == nil && ready(m, st) && engineReachable(m) {
 		return nil
+	}
+	if err == nil && (st == backend.Suspended || st == backend.Running) && suspendedOrTransition(m, st) {
+		fmt.Fprintf(stderr, "waking jailmachine %q...\n", name)
+		if st == backend.Running {
+			// A suspend that has not frozen the guest yet is cancelled
+			// rather than waited for.
+			abortSuspendInFlight(ctx, m)
+		}
+		ctx, cancel := context.WithTimeout(ctx, autostartLockWait)
+		defer cancel()
+		// With autostart off the wake must not turn into a boot: a "jm stop"
+		// that held the lock meanwhile has the last word.
+		return startQuietlyFn(ctx, name, !autostart)
 	}
 	if !autostart {
 		return withHint(fmt.Errorf("machine %q is %s and autostart is off", name, stateOrUnknown(st, err)),
@@ -97,8 +115,20 @@ func ensureRunning(ctx context.Context, name string, autostart bool) error {
 	fmt.Fprintf(stderr, "starting jailmachine %q...\n", name)
 	ctx, cancel := context.WithTimeout(ctx, autostartLockWait)
 	defer cancel()
-	return startQuietly(ctx, name)
+	return startQuietlyFn(ctx, name, false)
 }
+
+// suspendedOrTransition reports whether a machine in state st is asleep or
+// between awake and asleep: suspended, or running with a journal. While a
+// journal exists the engine socket may answer without a usable guest behind
+// it, so such a machine is never ready (ADR 0009).
+func suspendedOrTransition(m *machine.Machine, st backend.State) bool {
+	return st == backend.Suspended || (st == backend.Running && suspendInProgress(m))
+}
+
+// startQuietlyFn is runQuietly; a variable so tests can see a wake without
+// running one.
+var startQuietlyFn = runQuietly
 
 // engineReachable reports whether the machine's engine can be talked to
 // now, not merely whether its processes exist. A machine seconds into its
@@ -129,10 +159,16 @@ const engineDialTimeout = 500 * time.Millisecond
 // command prints after this belongs to podman or docker. Errors are
 // untouched — a failed boot still reports its stage and log.
 func startQuietly(ctx context.Context, name string) error {
+	return runQuietly(ctx, name, false)
+}
+
+// runQuietly is startQuietly that, with wakeOnly, wakes or finishes a
+// machine but never boots one found stopped under the lock.
+func runQuietly(ctx context.Context, name string, wakeOnly bool) error {
 	was := quiet
 	quiet = true
 	defer func() { quiet = was }()
-	return startMachine(ctx, []string{name}, startOpts{waitLock: true, skipIfReady: true})
+	return startMachine(ctx, []string{name}, startOpts{waitLock: true, skipIfReady: true, wakeOnly: wakeOnly, wakeBy: "wrapper"})
 }
 
 // lockMaybeWait takes the per-machine lock, waiting for it when wait is

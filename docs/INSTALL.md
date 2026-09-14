@@ -24,7 +24,7 @@ See [USAGE.md](USAGE.md) for the command reference once jm is installed,
 | QEMU | 8.0 or newer (`brew install qemu`) — provides `qemu-system-aarch64` and the EDK2 firmware |
 | podman | 5.0 or newer (`brew install podman`) — the host client, and the `gvproxy` binary jm uses for networking ships inside the podman formula at `libexec/podman/gvproxy` |
 | OpenSSH | `ssh` and `ssh-keygen` from the base system (`xcode-select --install` if missing) |
-| RAM | About 4 GB free: the default machine is 4 vCPU / 4096 MiB |
+| RAM | About 2 GB free: the default machine is 4 vCPU / 2048 MiB, with the guest's ZFS cache capped at 512 MiB |
 | Disk | About 10 GB free. The image download is roughly 800 MiB compressed; `disk.raw` is created sparse at the `--disk` size (64 GiB by default) and only occupies what the guest actually writes |
 | Optional | `xz` (`brew install xz`) makes decompression of the official image faster; without it jm falls back to a slower in-process decoder. `zstd` is needed only by maintainers running `jm image build` |
 

@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/gabrielbelli/jailmachine/internal/backend"
 	"github.com/gabrielbelli/jailmachine/internal/forwarder"
 )
 
@@ -27,7 +28,10 @@ func newPortsCmd() *cobra.Command {
 			"one, whatever the default is.\n\n" +
 			"The first \"#\" line is the default the running forwarder was started with; a\n" +
 			"second one appears when the record has been changed since and is waiting for\n" +
-			"a restart.",
+			"a restart.\n\n" +
+			"While the machine is suspended the table is kept, but nothing answers on the\n" +
+			"ports: they come back when the machine wakes, and connecting to one does not\n" +
+			"wake it.",
 		Example: `  jm ports
   jm ports --json dev`,
 		Args: cobra.MaximumNArgs(1),
@@ -47,7 +51,9 @@ func newPortsCmd() *cobra.Command {
 				return enc.Encode(entries)
 			}
 			_, running := forwarderProcess(m).Alive()
-			if !running {
+			if st, err := currentState(m); err == nil && st == backend.Suspended {
+				fmt.Fprintf(stdout, "# %s is suspended: these ports answer after the machine wakes; connecting to them does not wake it\n", m.Name)
+			} else if !running {
 				fmt.Fprintf(stdout, "# port forwarder for %s is not running (jm start%s)\n", m.Name, nameHint(m.Name))
 			}
 			inForce, pending := publishAddrs(m, running, st)

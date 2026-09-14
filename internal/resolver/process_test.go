@@ -1,8 +1,14 @@
 package resolver
 
 import (
+	"context"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestProcessIdentity(t *testing.T) {
@@ -64,5 +70,50 @@ func TestAliveAndStopWithoutAProcess(t *testing.T) {
 	}
 	if err := p.Stop(t.Context()); err != nil {
 		t.Errorf("Stop with no pid file: %v", err)
+	}
+}
+
+// Stop never signals the process it runs in, nor that process's group: a
+// recycled pid file can name either.
+func TestProcessStopNeverSignalsSelf(t *testing.T) {
+	dir := t.TempDir()
+	p := Process{Dir: dir, Name: "dev", Root: "/state root"}
+	child := exec.Command("sleep", "30") // shares the test's process group
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan struct{})
+	go func() { _ = child.Wait(); close(exited) }()
+	t.Cleanup(func() { _ = child.Process.Kill(); <-exited })
+	saved := commandLineOf
+	t.Cleanup(func() { commandLineOf = saved })
+	commandLineOf = func(pid int) string {
+		if pid == os.Getpid() || pid == child.Process.Pid {
+			return "/usr/local/bin/jm --state-root /state root _resolver dev"
+		}
+		return ""
+	}
+	pidFile := filepath.Join(dir, PIDFile)
+
+	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Stop(context.Background()); err == nil || !strings.Contains(err.Error(), "refusing") {
+		t.Fatalf("Stop with our own pid = %v, want a refusal", err)
+	}
+
+	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(child.Process.Pid)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-exited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("resolver in our process group was not stopped")
+	}
+	if _, err := os.Stat(pidFile); !os.IsNotExist(err) {
+		t.Error("pid file not removed")
 	}
 }

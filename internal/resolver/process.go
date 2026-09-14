@@ -12,10 +12,12 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/gabrielbelli/jailmachine/internal/procx"
 )
 
-// The resolver runs as a detached "jm _resolver <name>" (own session, pid
-// file, log file) so it outlives the "jm start" that launched it, and is
+// The resolver runs as a detached "jm _resolver <name>" (launched through
+// procx, with a pid file and a log file) so it outlives the "jm start" that launched it, and is
 // recognised by pid plus argv like the hypervisor, gvproxy and the port
 // forwarder: pid files survive reboots and pids are recycled (ADR 0005).
 //
@@ -46,6 +48,9 @@ const (
 	pollInterval = 100 * time.Millisecond
 )
 
+// commandLineOf is commandLine, replaced in tests.
+var commandLineOf = commandLine
+
 // Process locates one machine's resolver.
 type Process struct {
 	Dir  string // machine directory
@@ -74,7 +79,7 @@ func (p Process) Alive() (int, bool) {
 	if err != nil {
 		return 0, false
 	}
-	return pid, IsOurs(commandLine(pid), p)
+	return pid, IsOurs(commandLineOf(pid), p)
 }
 
 // IsOurs matches argv against the substrings that identify this machine's
@@ -149,23 +154,12 @@ func (p Process) Start(ctx context.Context, exe string) error {
 	// A stale address would be handed to the guest before the new resolver
 	// has published its own.
 	_ = os.Remove(p.AddrPath())
-	logf, err := os.OpenFile(p.LogPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	// Detached through procx: the resolver must outlive this jm invocation
+	// and must not become a zombie of a wrapper that execs podman.
+	pid, err := procx.StartDetached(exe, p.Args(), nil, p.LogPath(), false)
 	if err != nil {
-		return fmt.Errorf("resolver: opening %s: %w", p.LogPath(), err)
-	}
-	defer logf.Close()
-	// Not CommandContext: the resolver must outlive this jm invocation.
-	cmd := exec.Command(exe, p.Args()...)
-	cmd.Stdout = logf
-	cmd.Stderr = logf
-	cmd.Stdin = nil
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("resolver: failed to start: %w", err)
 	}
-	pid := cmd.Process.Pid
-	exited := make(chan error, 1)
-	go func() { exited <- cmd.Wait() }()
 	if err := os.WriteFile(p.pidFile(), []byte(strconv.Itoa(pid)+"\n"), 0o600); err != nil {
 		_ = syscall.Kill(pid, syscall.SIGKILL)
 		return fmt.Errorf("resolver: writing %s: %w", p.pidFile(), err)
@@ -175,17 +169,19 @@ func (p Process) Start(ctx context.Context, exe string) error {
 		if p.Addr() != "" {
 			return nil
 		}
-		select {
-		case err := <-exited:
-			return fmt.Errorf("resolver: exited before publishing its address (%v): %s", err, tail(p.LogPath()))
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(pollInterval):
+		if !procx.Alive(pid) {
+			_ = os.Remove(p.pidFile())
+			return fmt.Errorf("resolver: exited before publishing its address: %s", tail(p.LogPath()))
 		}
 		if time.Now().After(deadline) {
 			_ = syscall.Kill(pid, syscall.SIGKILL)
 			_ = os.Remove(p.pidFile())
 			return fmt.Errorf("resolver: timed out waiting for it to publish its address: %s", tail(p.LogPath()))
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(pollInterval):
 		}
 	}
 }
@@ -193,15 +189,22 @@ func (p Process) Start(ctx context.Context, exe string) error {
 // Stop terminates a live resolver (SIGTERM, wait, SIGKILL) and removes its
 // pid file. A dead or absent one is just tidied away. The published address
 // is kept: the next start reuses the port, so the guest's configuration
-// stays valid across a restart.
+// stays valid across a restart. Signals go to the resolver's process group
+// (procx.SignalGroup); Stop refuses to signal this process, and never
+// signals its caller's process group.
 func (p Process) Stop(ctx context.Context) error {
 	if pid, ok := p.Alive(); ok {
-		if err := signalGroup(pid, syscall.SIGTERM); err != nil && processAlive(pid) {
-			return fmt.Errorf("resolver: SIGTERM pid %d: %w", pid, err)
+		if err := procx.SignalGroup(pid, syscall.SIGTERM); err != nil {
+			if errors.Is(err, procx.ErrSelf) {
+				return fmt.Errorf("resolver: %s names this process (pid %d); refusing to signal it", PIDFile, pid)
+			}
+			if procx.Alive(pid) {
+				return fmt.Errorf("resolver: SIGTERM pid %d: %w", pid, err)
+			}
 		}
-		if !waitExit(ctx, pid, termTimeout) {
-			_ = signalGroup(pid, syscall.SIGKILL)
-			if !waitExit(ctx, pid, termTimeout) {
+		if !procx.WaitExit(ctx, pid, termTimeout) {
+			_ = procx.SignalGroup(pid, syscall.SIGKILL)
+			if !procx.WaitExit(ctx, pid, termTimeout) {
 				return fmt.Errorf("resolver: pid %d did not exit after SIGKILL", pid)
 			}
 		}
@@ -210,13 +213,6 @@ func (p Process) Stop(ctx context.Context) error {
 		return err
 	}
 	return nil
-}
-
-func signalGroup(pid int, sig syscall.Signal) error {
-	if err := syscall.Kill(-pid, sig); err == nil {
-		return nil
-	}
-	return syscall.Kill(pid, sig)
 }
 
 func readPID(path string) (int, error) {
@@ -231,17 +227,6 @@ func readPID(path string) (int, error) {
 	return pid, nil
 }
 
-func processAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	err := syscall.Kill(pid, 0)
-	if err == nil {
-		return true
-	}
-	return errors.Is(err, syscall.EPERM)
-}
-
 // commandLine returns the argv of pid as reported by ps, "" if none.
 func commandLine(pid int) string {
 	if pid <= 0 {
@@ -252,23 +237,6 @@ func commandLine(pid int) string {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
-}
-
-func waitExit(ctx context.Context, pid int, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for {
-		if !processAlive(pid) {
-			return true
-		}
-		if time.Now().After(deadline) {
-			return false
-		}
-		select {
-		case <-ctx.Done():
-			return !processAlive(pid)
-		case <-time.After(pollInterval):
-		}
-	}
 }
 
 // tail returns the trimmed tail of a log file, or a hint when it is empty.

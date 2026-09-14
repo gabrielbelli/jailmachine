@@ -258,7 +258,7 @@ func sharesParityCheck(ctx context.Context, m *machine.Machine) (doctor.Result, 
 	if len(m.Shares) == 0 {
 		return res, false
 	}
-	if st, err := currentState(m); err != nil || st != backend.Running {
+	if st, err := currentState(m); err != nil || !ready(m, st) {
 		return res, false
 	}
 	if b, err := backendFor(m); err != nil || !b.Capabilities().FileSharing {

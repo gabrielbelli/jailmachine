@@ -24,7 +24,7 @@ func TestSaveLoadRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if got.Version != Version || got.Name != "alpha" || got.CPUs != 4 || got.MemoryMiB != 4096 ||
+	if got.Version != Version || got.Name != "alpha" || got.CPUs != 4 || got.MemoryMiB != 2048 || got.ArcMiB != DefaultArcMiB || got.IdleSuspendMin != DefaultIdleSuspendMin ||
 		got.DiskGiB != 64 || got.SSHPort != 2222 || got.SSHUser != "root" || got.Backend != "qemu" ||
 		!got.Created.Equal(m.Created) || got.BackendOpts["backend.qemu.accel"] != "hvf" {
 		t.Fatalf("roundtrip mismatch: %+v", got)
@@ -156,5 +156,89 @@ func TestLoadLegacyRecordIsImageTrusted(t *testing.T) {
 	}
 	if m, err = s.Load("old"); err != nil || m.ImageTrusted {
 		t.Fatalf("explicit false: %+v, %v", m, err)
+	}
+}
+
+func TestLoadArcMiB(t *testing.T) {
+	// Records written before arc_mib existed get the default cap; an
+	// explicit 0 (the guest's own default) survives a save and load.
+	s := NewStore(t.TempDir())
+	if err := os.MkdirAll(s.Dir("old"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.Path("old", RecordFile), []byte(`{"version":1,"name":"old","memory_mib":4096}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m, err := s.Load("old")
+	if err != nil || m.ArcMiB != DefaultArcMiB || m.MemoryMiB != 4096 {
+		t.Fatalf("legacy record: %+v, %v", m, err)
+	}
+	m.ArcMiB = 0
+	if err := s.Save(m); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(s.Path("old", RecordFile)); !strings.Contains(string(data), `"arc_mib": 0`) {
+		t.Fatalf("explicit 0 not written:\n%s", data)
+	}
+	if m, err = s.Load("old"); err != nil || m.ArcMiB != 0 {
+		t.Fatalf("explicit 0: %+v, %v", m, err)
+	}
+	// A legacy record too small for the default cap gets one it can take.
+	if err := os.WriteFile(s.Path("old", RecordFile), []byte(`{"version":1,"name":"old","memory_mib":512}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if m, err = s.Load("old"); err != nil || m.ArcMiB != 256 {
+		t.Fatalf("legacy 512 MiB record: %+v, %v", m, err)
+	}
+}
+
+func TestDefaultArcFor(t *testing.T) {
+	for mem, want := range map[int]int{4096: 512, 2048: 512, 1024: 512, 1000: 500, 512: 256, 256: 128, 128: 64, 127: 0, 0: 0} {
+		if got := DefaultArcFor(mem); got != want {
+			t.Errorf("DefaultArcFor(%d) = %d, want %d", mem, got, want)
+		}
+	}
+}
+
+func TestLoadSeedsIdleSuspendMin(t *testing.T) {
+	// A record written before idle_suspend_min existed (the maintainer's
+	// 4096 MiB machine among them) gets the default idle time.
+	if d := Defaults(); d.IdleSuspendMin != DefaultIdleSuspendMin || DefaultIdleSuspendMin != 30 {
+		t.Fatalf("Defaults().IdleSuspendMin = %d, want 30", d.IdleSuspendMin)
+	}
+	s := NewStore(t.TempDir())
+	if err := os.MkdirAll(s.Dir("old"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.Path("old", RecordFile), []byte(`{"version":1,"name":"old","memory_mib":4096,"arc_mib":0}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m, err := s.Load("old")
+	if err != nil || m.IdleSuspendMin != DefaultIdleSuspendMin || m.ArcMiB != 0 || m.Version != 1 {
+		t.Fatalf("legacy record: %+v, %v", m, err)
+	}
+	// An explicit non-default value is kept as written.
+	if err := os.WriteFile(s.Path("old", RecordFile), []byte(`{"version":1,"name":"old","idle_suspend_min":120}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if m, err = s.Load("old"); err != nil || m.IdleSuspendMin != 120 {
+		t.Fatalf("explicit 120: %+v, %v", m, err)
+	}
+}
+
+func TestExplicitZeroIdleSuspendSurvives(t *testing.T) {
+	s := NewStore(t.TempDir())
+	m := Defaults()
+	m.Name = "never"
+	m.IdleSuspendMin = 0
+	if err := s.Save(&m); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(s.Path("never", RecordFile)); !strings.Contains(string(data), `"idle_suspend_min": 0`) {
+		t.Fatalf("explicit 0 not written:\n%s", data)
+	}
+	got, err := s.Load("never")
+	if err != nil || got.IdleSuspendMin != 0 {
+		t.Fatalf("explicit 0: %+v, %v", got, err)
 	}
 }

@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/gabrielbelli/jailmachine/internal/machine"
 )
@@ -29,6 +30,10 @@ const (
 	// Broken is a diagnosed, recoverable condition, e.g. a pid file whose
 	// process is gone (ADR 0005).
 	Broken State = "broken"
+	// Suspended means the guest's complete execution state is saved in the
+	// machine directory and no hypervisor process runs (ADR 0009). It is
+	// computed from the saved-state journal and file sizes, never cached.
+	Suspended State = "suspended"
 )
 
 // Capabilities are queried, never assumed: the CLI degrades features
@@ -41,6 +46,8 @@ type Capabilities struct {
 	// than letting a mount fail inside a container.
 	FileSharing     bool
 	RoutableNetwork bool
+	// Suspend is whether the backend implements Suspender (ADR 0009).
+	Suspend bool
 }
 
 // NetAttachment describes how the hypervisor should attach the VM's NIC.
@@ -115,6 +122,116 @@ type Resizer interface {
 	// ResizeDisk announces the new size of disk.raw, in bytes, to the
 	// running VM.
 	ResizeDisk(ctx context.Context, m *machine.Machine, size int64) error
+}
+
+// Errors a Suspender returns, wrapped with the detail.
+var (
+	// ErrSuspended is returned by Start on a suspended machine: it must be
+	// resumed or its saved state discarded first.
+	ErrSuspended = errors.New("backend: machine is suspended; wake or discard it first")
+	// ErrSuspendUnavailable means this machine cannot be suspended now; the
+	// wrapped text says why. Nothing was changed.
+	ErrSuspendUnavailable = errors.New("backend: suspend unavailable")
+	// ErrSuspendBlocked means the hypervisor refused to save the machine
+	// (for example a device that blocks migration). The guest was never
+	// frozen.
+	ErrSuspendBlocked = errors.New("backend: suspend blocked")
+	// ErrSuspendAborted means the caller's abort hook asked to stop before
+	// the guest was frozen.
+	ErrSuspendAborted = errors.New("backend: suspend aborted")
+	// ErrSuspendCrashed means the hypervisor exited while it was saving
+	// the machine. The saved state is incomplete; the disk is not.
+	ErrSuspendCrashed = errors.New("backend: hypervisor exited while suspending")
+	// ErrResumeIncompatible means the saved state cannot be restored and
+	// must be discarded: the hypervisor rejected it, or the disk, firmware
+	// store or hardware changed since it was saved. Any other Resume error
+	// is transient and keeps the saved state.
+	ErrResumeIncompatible = errors.New("backend: saved state cannot be restored")
+)
+
+// SuspendPhase is the phase a suspend journal records.
+type SuspendPhase string
+
+const (
+	// SuspendNone: no journal.
+	SuspendNone SuspendPhase = ""
+	// SuspendSaving: a suspend has started and is not yet durable.
+	SuspendSaving SuspendPhase = "saving"
+	// SuspendSaved: the saved state is complete and durable.
+	SuspendSaved SuspendPhase = "saved"
+)
+
+// SuspendStatus is what the journal says, read from files only.
+type SuspendStatus struct {
+	Phase   SuspendPhase
+	Reason  string
+	SavedAt time.Time
+	// ImagePath is the saved state; ImageBytes its logical size and
+	// AllocatedBytes the space it takes on disk.
+	ImagePath      string
+	ImageBytes     int64
+	AllocatedBytes int64
+	// Meta is the caller's own key/value data from SuspendPlan.
+	Meta map[string]string
+}
+
+// SuspendPlan is what the caller records in the journal when a suspend
+// starts.
+type SuspendPlan struct {
+	Reason string
+	// Meta is kept verbatim and handed back by SuspendStatus, so the CLI can
+	// restore its own settings at wake.
+	Meta map[string]string
+}
+
+// RecoverAction is what Recover did to an interrupted transition.
+type RecoverAction string
+
+const (
+	// RecoverNone: there was nothing to recover.
+	RecoverNone RecoverAction = "none"
+	// RecoverResumedGuest: the guest runs again (it was never frozen, or it
+	// was continued). The caller must remount shares and restart the
+	// helpers the transition stopped.
+	RecoverResumedGuest RecoverAction = "resumed-guest"
+	// RecoverSuspended: the machine is suspended with a valid saved state.
+	RecoverSuspended RecoverAction = "suspended"
+	// RecoverDiscarded: an incomplete or unusable saved state was removed;
+	// the machine is stopped.
+	RecoverDiscarded RecoverAction = "discarded"
+)
+
+// Suspender is an optional interface for backends that can save a running
+// machine's execution state to its directory and restore it (ADR 0009).
+// Every method except Suspendable and SuspendStatus must run under the
+// machine lock.
+type Suspender interface {
+	// Suspendable returns "" when the machine can be suspended, or the
+	// reason it cannot. It reads files and process tables only.
+	Suspendable(m *machine.Machine) string
+	// SuspendStatus reads the journal. It never talks to the hypervisor.
+	SuspendStatus(m *machine.Machine) (SuspendStatus, error)
+	// PrepareSuspend checks that the running hypervisor can save the
+	// machine and writes a "saving" journal. The guest is not touched.
+	PrepareSuspend(ctx context.Context, m *machine.Machine, plan SuspendPlan) error
+	// CommitSuspend freezes and saves the guest, commits the journal as
+	// "saved" once the image is durable, and ends the hypervisor. abort is
+	// called immediately before the freeze; true cancels. On a failure
+	// before the commit the guest is left running and the journal stays
+	// "saving" for CancelSuspend.
+	CommitSuspend(ctx context.Context, m *machine.Machine, abort func() bool) error
+	// CancelSuspend removes a "saving" journal and any partial image.
+	CancelSuspend(m *machine.Machine) error
+	// Recover resolves a transition that a killed process left half done.
+	// It never continues a guest whose journal says "saved".
+	Recover(ctx context.Context, m *machine.Machine) (RecoverAction, error)
+	// Resume restores a suspended machine and leaves the guest running.
+	// net is the provider's attachment, which must already be up. An error
+	// wrapping ErrResumeIncompatible means the caller should discard the
+	// saved state; any other error keeps it.
+	Resume(ctx context.Context, m *machine.Machine, net NetAttachment) error
+	// DiscardSuspend removes the journal first, then the image.
+	DiscardSuspend(m *machine.Machine, reason string) error
 }
 
 // Backend is implemented by each hypervisor package (e.g. backend/qemu).

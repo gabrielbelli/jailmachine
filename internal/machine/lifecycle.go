@@ -25,6 +25,9 @@ const (
 	StageConnect Stage = "connect"
 	// StageForwarder launches the detached port forwarder (ADR 0004).
 	StageForwarder Stage = "forwarder"
+	// StageSleeper launches the detached helper that suspends an idle
+	// machine and holds its endpoints while it is suspended (ADR 0009).
+	StageSleeper Stage = "sleeper"
 )
 
 // StageError wraps an error with the stage it happened in and a hint about

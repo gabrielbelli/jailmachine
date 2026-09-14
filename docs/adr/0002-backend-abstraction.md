@@ -39,3 +39,27 @@ will need different hypervisors. The thing users care about — "my machine,
   Machine record so they can be ignored by other backends.
 - The interface is intentionally small; GUI/console attach, snapshots and
   suspend are added as optional capability interfaces, not as required methods.
+
+## Addendum (2026-09-14): the optional suspend capability
+
+**ADR 0009** adds the suspend capability this ADR reserved. `State` gains
+`suspended`, computed from files like the others, and `Capabilities` gains
+`suspend`. A backend that has it also implements:
+
+```
+Suspendable(machine) -> "" | reason       SuspendStatus(machine) -> phase, saved at, image
+PrepareSuspend(machine, plan)             CommitSuspend(machine, abort?) -> saved | error
+CancelSuspend(machine)                    Recover(machine) -> none|resumed|suspended|discarded
+Resume(machine, net attachment)           DiscardSuspend(machine, reason)
+```
+
+`Suspendable` and `SuspendStatus` read files and the process table only.
+`CommitSuspend` asks `abort?` immediately before the guest is frozen, so a
+client that arrives late cancels at no cost. Failures are classified, because
+the CLI acts on the class: *unavailable* and *blocked* change nothing, *aborted*
+is a client arriving, *crashed* is the hypervisor exiting mid-save, and
+*incompatible* (a rejected load, an unknown machine model, a changed disk,
+firmware store or hardware description) is the only failure that discards a
+saved state. `Start` on a suspended machine refuses rather than boot over the
+saved state, and `Repair` keeps a valid saved state while discarding an
+incomplete one.

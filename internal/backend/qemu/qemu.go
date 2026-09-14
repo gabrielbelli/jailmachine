@@ -1,6 +1,7 @@
 // Package qemu implements backend.Backend with QEMU (HVF on macOS, KVM on
 // Linux later): -M virt, EDK2 pflash, virtio-blk/net/rng, serial console to
-// console.log, QMP socket for graceful power-down.
+// console.log, QMP socket for readiness and graceful power-down. QEMU is
+// launched detached through procx, never with -daemonize.
 //
 // The backend finds a machine's files through Machine.Dir, which the machine
 // store fills in on load (ADR 0005); it knows nothing about the state root.
@@ -8,16 +9,18 @@ package qemu
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gabrielbelli/jailmachine/internal/backend"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
+	"github.com/gabrielbelli/jailmachine/internal/procx"
 )
 
 // Name is the identifier stored in Machine.Backend.
@@ -27,7 +30,6 @@ const Name = "qemu"
 const (
 	gracefulTimeout = 30 * time.Second
 	termTimeout     = 5 * time.Second
-	pollInterval    = 200 * time.Millisecond
 )
 
 // ErrRunning is returned by Start when the machine is already running.
@@ -45,10 +47,11 @@ func init() { backend.Register(Backend{}) }
 // Name implements backend.Backend.
 func (Backend) Name() string { return Name }
 
-// Capabilities implements backend.Backend: a serial console, and host
-// filesystem sharing over virtio-9p (ADR 0007).
+// Capabilities implements backend.Backend: a serial console, host
+// filesystem sharing over virtio-9p (ADR 0007), and suspend to a file
+// (ADR 0009).
 func (Backend) Capabilities() backend.Capabilities {
-	return backend.Capabilities{SerialConsole: true, FileSharing: true}
+	return backend.Capabilities{SerialConsole: true, FileSharing: true, Suspend: true}
 }
 
 // Preflight implements backend.Backend: the emulator and its firmware must
@@ -94,16 +97,49 @@ func (b Backend) paths(m *machine.Machine) Paths {
 	}
 }
 
-// State implements backend.Backend: computed from the pid file and the
-// process behind it, never cached. A pid that is alive but is not our QEMU
-// (pid recycled after a reboot or crash) is Broken, so Start repairs and
-// Stop never signals a foreign process.
+// State implements backend.Backend: computed from the pid file, the
+// process behind it and the suspend journal, never cached and never over
+// QMP. A pid that is alive but is not our QEMU (pid recycled after a reboot
+// or crash) is not running, so Start repairs and Stop never signals a
+// foreign process.
 func (b Backend) State(m *machine.Machine) (backend.State, error) {
 	if m.Dir == "" {
 		return "", ErrNoDir
 	}
 	pidFile := b.paths(m).PID
-	return stateFromPIDFile(pidFile, func(pid int) bool { return isOurQEMU(pid, pidFile) })
+	sp := suspendPaths(m.Dir)
+	return stateFromFiles(pidFile, sp.Journal, sp.Image, func(pid int) bool { return isOurQEMU(pid, pidFile) })
+}
+
+// stateFromFiles is the pure core of State (ADR 0009 state table):
+//
+//	qemu.pid         journal       image             state
+//	live, ours       any           -                 running
+//	absent or stale  saved         valid             suspended
+//	absent or stale  saved         missing or short  broken
+//	absent or stale  saving        -                 broken
+//	absent or stale  unparseable   -                 broken
+//	absent           none          any               stopped
+//	stale            none          -                 broken
+//
+// A running machine with a journal is a transition in flight or interrupted;
+// callers that need a usable guest check for the journal too.
+func stateFromFiles(pidFile, journal, image string, ours func(pid int) bool) (backend.State, error) {
+	pidState, err := stateFromPIDFile(pidFile, ours)
+	if err != nil || pidState == backend.Running {
+		return pidState, err
+	}
+	j, jerr := readJournal(journal)
+	switch {
+	case errors.Is(jerr, os.ErrNotExist):
+		return pidState, nil // stopped, or broken for a stale pid file
+	case jerr != nil:
+		return backend.Broken, nil
+	case j.Phase == backend.SuspendSaved && validImage(image, j):
+		return backend.Suspended, nil
+	default:
+		return backend.Broken, nil
+	}
 }
 
 // stateFromPIDFile is the pure core of State, shared with tests. ours
@@ -125,13 +161,52 @@ func stateFromPIDFile(pidFile string, ours func(pid int) bool) (backend.State, e
 }
 
 // Repair removes stale runtime files left behind by a dead QEMU (ADR 0005
-// "broken" -> "stopped").
+// "broken" -> "stopped"). A valid saved pair (a "saved" journal whose image
+// has the committed size) is kept, so a suspended machine with a stale pid
+// file repairs to suspended. Anything else of a suspend is discarded: an
+// unparseable journal is kept aside as suspend.json.bad, and a "saving" or
+// invalid "saved" journal is removed before its image. It must not be
+// called while QEMU runs.
 func (b Backend) Repair(m *machine.Machine) error {
 	if m.Dir == "" {
 		return ErrNoDir
 	}
 	p := b.paths(m)
-	return removeAll(p.PID, p.QMP)
+	if err := removeAll(p.PID, p.QMP); err != nil {
+		return err
+	}
+	return repairSuspend(suspendPaths(m.Dir))
+}
+
+// repairSuspend keeps a valid saved pair and discards everything else. A
+// journal or image that cannot be read (an I/O or permission error, as
+// opposed to one that was read and is invalid) changes nothing: the error is
+// returned, because discarding would destroy a saved state that may be fine.
+func repairSuspend(sp journalPaths) error {
+	j, err := readJournal(sp.Journal)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return removeImages(sp) // orphans of a finished or discarded suspend
+	case errors.Is(err, errBadJournal):
+		if rerr := os.Rename(sp.Journal, sp.Bad); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+			return fmt.Errorf("qemu: setting aside a bad suspend journal: %w", rerr)
+		}
+		if err := syncDir(filepath.Dir(sp.Journal)); err != nil {
+			return err
+		}
+		return removeImages(sp)
+	case err != nil:
+		return fmt.Errorf("qemu: reading the suspend journal (nothing was changed): %w", err)
+	}
+	valid, err := checkImage(sp.Image, j)
+	switch {
+	case err != nil:
+		return fmt.Errorf("%w (nothing was changed)", err)
+	case j.Phase == backend.SuspendSaved && valid:
+		return removeAll(sp.Tmp)
+	default:
+		return discardJournalThenImage(sp)
+	}
 }
 
 func removeAll(paths ...string) error {
@@ -144,8 +219,16 @@ func removeAll(paths ...string) error {
 	return errors.Join(errs...)
 }
 
-// Start implements backend.Backend: daemonises qemu-system-aarch64 with the
-// PoC argv and returns once the pid file exists.
+// launchReadyTimeout bounds how long Start waits for a launched QEMU to
+// write its pid file and answer QMP. A variable so tests can shorten it.
+var launchReadyTimeout = 15 * time.Second
+
+// launchPollInterval is how often Start checks a launched QEMU.
+const launchPollInterval = 50 * time.Millisecond
+
+// Start implements backend.Backend: launches qemu-system-aarch64 detached
+// (procx, no -daemonize) and returns once its pid file names the launched
+// process and QMP answers query-status with "prelaunch" or "running".
 func (b Backend) Start(ctx context.Context, m *machine.Machine, net backend.NetAttachment) error {
 	st, err := b.State(m)
 	if err != nil {
@@ -154,13 +237,29 @@ func (b Backend) Start(ctx context.Context, m *machine.Machine, net backend.NetA
 	switch st {
 	case backend.Running:
 		return ErrRunning
+	case backend.Suspended:
+		return backend.ErrSuspended
 	case backend.Broken:
 		if err := b.Repair(m); err != nil {
 			return fmt.Errorf("qemu: repairing stale state: %w", err)
 		}
+		// A suspended machine with a stale pid file repairs to suspended.
+		if st, err := b.State(m); err != nil {
+			return err
+		} else if st == backend.Suspended {
+			return backend.ErrSuspended
+		}
 	}
 
 	p := b.paths(m)
+	// With no journal, a saved image is an orphan of an interrupted
+	// discard or wake; a cold boot makes it meaningless.
+	sp := suspendPaths(m.Dir)
+	if _, err := os.Stat(sp.Journal); errors.Is(err, os.ErrNotExist) {
+		if err := removeImages(sp); err != nil {
+			return fmt.Errorf("qemu: removing an orphan suspend image: %w", err)
+		}
+	}
 	if _, err := os.Stat(p.Disk); err != nil {
 		return fmt.Errorf("qemu: disk image missing (run 'jm init'): %w", err)
 	}
@@ -195,24 +294,116 @@ func (b Backend) Start(ctx context.Context, m *machine.Machine, net backend.NetA
 	}
 
 	args := Args(&run, net, p)
-	logf, err := os.OpenFile(p.Log, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	// The console chardev appends, so a cold boot starts the log afresh
+	// here, as -serial file: used to.
+	if err := truncateFile(p.Console); err != nil {
+		return err
+	}
+	// Written before the launch, so a live QEMU never has a stale argv.
+	if err := writeArgv(filepath.Join(m.Dir, ArgvFile), append([]string{bin}, args...)); err != nil {
+		return err
+	}
+	pid, err := procx.StartDetached(bin, args, nil, p.Log, true)
 	if err != nil {
-		return fmt.Errorf("qemu: opening %s: %w", p.Log, err)
+		return fmt.Errorf("qemu: failed to start: %w", err)
 	}
-	cmd := exec.CommandContext(ctx, bin, args...)
-	cmd.Stdout = logf
-	cmd.Stderr = logf
-	runErr := cmd.Run()
-	_ = logf.Close()
-	if runErr != nil {
-		return fmt.Errorf("qemu: failed to start (%v): %s", runErr, tailOf(p.Log))
+	return waitLaunched(ctx, pid, p, launchReadyTimeout)
+}
+
+// launchKill and launchKillTimeout are how waitLaunched kills a QEMU that
+// failed to start and how long it waits for it to go. Variables so tests can
+// simulate a process that outlives SIGKILL.
+var (
+	launchKill        = kill
+	launchKillTimeout = termTimeout
+)
+
+// waitLaunched polls a freshly launched QEMU until its pid file names pid
+// and QMP reports "prelaunch" or "running". An early exit is reported with
+// the tail of qemu.log; on a timeout or a cancelled ctx the process is
+// killed. Once the process is confirmed gone the pid file and QMP socket are
+// removed, so a failed Start leaves the machine stopped. A process that does
+// not exit after SIGKILL stays tracked instead: the pid file is made to name
+// it, so State does not report Stopped and 'jm stop' can still reach it.
+func waitLaunched(ctx context.Context, pid int, p Paths, timeout time.Duration) error {
+	fail := func(err error) error {
+		if procx.Alive(pid) {
+			_ = launchKill(pid)
+			if !procx.WaitExit(context.Background(), pid, launchKillTimeout) {
+				if got, rerr := readPID(p.PID); rerr != nil || got != pid {
+					_ = writeAtomic(p.PID, []byte(strconv.Itoa(pid)+"\n"), 0o600)
+				}
+				return fmt.Errorf("%w; pid %d did not exit after SIGKILL and is still recorded in %s", err, pid, p.PID)
+			}
+		}
+		_ = removeAll(p.PID, p.QMP)
+		return err
 	}
-	// With -daemonize qemu only exits 0 once the child has written the pid
-	// file, but be defensive: a missing pid file means nothing is running.
-	if _, err := readPID(p.PID); err != nil {
-		return fmt.Errorf("qemu: exited without writing %s: %s", p.PID, tailOf(p.Log))
+	deadline := time.Now().Add(timeout)
+	for {
+		if !procx.Alive(pid) {
+			return fail(fmt.Errorf("qemu: exited during startup: %s", tailOf(p.Log)))
+		}
+		if ready(ctx, pid, p) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fail(fmt.Errorf("qemu: not ready after %s (no pid file or QMP answer); killed it: %s", timeout, tailOf(p.Log)))
+		}
+		select {
+		case <-ctx.Done():
+			return fail(fmt.Errorf("qemu: waiting for startup: %w", ctx.Err()))
+		case <-time.After(launchPollInterval):
+		}
 	}
-	return nil
+}
+
+// ready reports whether QEMU has written pid to its pid file and answers
+// query-status with a state it reaches only after initialising.
+func ready(ctx context.Context, pid int, p Paths) bool {
+	if got, err := readPID(p.PID); err != nil || got != pid {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	q, err := DialMonitor(ctx, p.QMP)
+	if err != nil {
+		return false
+	}
+	defer q.Close()
+	status, err := q.QueryStatus(ctx)
+	return err == nil && (status == "prelaunch" || status == "running")
+}
+
+// truncateFile empties path, creating it with mode 0600 when absent.
+func truncateFile(path string) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("qemu: truncating %s: %w", path, err)
+	}
+	return f.Close()
+}
+
+// writeArgv records argv in path as a JSON array, atomically.
+func writeArgv(path string, argv []string) error {
+	data, err := json.Marshal(argv)
+	if err != nil {
+		return fmt.Errorf("qemu: encoding argv: %w", err)
+	}
+	return writeAtomic(path, append(data, '\n'), 0o600)
+}
+
+// ReadArgv returns the argv recorded in a machine directory's ArgvFile.
+func ReadArgv(dir string) ([]string, error) {
+	data, err := os.ReadFile(filepath.Join(dir, ArgvFile))
+	if err != nil {
+		return nil, err
+	}
+	var argv []string
+	if err := json.Unmarshal(data, &argv); err != nil {
+		return nil, fmt.Errorf("qemu: reading %s: %w", ArgvFile, err)
+	}
+	return argv, nil
 }
 
 // writeShareTable publishes the share table into the directory exported to
@@ -258,6 +449,12 @@ func ensureEFIVars(src, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return err
 	}
+	return writeAtomic(dst, data, 0o600)
+}
+
+// writeAtomic writes data to a temporary sibling of dst, syncs it and
+// renames it into place, so a reader never sees a partial file.
+func writeAtomic(dst string, data []byte, perm os.FileMode) error {
 	tmp, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".*.tmp")
 	if err != nil {
 		return fmt.Errorf("qemu: writing %s: %w", dst, err)
@@ -275,7 +472,7 @@ func ensureEFIVars(src, dst string) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("qemu: writing %s: %w", dst, err)
 	}
-	if err := os.Chmod(tmpName, 0o600); err != nil {
+	if err := os.Chmod(tmpName, perm); err != nil {
 		return err
 	}
 	if err := os.Rename(tmpName, dst); err != nil {
@@ -369,21 +566,8 @@ func (b Backend) Cleanup(m *machine.Machine) error {
 	return removeAll(qmp)
 }
 
-// waitExit polls until the process is gone, the timeout lapses or ctx is
-// cancelled. It returns true if the process exited.
+// waitExit polls until the process is gone (a zombie counts as gone), the
+// timeout lapses or ctx is cancelled. It returns true if the process exited.
 func waitExit(ctx context.Context, pid int, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for {
-		if !processAlive(pid) {
-			return true
-		}
-		if time.Now().After(deadline) {
-			return false
-		}
-		select {
-		case <-ctx.Done():
-			return !processAlive(pid)
-		case <-time.After(pollInterval):
-		}
-	}
+	return procx.WaitExit(ctx, pid, timeout)
 }

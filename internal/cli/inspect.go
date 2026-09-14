@@ -4,13 +4,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/gabrielbelli/jailmachine/internal/backend"
 	"github.com/gabrielbelli/jailmachine/internal/forwarder"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
+	"github.com/gabrielbelli/jailmachine/internal/sleeper"
 )
 
 // info is the inspect/list view: the record plus computed runtime facts.
@@ -50,9 +53,33 @@ type info struct {
 	ResolverLog  string        `json:"resolver_log,omitempty"`
 	// Autostart is whether "jpodman"/"jdocker" would boot this machine on
 	// demand; DockerHost is what they point the docker CLI at.
-	Autostart     bool   `json:"autostart"`
-	DockerHost    string `json:"docker_host,omitempty"`
-	networkString string
+	Autostart  bool   `json:"autostart"`
+	DockerHost string `json:"docker_host,omitempty"`
+	// SuspendedAt, SuspendImage and SuspendImageBytes (the image's
+	// allocated size) describe a suspended machine's saved state (ADR
+	// 0009); they are omitted unless the machine is suspended.
+	SuspendedAt       *time.Time `json:"suspended_at,omitempty"`
+	SuspendImage      string     `json:"suspend_image,omitempty"`
+	SuspendImageBytes int64      `json:"suspend_image_bytes,omitempty"`
+	// Sleeper is the per-machine helper that runs a suspend and holds the
+	// machine's endpoints while it is suspended (ADR 0009). LastWakeBy,
+	// LastResumeMS and LastSuspendMS come from its status file and are
+	// omitted when unknown.
+	Sleeper       backend.State `json:"sleeper_state"`
+	SleeperLog    string        `json:"sleeper_log,omitempty"`
+	LastWakeBy    string        `json:"last_wake_by,omitempty"`
+	LastResumeMS  int64         `json:"last_resume_ms,omitempty"`
+	LastSuspendMS int64         `json:"last_suspend_ms,omitempty"`
+	// IdleSeconds, IdleSuspendAfterSeconds (the idle period, lengthened
+	// after quick wakes), IdleBlockers, IdleUnavailable and
+	// IdleDisabledReason are the idle monitor's last report (ADR 0009):
+	// present only while the machine runs and its sleeper monitors it.
+	IdleSeconds             *int64   `json:"idle_seconds,omitempty"`
+	IdleSuspendAfterSeconds int64    `json:"idle_suspend_after_seconds,omitempty"`
+	IdleBlockers            []string `json:"idle_blockers,omitempty"`
+	IdleUnavailable         string   `json:"idle_unavailable,omitempty"`
+	IdleDisabledReason      string   `json:"idle_disabled_reason,omitempty"`
+	networkString           string
 }
 
 // describe computes the runtime view of m; read-only, never blocks.
@@ -64,6 +91,7 @@ func describe(m *machine.Machine) info {
 		Ports:         []forwarder.Entry{},
 		Forwarder:     backend.Stopped,
 		Resolver:      backend.Stopped,
+		Sleeper:       backend.Stopped,
 	}
 	fw := forwardState(m)
 	if fw.Owned != nil {
@@ -71,6 +99,7 @@ func describe(m *machine.Machine) info {
 	}
 	i.Autostart = autostartEnabled()
 	running := false
+	var sleeperStatus *sleeper.Status
 	if m.Dir != "" {
 		pr := forwarderProcess(m)
 		i.ForwarderLog = pr.LogPath()
@@ -79,6 +108,15 @@ func describe(m *machine.Machine) info {
 		}
 		rp := resolverProcess(m)
 		i.ResolverLog, i.ResolverAddr, i.Resolver = rp.LogPath(), rp.Addr(), resolverState(m)
+		sp := sleeperProcess(m)
+		i.SleeperLog = sp.LogPath()
+		if sleeperAlive(m) {
+			i.Sleeper = backend.Running
+		}
+		if st, err := sleeper.LoadStatus(sp.StatusPath()); err == nil {
+			i.LastWakeBy, i.LastResumeMS, i.LastSuspendMS = st.LastWakeBy, st.LastResumeMS, st.LastSuspendMS
+			sleeperStatus = &st
+		}
 	}
 	i.PublishAddr, i.PublishAddrPending = publishAddrs(m, running, fw)
 	b, p, err := components(m)
@@ -93,6 +131,21 @@ func describe(m *machine.Machine) info {
 		i.NetworkState = st
 	}
 	i.State = combineState(i.BackendState, i.NetworkState, p.Capabilities().Supervised)
+	if st := sleeperStatus; st != nil && i.Sleeper == backend.Running && ready(m, i.State) && st.Mode == sleeper.ModeMonitor {
+		secs := st.IdleSeconds
+		i.IdleSeconds = &secs
+		i.IdleSuspendAfterSeconds, i.IdleBlockers = st.IdleSuspendAfterSeconds, st.Blockers
+		i.IdleUnavailable, i.IdleDisabledReason = st.IdleUnavailable, st.DisabledReason
+	}
+	if s, ok := b.(backend.Suspender); ok && i.State == backend.Suspended {
+		if st, err := s.SuspendStatus(m); err == nil {
+			if !st.SavedAt.IsZero() {
+				at := st.SavedAt
+				i.SuspendedAt = &at
+			}
+			i.SuspendImage, i.SuspendImageBytes = st.ImagePath, st.AllocatedBytes
+		}
+	}
 	i.Console = b.ConsolePath(m)
 	i.NetworkLogs = p.Logs(m)
 	if ep, err := p.Endpoint(m); err == nil {
@@ -112,8 +165,11 @@ state is read from the hypervisor and the network provider on every call.
 
 --json prints one object with snake_case keys:
 
-  name, state (running|stopped|broken), backend_state, network_state,
-  backend, network, image, cpus, memory_mib, disk_gib, mac, ssh_port,
+  name, state (running|stopped|suspended|broken), backend_state, network_state,
+  backend, network, image, cpus, memory_mib, arc_mib (the guest's ZFS ARC
+  cap in MiB; 0 is the guest's own default), idle_suspend_min (minutes a
+  running machine may sit idle before it is suspended to disk; 0 never
+  suspends; always present), disk_gib, mac, ssh_port,
   ssh_user, guest_ip, ssh (host:port), ssh_key, podman_uri,
   podman_sock_uri, api_socket, dns, console, network_logs, dir,
   provisioned, image_trusted (false for a BYO image without a .sha256 sidecar),
@@ -124,9 +180,71 @@ state is read from the hypervisor and the network provider on every call.
   the running forwarder binds when -p names no host address) and
   publish_addr_pending (the record's value when it differs and is waiting
   for a restart),
-  resolver_state, resolver_addr, resolver_log.
+  resolver_state, resolver_addr, resolver_log,
+  sleeper_state (running|stopped), sleeper_log, last_wake_by (socket,
+  ssh-port, wrapper or jm start), last_resume_ms and last_suspend_ms (from
+  the sleeper's last report; omitted when unknown),
+  suspended_at (RFC 3339), suspend_image (the saved state's path) and
+  suspend_image_bytes (the space it takes on disk): only while suspended,
+  idle_seconds (how long the machine has been idle), idle_suspend_after_seconds
+  (how long it may be idle, lengthened after quick wakes), idle_blockers (what
+  holds it awake), idle_unavailable (why it cannot be suspended) and
+  idle_disabled_reason (why automatic suspend is off): the idle monitor's last
+  report, only while the machine runs and its sleeper watches it.
 
 Keys whose value is empty are omitted.`
+
+// idleRow is the inspect Idle suspend row: the setting, and while the
+// machine runs, what its idle monitor last reported.
+func idleRow(i info) string {
+	row := idleSuspendRow(i.IdleSuspendMin)
+	switch {
+	case i.IdleSuspendMin == 0:
+		return row
+	case i.IdleDisabledReason != "":
+		return row + " (" + i.IdleDisabledReason + ")"
+	case i.IdleUnavailable != "":
+		return "unavailable (" + i.IdleUnavailable + ")"
+	case len(i.IdleBlockers) > 0:
+		return "held awake by: " + strings.Join(i.IdleBlockers, ", ")
+	case i.IdleSeconds == nil:
+		return row
+	}
+	if after := i.IdleSuspendAfterSeconds; after > int64(i.IdleSuspendMin)*60 {
+		row = "after " + idleSuspendWord(int(after/60)) + ", lengthened after quick wakes"
+	}
+	return row + " (idle " + idleWord(*i.IdleSeconds) + ")"
+}
+
+// idleWord renders an idle time: seconds under a minute, minutes after.
+func idleWord(secs int64) string {
+	if secs < 60 {
+		return fmt.Sprintf("%d s", secs)
+	}
+	return fmt.Sprintf("%d min", secs/60)
+}
+
+// stateRow is the inspect State row: the state, with the saved state's time
+// and size while suspended.
+func stateRow(i info) string {
+	if i.State != backend.Suspended {
+		return string(i.State)
+	}
+	var parts []string
+	if i.SuspendedAt != nil {
+		at := i.SuspendedAt.Local()
+		if y, m, d := at.Date(); y == time.Now().Year() && m == time.Now().Month() && d == time.Now().Day() {
+			parts = append(parts, "since "+at.Format("15:04"))
+		} else {
+			parts = append(parts, "since "+at.Format("2006-01-02 15:04"))
+		}
+	}
+	if i.SuspendImageBytes > 0 {
+		parts = append(parts, "image "+humanBytes(i.SuspendImageBytes))
+	}
+	parts = append(parts, "wakes on first use")
+	return fmt.Sprintf("%s (%s)", i.State, strings.Join(parts, "; "))
+}
 
 func newInspectCmd() *cobra.Command {
 	return &cobra.Command{
@@ -151,7 +269,7 @@ func newInspectCmd() *cobra.Command {
 			tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
 			row := func(k string, v any) { fmt.Fprintf(tw, "%s:\t%v\n", k, v) }
 			row("Name", i.Name)
-			row("State", i.State)
+			row("State", stateRow(i))
 			if i.State == backend.Broken {
 				row("  Hypervisor", i.BackendState)
 				row("  Network", i.NetworkState)
@@ -162,6 +280,8 @@ func newInspectCmd() *cobra.Command {
 			row("Image trusted", i.ImageTrusted)
 			row("CPUs", i.CPUs)
 			row("Memory", fmt.Sprintf("%d MiB", i.MemoryMiB))
+			row("ZFS ARC cap", arcWord(i.ArcMiB))
+			row("Idle suspend", idleRow(i))
 			row("Disk", fmt.Sprintf("%d GiB", i.DiskGiB))
 			row("MAC", i.MAC)
 			if i.GuestIP != "" {
@@ -202,6 +322,10 @@ func newInspectCmd() *cobra.Command {
 			row("Forwarder", i.Forwarder)
 			if i.ForwarderLog != "" {
 				row("Forwarder log", i.ForwarderLog)
+			}
+			row("Sleeper", i.Sleeper)
+			if i.SleeperLog != "" {
+				row("Sleeper log", i.SleeperLog)
 			}
 			for _, e := range i.Ports {
 				row("Port", fmt.Sprintf("%s -> %s %s (%s)", e.Local, remoteOrDash(e.Remote), e.Proto, e.Status()))

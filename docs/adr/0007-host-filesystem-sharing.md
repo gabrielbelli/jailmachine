@@ -78,3 +78,20 @@ container creates appears on the Mac as `0600` with its real mode and owner in
 are readable by a non-root container user, and read-only shares stay read-only.
 `$JM_9P_SECURITY` (`none`, `mapped-xattr`, `mapped-file`), read at `jm start`,
 restores the old behaviour for anyone who prefers host-native modes.
+
+## Addendum, 2026-09-14 — shares across a suspend
+
+**ADR 0009** saves a running guest and restores it later, and an attached share
+cannot be saved while the guest has it mounted. The guest contract gains:
+
+- **(e)** shares can be detached at runtime **without force** before a suspend;
+  a share that is in use refuses, and the suspend is cancelled with every share
+  re-attached. After a resume they are re-attached with the same idempotent
+  action that mounts them at boot, before any client is served. Contract (d),
+  force-unmounting at shutdown, is untouched: detaching for a suspend never
+  forces.
+- The saved hardware description keeps every share device at its pinned
+  address, so a resume never perturbs virtual hardware. A share whose host path
+  vanished while the machine was suspended keeps its device, backed by an
+  empty read-only placeholder, and is not mounted; it comes back at the next
+  cold start after the path does.

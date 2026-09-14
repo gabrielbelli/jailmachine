@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"errors"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -165,7 +166,7 @@ func TestListColumns(t *testing.T) {
 	if strings.Join(strings.Fields(lines[0]), " ") != "NAME STATE CPUS MEMORY DISK SSH PORTS" {
 		t.Errorf("header = %q", lines[0])
 	}
-	if f := strings.Fields(lines[1]); len(f) != 9 || f[0] != "dev" || f[1] != "stopped" || f[2] != "4" || f[3] != "4096" || f[5] != "64" || f[8] != "0" {
+	if f := strings.Fields(lines[1]); len(f) != 9 || f[0] != "dev" || f[1] != "stopped" || f[2] != "4" || f[3] != "2048" || f[5] != "64" || f[8] != "0" {
 		t.Errorf("row = %q", lines[1])
 	}
 	out, err = run(t, root, "--json", "list")
@@ -176,7 +177,7 @@ func TestListColumns(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &rows); err != nil || len(rows) != 1 {
 		t.Fatalf("json list = %q, %v", out, err)
 	}
-	for _, k := range []string{"name", "state", "cpus", "memory_mib", "disk_gib", "ssh", "ports"} {
+	for _, k := range []string{"name", "state", "cpus", "memory_mib", "arc_mib", "disk_gib", "ssh", "ports"} {
 		if _, ok := rows[0][k]; !ok {
 			t.Errorf("json list lacks %q", k)
 		}
@@ -197,5 +198,59 @@ func TestHelpHasQuickstartAndExamples(t *testing.T) {
 	out, _ = run(t, t.TempDir(), "inspect", "--help")
 	if !strings.Contains(out, "podman_sock_uri") {
 		t.Error("inspect help should document the --json keys")
+	}
+}
+
+// idleSuspendLine matches the whole "Idle suspend" row of the inspect text
+// view with the given value, so a value from another row cannot satisfy it.
+func idleSuspendLine(value string) *regexp.Regexp {
+	return regexp.MustCompile(`(?m)^Idle suspend:\s+` + regexp.QuoteMeta(value) + `\s*$`)
+}
+
+func TestIdleSuspendHelpAndInspect(t *testing.T) {
+	for _, c := range []string{"init", "set"} {
+		out, err := run(t, t.TempDir(), c, "--help")
+		// Cobra wraps nothing, so the shared usage appears verbatim.
+		if err != nil || !strings.Contains(out, "--idle-suspend") || !strings.Contains(out, idleSuspendFlagUsage) {
+			t.Errorf("%s --help lacks --idle-suspend: %v\n%s", c, err, out)
+		}
+	}
+	if out, _ := run(t, t.TempDir(), "init", "--help"); !strings.Contains(out, "(default 30m)") {
+		t.Errorf("init --help should give the default:\n%s", out)
+	}
+	out, _ := run(t, t.TempDir(), "inspect", "--help")
+	if !strings.Contains(out, "idle_suspend_min") || !strings.Contains(inspectLong, "idle_suspend_min") {
+		t.Error("inspect help should document idle_suspend_min")
+	}
+
+	root := t.TempDir()
+	seedRecord(t, root, "dev")
+	out, err := run(t, root, "inspect", "dev")
+	if err != nil || !idleSuspendLine("after 30 min").MatchString(out) {
+		t.Errorf("inspect = %q, %v", out, err)
+	}
+	out, err = run(t, root, "inspect", "--json", "dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if v, ok := obj["idle_suspend_min"]; !ok || v != float64(30) {
+		t.Errorf("inspect --json idle_suspend_min = %v (present %v)", v, ok)
+	}
+	if _, err := run(t, root, "set", "dev", "--idle-suspend", "0"); err != nil {
+		t.Fatal(err)
+	}
+	out, _ = run(t, root, "inspect", "--json", "dev")
+	obj = nil
+	if err := json.Unmarshal([]byte(out), &obj); err != nil || obj["idle_suspend_min"] != float64(0) {
+		t.Errorf("explicit 0 must stay in the JSON: %v, %v", obj["idle_suspend_min"], err)
+	}
+	out, _ = run(t, root, "inspect", "dev")
+	// Match the row itself: the Autostart row also says "off".
+	if !idleSuspendLine("off").MatchString(out) {
+		t.Errorf("inspect after 0 = %q", out)
 	}
 }

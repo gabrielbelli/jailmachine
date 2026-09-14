@@ -45,7 +45,7 @@ func newStartCmd() *cobra.Command {
 		Use:   "start [name]",
 		Short: "Boot a machine and connect podman to it",
 		Long: "Boot a machine in stages: network provider, hypervisor, SSH, first-boot\n" +
-			"provisioning, podman connection, port forwarder. Starting a running machine\n" +
+			"provisioning, podman connection, port forwarder, sleeper. Starting a running machine\n" +
 			"re-checks the ssh, provision, dns, connect and forwarder stages (so an interrupted start can be\n" +
 			"finished); a broken one (half of it running) is stopped and started again.\n\n" +
 			"On failure the error names the stage and the log to read: qemu.log and\n" +
@@ -65,7 +65,7 @@ func newStartCmd() *cobra.Command {
 }
 
 func runStart(ctx context.Context, args []string) error {
-	return startMachine(ctx, args, startOpts{})
+	return startMachine(ctx, args, startOpts{wakeBy: "jm start"})
 }
 
 // startOpts vary "jm start" for autostart (see autostart.go).
@@ -79,6 +79,18 @@ type startOpts struct {
 	// booted and its engine answering — which is what the wrapper that
 	// waited behind the one that did the work finds.
 	skipIfReady bool
+	// fromHelper marks a start run by a detached jm helper rather than a
+	// user's shell: the environment it inherited is not folded into the
+	// record (ADR 0009).
+	fromHelper bool
+	// wakeOnly is set by callers that wake a suspended machine without
+	// being allowed to boot a stopped one ("jm ssh", and the wrappers with
+	// autostart off): the state they saw unlocked may be gone by the time
+	// the lock is theirs, and a machine stopped meanwhile stays stopped.
+	wakeOnly bool
+	// wakeBy names the caller in the sleeper's status when this start wakes
+	// a suspended machine.
+	wakeBy string
 }
 
 // startMachine is "jm start", with the variations autostart needs.
@@ -97,12 +109,51 @@ func startMachine(ctx context.Context, args []string, opts startOpts) error {
 	}
 	defer unlock()
 
+	// An interrupted suspend or wake is resolved before anything else, so
+	// the state below is running, suspended or stopped (ADR 0009).
+	recovered, err := recoverInterruptedTransition(ctx, m, b, p)
+	if err != nil {
+		return err
+	}
 	st, err := stateOf(m, b, p)
 	if err != nil {
 		return err
 	}
-	if opts.skipIfReady && st == backend.Running && engineReachable(m) {
+	if opts.skipIfReady && ready(m, st) && engineReachable(m) {
 		return nil
+	}
+	if st == backend.Broken {
+		// Half of the machine is up or stale; converge both halves to
+		// stopped before starting them in order (ADR 0005). A saved state
+		// survives the repair, so the state is read again: the machine may
+		// be suspended now rather than stopped.
+		if err := repairBroken(ctx, m, b, p, true); err != nil {
+			return err
+		}
+		if st, err = stateOf(m, b, p); err != nil {
+			return err
+		}
+		if st == backend.Broken || st == backend.Running {
+			return withHint(fmt.Errorf("%s is still %s after the repair", m.Name, st), consoleHint(m, b)+"; "+networkHint(m, p))
+		}
+	}
+	if st == backend.Running && suspendInProgress(m) {
+		return withHint(fmt.Errorf("a suspend or wake of %s was interrupted and could not be resolved", m.Name), consoleHint(m, b))
+	}
+	if opts.wakeOnly && st == backend.Stopped && recovered != backend.RecoverDiscarded {
+		return withHint(fmt.Errorf("%s was stopped before it could be woken", m.Name), "run 'jm start"+nameHint(m.Name)+"'")
+	}
+	if st == backend.Suspended {
+		resumed, err := wakeMachine(ctx, m, b, p, wakeOpts{FromHelper: opts.fromHelper, By: opts.wakeBy})
+		if err != nil {
+			return err
+		}
+		if resumed {
+			return nil
+		}
+		// The saved state could not be restored and is gone: boot from
+		// disk in this same invocation.
+		st = backend.Stopped
 	}
 	// $JM_PUBLISH_ADDR is an override read here, once, and written onto the
 	// record: the forwarder runs detached, so the address it binds must be
@@ -113,14 +164,10 @@ func startMachine(ctx context.Context, args []string, opts startOpts) error {
 	// exports the variable must not rewrite the record of a machine that is
 	// already running with another address — which this invocation would
 	// not restart, so the running forwarder would go on binding the old one
-	// while "jm inspect" showed the new.
-	if err := applyPublishAddrEnv(m); err != nil {
-		return err
-	}
-	if st == backend.Broken {
-		// Half of the machine is up or stale; converge both halves to
-		// stopped before starting them in order (ADR 0005).
-		if err := repairBroken(ctx, m, b, p, true); err != nil {
+	// while "jm inspect" showed the new. A wake never reads it, and neither
+	// does a detached helper, whose environment is not the user's.
+	if !opts.fromHelper {
+		if err := applyPublishAddrEnv(m); err != nil {
 			return err
 		}
 	}
@@ -134,7 +181,7 @@ func startMachine(ctx context.Context, args []string, opts startOpts) error {
 	// The link size is fixed when the provider starts (gvproxy reads
 	// $JM_MTU there), so record it: doctor and inspect must report the
 	// machine as it runs, not as this shell would start it.
-	if caps := p.Capabilities(); caps.MTU != m.MTU {
+	if caps := p.Capabilities(); !opts.fromHelper && caps.MTU != m.MTU {
 		m.MTU = caps.MTU
 		if err := store().Save(m); err != nil {
 			return err
@@ -197,6 +244,12 @@ func startMachine(ctx context.Context, args []string, opts startOpts) error {
 	// through a host sleep, or a guest too old to carry the resync service,
 	// is right before anything is built or run in it.
 	syncGuestClock(ctx, m, client)
+	// The ZFS ARC cap is pushed at every start (see arc.go), so a record
+	// changed while stopped, or a guest that lost loader.conf, converges.
+	syncGuestArc(ctx, m, client)
+	// Shares a suspend unmounted in a guest that recovery continued, or
+	// that a wake continued and did not finish, are mounted again here.
+	remountSharesIfPending(ctx, m, client)
 
 	// Stage: provision.
 	logf(stdout, "%s: waiting for %s", machine.StageProvision, machine.GuestProvisionMarker)
@@ -218,6 +271,9 @@ func startMachine(ctx context.Context, args []string, opts startOpts) error {
 	// devices and mounts nothing, which is silent everywhere else (ADR
 	// 0007); say so here, as the clock check does for jm_rtcsync.
 	warnMissingShareSupport(ctx, m, client)
+	// Disks provisioned before provision.sh raised MaxAuthTries get it here
+	// (see sshd.go); after provisioning, so it never races provision.sh.
+	syncGuestSSHD(ctx, m, client)
 
 	// Stage: dns (guest half): the guest and its containers get exactly one
 	// nameserver, the host resolver started above.
@@ -254,6 +310,13 @@ func startMachine(ctx context.Context, args []string, opts startOpts) error {
 	// containers (ADR 0004); detached, so it outlives this command.
 	if err := startForwarder(m, p, ep); err != nil {
 		return err
+	}
+
+	// Stage: sleeper. It runs a suspend and holds the machine's endpoints
+	// while it is suspended (ADR 0009); detached, and started only if it is
+	// not alive. The machine is usable without it, so a failure is a warning.
+	if err := startSleeper(ctx, m, b, p); err != nil {
+		fmt.Fprintf(stderr, "jm: warning: %v; 'jm start%s' retries it\n", err, nameHint(m.Name))
 	}
 	logf(stdout, "ready: try 'jpodman run --rm --os=linux docker.io/alpine echo hi'")
 	return nil

@@ -60,7 +60,7 @@ func TestGenerateKey(t *testing.T) {
 
 func TestArgs(t *testing.T) {
 	got := strings.Join(Args("127.0.0.1", 2222, "root", "/k", []string{"uname", "-a"}), " ")
-	want := "-i /k -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=3 -p 2222 root@127.0.0.1 uname -a"
+	want := "-i /k -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=3 -p 2222 root@127.0.0.1 uname -a"
 	if got != want {
 		t.Errorf("Args = %q\nwant %q", got, want)
 	}
@@ -258,7 +258,7 @@ func TestSocketExists(t *testing.T) {
 
 func TestForwardArgs(t *testing.T) {
 	got := strings.Join(ForwardArgs("127.0.0.1", 2222, "root", "/k", "/h/podman.sock", "/var/run/podman/podman.sock"), " ")
-	for _, want := range []string{"-i /k", "-p 2222", " root@127.0.0.1", " -N ", "-o ExitOnForwardFailure=yes", "-o StreamLocalBindUnlink=yes", "-L /h/podman.sock:/var/run/podman/podman.sock"} {
+	for _, want := range []string{"-i /k", "-o IdentitiesOnly=yes", "-p 2222", " root@127.0.0.1", " -N ", "-o ExitOnForwardFailure=yes", "-o StreamLocalBindUnlink=yes", "-L /h/podman.sock:/var/run/podman/podman.sock"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("ForwardArgs missing %q: %s", want, got)
 		}
@@ -308,5 +308,83 @@ func TestForgetKnownHostNoBinary(t *testing.T) {
 	t.Setenv("HOME", t.TempDir()) // isolate from the real known_hosts
 	if err := ForgetKnownHost("127.0.0.1", 65000); err != nil {
 		t.Error(err)
+	}
+}
+
+func TestKeepalive(t *testing.T) {
+	// The fake server refuses every global request: a refusal is an answer.
+	c := newTestClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.Keepalive(ctx); err != nil {
+		t.Fatalf("keepalive against a live server: %v", err)
+	}
+
+	// A server that never services its global requests never answers:
+	// the context ends the wait and the connection is closed.
+	key := filepath.Join(t.TempDir(), "id_ed25519")
+	if err := GenerateKey(key); err != nil {
+		t.Fatal(err)
+	}
+	pubRaw, _ := os.ReadFile(key + ".pub")
+	pub, _, _, _, err := ssh.ParseAuthorizedKey(pubRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, hostPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostSigner, err := ssh.NewSignerFromKey(hostPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &ssh.ServerConfig{
+		PublicKeyCallback: func(_ ssh.ConnMetadata, k ssh.PublicKey) (*ssh.Permissions, error) {
+			if string(k.Marshal()) == string(pub.Marshal()) {
+				return &ssh.Permissions{}, nil
+			}
+			return nil, fmt.Errorf("unknown key")
+		},
+	}
+	cfg.AddHostKey(hostSigner)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		sc, _, _, err := ssh.NewServerConn(conn, cfg)
+		if err != nil {
+			return
+		}
+		defer sc.Close()
+		_ = sc.Wait()
+	}()
+	addr := ln.Addr().(*net.TCPAddr)
+	dctx, dcancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer dcancel()
+	mute, err := Dial(dctx, addr.IP.String(), addr.Port, "root", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { mute.Close() })
+	kctx, kcancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer kcancel()
+	if err := mute.Keepalive(kctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("keepalive against a mute server = %v", err)
+	}
+	if _, _, err := mute.Run(context.Background(), "echo hi"); err == nil {
+		t.Error("the connection survived a keepalive that timed out")
+	}
+
+	// A closed client fails at once.
+	c.Close()
+	if err := c.Keepalive(ctx); err == nil {
+		t.Error("keepalive on a closed client succeeded")
 	}
 }

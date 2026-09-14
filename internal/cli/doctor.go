@@ -14,6 +14,7 @@ import (
 	"github.com/gabrielbelli/jailmachine/internal/doctor"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
 	"github.com/gabrielbelli/jailmachine/internal/netprov"
+	"github.com/gabrielbelli/jailmachine/internal/sleeper"
 	"github.com/gabrielbelli/jailmachine/internal/version"
 )
 
@@ -92,6 +93,15 @@ func machineChecks(ctx context.Context) []doctor.Result {
 			if res, ok := datagramLimitCheck(m); ok {
 				out = append(out, res)
 			}
+			if res, ok := suspendReadinessCheck(m); ok {
+				out = append(out, res)
+			}
+			if res, ok := sleeperCheck(m); ok {
+				out = append(out, res)
+			}
+			if res, ok := idleCheck(m); ok {
+				out = append(out, res)
+			}
 		}
 	}
 	return out
@@ -153,6 +163,29 @@ func checkMachine(name string) doctor.Result {
 		return res
 	}
 	res.Detail = fmt.Sprintf("%s (%s, %s)", st, b.Name(), p.Name())
+	switch {
+	case st == backend.Suspended:
+		// Reported from the journal alone: doctor never wakes a machine.
+		res.Status = doctor.OK
+		res.Detail = "suspended"
+		if s, ok := b.(backend.Suspender); ok {
+			if ss, err := s.SuspendStatus(m); err == nil {
+				if !ss.SavedAt.IsZero() {
+					res.Detail += " since " + ss.SavedAt.Local().Format("2006-01-02 15:04")
+				}
+				if ss.AllocatedBytes > 0 {
+					res.Detail += ", image " + humanBytes(ss.AllocatedBytes)
+				}
+			}
+		}
+		res.Detail += fmt.Sprintf(" (wakes on first use; %s, %s)", b.Name(), p.Name())
+		return res
+	case st == backend.Running && suspendInProgress(m):
+		res.Status = doctor.Warn
+		res.Detail = fmt.Sprintf("a suspend or wake is in progress or was interrupted (%s, %s)", b.Name(), p.Name())
+		res.Fix = "if no jm command is running, 'jm start " + name + "' resolves it"
+		return res
+	}
 	if st == backend.Broken {
 		res.Status = doctor.Warn
 		res.Fix = fmt.Sprintf("stale hypervisor or network state; 'jm stop %s' repairs it (%s)", name, consoleHint(m, b))
@@ -160,6 +193,122 @@ func checkMachine(name string) doctor.Result {
 	}
 	res.Status = doctor.OK
 	return res
+}
+
+// suspendReadinessCheck warns, for a running machine with idle suspend on,
+// about what would keep it from being suspended: a hypervisor started by an
+// older jm, which cannot be saved without crashing it, or a volume without
+// room for the saved state (ADR 0009). It reads files and the process table
+// only.
+func suspendReadinessCheck(m *machine.Machine) (doctor.Result, bool) {
+	res := doctor.Result{Name: "suspend " + m.Name}
+	if m.IdleSuspendMin == 0 {
+		return res, false
+	}
+	b, p, err := components(m)
+	if err != nil {
+		return res, false
+	}
+	if st, err := stateOf(m, b, p); err != nil || !ready(m, st) {
+		return res, false
+	}
+	if _, ok := b.(backend.Suspender); !ok || !b.Capabilities().Suspend {
+		return res, false
+	}
+	// A provider that cannot be parked makes suspend unsupported, not
+	// something to fix: no row, as for a backend without the capability.
+	if _, ok := p.(netprov.APIForwarder); !ok || !p.Capabilities().Supervised {
+		return res, false
+	}
+	if err := suspendPreflight(m, b, p); err != nil {
+		res.Status, res.Detail = doctor.Warn, err.Error()
+		switch {
+		case strings.Contains(err.Error(), "free"):
+			res.Fix = "free space on the volume holding " + m.Dir + ", or lower --memory"
+		case strings.Contains(err.Error(), "older jm"):
+			res.Fix = "jm stop " + m.Name + " && jm start " + m.Name
+		}
+		return res, true
+	}
+	res.Status, res.Detail = doctor.OK, "can be suspended ('jm suspend "+m.Name+"')"
+	return res, true
+}
+
+// sleeperCheck reports on the helper that holds a suspended machine's
+// endpoints and runs a suspend (ADR 0009), for a running or suspended machine
+// whose components can suspend. It reads the pid file and the process table
+// only; it never asks the sleeper and never wakes the machine.
+func sleeperCheck(m *machine.Machine) (doctor.Result, bool) {
+	res := doctor.Result{Name: "sleeper " + m.Name}
+	b, p, err := components(m)
+	if err != nil || m.Dir == "" || !sleeperSupported(b, p) {
+		return res, false
+	}
+	st, err := stateOf(m, b, p)
+	if err != nil {
+		return res, false
+	}
+	pr := sleeperProcess(m)
+	alive := sleeperAlive(m)
+	switch {
+	case st == backend.Suspended && alive:
+		res.Status, res.Detail = doctor.OK, "holding the engine socket and the SSH port; a connection there wakes the machine"
+	case st == backend.Suspended:
+		res.Status = doctor.Warn
+		res.Detail = "not running: jpodman, jdocker, 'jm start' and 'jm ssh' still wake the machine, but clients of the engine socket or the SSH port are refused"
+		res.Fix = "jm start " + m.Name
+	case ready(m, st) && alive:
+		res.Status, res.Detail = doctor.OK, "running (log: "+pr.LogPath()+")"
+	case ready(m, st):
+		res.Status = doctor.Warn
+		res.Detail = "not running: 'jm suspend' starts it, and a suspended machine's endpoints would not wake it"
+		res.Fix = "jm start " + m.Name
+	default:
+		return res, false
+	}
+	return res, true
+}
+
+// idleCheck reports what the idle monitor of a running machine last saw
+// (ADR 0009): how long it has been idle, what holds it awake, or that
+// automatic suspend was turned off after repeated failures. It reads
+// sleeper.json only, and has no row while the sleeper is not monitoring
+// (sleeperCheck reports that) or suspend is unavailable
+// (suspendReadinessCheck reports that).
+func idleCheck(m *machine.Machine) (doctor.Result, bool) {
+	res := doctor.Result{Name: "idle suspend " + m.Name}
+	b, p, err := components(m)
+	if err != nil || m.Dir == "" || !sleeperSupported(b, p) {
+		return res, false
+	}
+	if st, err := stateOf(m, b, p); err != nil || !ready(m, st) || !sleeperAlive(m) {
+		return res, false
+	}
+	ss, err := sleeper.LoadStatus(sleeperProcess(m).StatusPath())
+	if err != nil || ss.Mode != sleeper.ModeMonitor {
+		return res, false
+	}
+	after := idleSuspendRow(m.IdleSuspendMin)
+	if secs := ss.IdleSuspendAfterSeconds; secs > int64(m.IdleSuspendMin)*60 {
+		after = "after " + idleSuspendWord(int(secs/60)) + " (lengthened after quick wakes)"
+	}
+	switch {
+	case m.IdleSuspendMin == 0:
+		res.Status, res.Detail = doctor.OK, "off ('jm set --idle-suspend 30m "+m.Name+"' turns it on)"
+	case ss.DisabledReason != "":
+		res.Status, res.Detail = doctor.Warn, ss.DisabledReason
+		if ss.LastSuspendError != "" {
+			res.Detail += "; last error: " + ss.LastSuspendError
+		}
+		res.Fix = "see " + sleeperProcess(m).LogPath() + "; 'jm stop " + m.Name + " && jm start " + m.Name + "' restarts the sleeper"
+	case ss.IdleUnavailable != "":
+		return res, false
+	case len(ss.Blockers) > 0:
+		res.Status, res.Detail = doctor.OK, after+"; held awake by: "+strings.Join(ss.Blockers, ", ")
+	default:
+		res.Status, res.Detail = doctor.OK, after+"; idle "+idleWord(ss.IdleSeconds)
+	}
+	return res, true
 }
 
 // datagramLimitCheck states the one silent limit of the host<->guest link:

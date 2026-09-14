@@ -16,7 +16,7 @@ func newRmCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "rm [name]",
 		Short: "Remove a machine and all its state",
-		Long:  "Stop the machine if needed, forget its podman connection and host key, and delete its directory. Always converges to \"gone\".",
+		Long:  "Stop the machine if needed, forget its podman connection and host key, and delete its directory. Always converges to \"gone\". A suspended machine's saved state is discarded, not restored.",
 		Example: `  jm rm
   jm rm --force dev`,
 		Args: cobra.MaximumNArgs(1),
@@ -59,6 +59,7 @@ func newRmCmd() *cobra.Command {
 				// backendFor fails below; the directory still goes.
 				backendName, _ := backend.DefaultForHost()
 				m = &machine.Machine{Name: name, Backend: backendName, Network: netprov.DefaultForHost(), Dir: s.Dir(name)}
+				stopSleeper(ctx, m)
 				if p, perr := providerFor(m); perr == nil {
 					stopForwarder(ctx, m, p)
 				}
@@ -74,13 +75,16 @@ func newRmCmd() *cobra.Command {
 					}
 				}
 			} else {
-				if err := stopMachine(ctx, m, !force); err != nil {
+				// A suspended machine is discarded, never restored only
+				// to be deleted.
+				if err := stopMachine(ctx, m, !force, true); err != nil {
 					if !force {
 						return withHint(err, "use 'jm rm --force"+nameHint(name)+"' to remove anyway")
 					}
 					fmt.Fprintf(stderr, "jm: %v; continuing\n", err)
 					// stopMachine may have failed before reaching the
-					// forwarder; never leave one behind.
+					// helpers; never leave one behind.
+					stopSleeper(ctx, m)
 					if p, perr := providerFor(m); perr == nil {
 						stopForwarder(ctx, m, p)
 					}
@@ -105,6 +109,9 @@ func newRmCmd() *cobra.Command {
 						fmt.Fprintf(stderr, "jm: %v; continuing\n", cerr)
 					}
 				}
+			}
+			if cerr := sleeperProcess(m).Cleanup(); cerr != nil {
+				fmt.Fprintf(stderr, "jm: %v; continuing\n", cerr)
 			}
 			if err := s.Delete(name); err != nil {
 				return err

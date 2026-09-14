@@ -36,7 +36,14 @@ func newEnvCmd() *cobra.Command {
 			// The socket only exists while the machine runs; the exports
 			// are still printed so "eval $(jm env)" in a profile works.
 			if b, prov, cerr := components(m); cerr == nil {
-				if st, serr := stateOf(m, b, prov); serr == nil && st != backend.Running {
+				switch st, serr := stateOf(m, b, prov); {
+				case serr != nil, st == backend.Running:
+				case st == backend.Suspended:
+					// Nothing holds the socket while the machine sleeps yet,
+					// so a client using these exports is refused until a jm
+					// command wakes it.
+					fmt.Fprintf(stderr, "jm: warning: %s is suspended; the socket answers once jpodman, jdocker, 'jm start%s' or 'jm ssh%s' wakes it\n", m.Name, nameHint(m.Name), nameHint(m.Name))
+				default:
 					fmt.Fprintf(stderr, "jm: warning: %s is %s; the socket appears once you run 'jm start%s'\n", m.Name, st, nameHint(m.Name))
 				}
 			}

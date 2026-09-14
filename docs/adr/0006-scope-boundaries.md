@@ -37,3 +37,10 @@ mounted at the identity path before the engine starts), rather than adding a
 network filesystem with its own lifecycle. Name resolution parity (**ADR
 0008**) is likewise in scope as a property of the existing NetworkProvider.
 Both are optional per backend/provider and degrade with a stated reason.
+
+## Addendum (2026-09-14): suspend is in scope
+
+Suspend moves from "out of scope" to in scope, per **ADR 0009**. It fits the
+rule above by using the optional capability interface ADR 0002 reserved for it
+and by a new ADR that widens the lifecycle deliberately (ADR 0005 addendum).
+Snapshots, meaning named, multiple, user-managed saved states, remain out of scope.

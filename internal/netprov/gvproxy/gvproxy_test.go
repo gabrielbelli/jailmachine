@@ -85,7 +85,7 @@ func TestForwardLiveness(t *testing.T) {
 	if err := os.WriteFile(p.Podman, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := stopForward(context.Background(), p); err != nil {
+	if err := stopForward(context.Background(), p, false); err != nil {
 		t.Fatal(err)
 	}
 	for _, f := range []string{p.FwdPID, p.Podman} {

@@ -46,12 +46,23 @@ func newSetCmd() *cobra.Command {
 			"the publish flag names none (the default is every interface, as docker does\n" +
 			"on Linux). It is a default, not an override: '-p 127.0.0.1:8080:80' binds the\n" +
 			"host's loopback whatever it says. It applies when the forwarder is next\n" +
-			"started; 'jm ports' says so while the old one is still bound.",
+			"started; 'jm ports' says so while the old one is still bound.\n\n" +
+			"--arc caps the guest's ZFS ARC (MiB, or with a unit; 0 restores the guest's\n" +
+			"default). On a running machine it applies at once; otherwise on the next\n" +
+			"'jm start'. The cap must be at least 64 MiB and below the memory.\n\n" +
+			"--idle-suspend sets how long a running machine may sit idle before it is\n" +
+			"suspended to disk; it wakes on first use. It can be changed in any state and\n" +
+			"needs no restart.\n\n" +
+			"A suspended machine keeps the hardware it was saved with: --cpus, --memory,\n" +
+			"--ssh-port, the shares and --disk are refused until 'jm stop' (or, for --disk,\n" +
+			"'jm start'). --arc and --publish-addr are recorded and applied when it wakes.",
 		Example: `  jm set --cpus 8 --memory 8GiB
   jm set --mount /work --mount /srv/data:ro
   jm set --unmount /srv/data
   jm set --no-mounts
-  jm set --publish-addr 127.0.0.1   # keep published ports off the LAN`,
+  jm set --publish-addr 127.0.0.1   # keep published ports off the LAN
+  jm set --arc 1GiB                 # works while running
+  jm set --idle-suspend 2h          # or 0 to never suspend`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			o.cpusSet = cmd.Flags().Changed("cpus")
@@ -59,6 +70,8 @@ func newSetCmd() *cobra.Command {
 			o.diskSet = cmd.Flags().Changed("disk")
 			o.sshPortSet = cmd.Flags().Changed("ssh-port")
 			o.publishAddrSet = cmd.Flags().Changed("publish-addr")
+			o.arcSet = cmd.Flags().Changed("arc")
+			o.idleSuspendSet = cmd.Flags().Changed("idle-suspend")
 			return runSet(cmd.Context(), args, o)
 		},
 	}
@@ -71,6 +84,8 @@ func newSetCmd() *cobra.Command {
 	f.StringArrayVar(&o.unmount, "unmount", nil, "stop sharing a host directory (repeatable)")
 	f.BoolVar(&o.noMounts, "no-mounts", false, "share no host directories at all (drops every share)")
 	f.StringVar(&o.publishAddr, "publish-addr", "", publishAddrFlagUsage)
+	f.StringVar(&o.arc, "arc", "", arcFlagUsage)
+	f.StringVar(&o.idleSuspend, "idle-suspend", "", idleSuspendFlagUsage)
 	return cmd
 }
 
@@ -78,11 +93,16 @@ type setOpts struct {
 	cpus, disk, sshPort                     int
 	memory                                  string
 	publishAddr                             string
+	arc                                     string
+	idleSuspend                             string
 	mount, unmount                          []string
 	noMounts                                bool
 	cpusSet, memorySet, diskSet, sshPortSet bool
-	publishAddrSet                          bool
+	publishAddrSet, arcSet, idleSuspendSet  bool
 }
+
+// arcFlagUsage is the --arc help shared by init and set.
+const arcFlagUsage = "ZFS ARC cap in the guest: MiB, or with a unit (512, 1GiB); 0 is the guest's own default"
 
 // ParseMemoryMiB parses a memory size: a bare number is MiB; suffixes
 // m/mib/mb and g/gib/gb (any case, optional space) scale it.
@@ -126,11 +146,19 @@ type changes struct {
 	// --unmount was given at all (an empty set is a legitimate result).
 	shares    []machine.Share
 	sharesSet bool
+	// arcMiB is the guest's ZFS ARC cap; it applies live on a running
+	// machine, so it needs no stop either.
+	arcMiB int
+	arcSet bool
+	// idleSuspendMin is the idle time before a suspend; it is a record
+	// setting read live, so it is allowed in every state.
+	idleSuspendMin int
+	idleSuspendSet bool
 }
 
 // any reports whether at least one flag was given.
 func (c changes) any() bool {
-	return c.cpusSet || c.memorySet || c.diskSet || c.sshPortSet || c.sharesSet || c.publishAddrSet
+	return c.cpusSet || c.memorySet || c.diskSet || c.sshPortSet || c.sharesSet || c.publishAddrSet || c.arcSet || c.idleSuspendSet
 }
 
 // needsStopped reports whether the changes require a stopped machine. The
@@ -144,11 +172,18 @@ func (c changes) needsStopped() bool {
 func (o setOpts) validate(m *machine.Machine) (changes, error) {
 	c := changes{
 		cpusSet: o.cpusSet, memorySet: o.memorySet, diskSet: o.diskSet, sshPortSet: o.sshPortSet,
-		publishAddrSet: o.publishAddrSet,
-		sharesSet:      len(o.mount) > 0 || len(o.unmount) > 0 || o.noMounts,
+		publishAddrSet: o.publishAddrSet, arcSet: o.arcSet, idleSuspendSet: o.idleSuspendSet,
+		sharesSet: len(o.mount) > 0 || len(o.unmount) > 0 || o.noMounts,
 	}
 	if !c.any() {
-		return c, errors.New("nothing to set (use --cpus, --memory, --disk, --ssh-port, --publish-addr, --mount, --unmount or --no-mounts)")
+		return c, errors.New("nothing to set (use --cpus, --memory, --disk, --ssh-port, --publish-addr, --arc, --idle-suspend, --mount, --unmount or --no-mounts)")
+	}
+	if o.idleSuspendSet {
+		mins, err := ParseIdleSuspend(o.idleSuspend)
+		if err != nil {
+			return c, err
+		}
+		c.idleSuspendMin = mins
 	}
 	if o.publishAddrSet {
 		addr, err := parsePublishAddr(o.publishAddr)
@@ -189,6 +224,24 @@ func (o setOpts) validate(m *machine.Machine) (changes, error) {
 		}
 		c.memoryMiB = mib
 	}
+	// The ARC cap is checked against the memory the machine will have:
+	// the new value when --memory is in the same call.
+	memory := m.MemoryMiB
+	if o.memorySet {
+		memory = c.memoryMiB
+	}
+	if o.arcSet {
+		mib, err := ParseMemoryMiB(o.arc)
+		if err != nil {
+			return c, fmt.Errorf("--arc: %w", err)
+		}
+		if err := validateArc(mib, memory); err != nil {
+			return c, err
+		}
+		c.arcMiB = mib
+	} else if o.memorySet && m.ArcMiB != 0 && validateArc(m.ArcMiB, memory) != nil {
+		return c, fmt.Errorf("--memory %d MiB leaves no room above the ZFS ARC cap of %d MiB; lower it in the same call with --arc", memory, m.ArcMiB)
+	}
 	if o.diskSet {
 		switch {
 		case o.disk < minDiskGiB || o.disk > maxDiskGiB:
@@ -227,6 +280,13 @@ func runSet(ctx context.Context, args []string, o setOpts) error {
 		return err
 	}
 	stopHint := "stop the machine first: jm stop" + nameHint(m.Name)
+	if st == backend.Running && suspendInProgress(m) && (c.needsStopped() || c.diskSet || c.arcSet) {
+		return withHint(fmt.Errorf("a suspend or wake of %s is in progress or was interrupted", m.Name), "'jm start"+nameHint(m.Name)+"' finishes it")
+	}
+	if st == backend.Suspended && c.needsStopped() {
+		return withHint(fmt.Errorf("%s is suspended; cpus, memory, the ssh port and the shared directories change only on a stopped machine", m.Name),
+			"'jm stop"+nameHint(m.Name)+"' restores it and shuts it down")
+	}
 	if st != backend.Stopped && c.needsStopped() {
 		return withHint(fmt.Errorf("%s is %s; cpus, memory, the ssh port and the shared directories change only on a stopped machine", m.Name, st), stopHint)
 	}
@@ -267,10 +327,23 @@ func runSet(ctx context.Context, args []string, o setOpts) error {
 			logf(stdout, "%s", publishAddrNote(m))
 		}
 	}
+	arcChanged := c.arcSet && c.arcMiB != m.ArcMiB
+	if arcChanged {
+		logf(stdout, "zfs arc cap: %s -> %s", arcWord(m.ArcMiB), arcWord(c.arcMiB))
+		m.ArcMiB = c.arcMiB
+	}
+	if c.idleSuspendSet && c.idleSuspendMin != m.IdleSuspendMin {
+		logf(stdout, "idle suspend: %s -> %s", idleSuspendWord(m.IdleSuspendMin), idleSuspendWord(c.idleSuspendMin))
+		m.IdleSuspendMin = c.idleSuspendMin
+	}
 	if c.diskSet && c.diskGiB != m.DiskGiB {
 		var resizer backend.Resizer
 		switch st {
 		case backend.Stopped:
+		case backend.Suspended:
+			// The saved state holds the old disk size.
+			return withHint(fmt.Errorf("%s is suspended; its disk grows only while it runs or is stopped", m.Name),
+				"run 'jm start"+nameHint(m.Name)+"' first (it grows live), or 'jm stop"+nameHint(m.Name)+"'")
 		case backend.Running:
 			b, err := backendFor(m)
 			if err != nil {
@@ -312,6 +385,28 @@ func runSet(ctx context.Context, args []string, o setOpts) error {
 	}
 	if err := store().Save(m); err != nil {
 		return err
+	}
+	if c.idleSuspendSet && ready(m, st) {
+		// A running machine without its sleeper gets one now; a live
+		// sleeper reads the record itself.
+		if b, p, err := components(m); err == nil {
+			if err := startSleeper(ctx, m, b, p); err != nil {
+				fmt.Fprintf(stderr, "jm: warning: %v\n", err)
+			}
+		}
+	}
+	if arcChanged {
+		// Saved first, so a cap the guest does not take is still applied
+		// by the next start.
+		if st == backend.Running {
+			if err := applyArcLive(ctx, m); err != nil {
+				return fmt.Errorf("ZFS ARC cap recorded but not applied to the running guest (retried on the next start): %w", err)
+			}
+		} else if st == backend.Suspended {
+			logf(stdout, "the ZFS ARC cap is applied when %s wakes", m.Name)
+		} else {
+			logf(stdout, "the ZFS ARC cap is applied on the next start: jm start%s", nameHint(m.Name))
+		}
 	}
 	logf(stdout, "%s: %d cpus, %d MiB, %d GiB, ssh port %d, publishing on %s",
 		m.Name, m.CPUs, m.MemoryMiB, m.DiskGiB, m.SSHPort, forwarder.HostIP(m.PublishAddr))

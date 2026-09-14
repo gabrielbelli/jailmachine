@@ -73,6 +73,21 @@ func (s *Store) Load(name string) (*Machine, error) {
 	if m.Name == "" {
 		m.Name = name
 	}
+	// A record written before arc_mib existed gets the cap a new machine of
+	// its memory size would get, and one written before idle_suspend_min
+	// existed gets the default idle time; an explicit 0 is kept for both.
+	var probe struct {
+		ArcMiB         *int `json:"arc_mib"`
+		IdleSuspendMin *int `json:"idle_suspend_min"`
+	}
+	if json.Unmarshal(data, &probe) == nil {
+		if probe.ArcMiB == nil {
+			m.ArcMiB = DefaultArcFor(m.MemoryMiB)
+		}
+		if probe.IdleSuspendMin == nil {
+			m.IdleSuspendMin = DefaultIdleSuspendMin
+		}
+	}
 	m.Dir = s.Dir(name)
 	return &m, nil
 }
