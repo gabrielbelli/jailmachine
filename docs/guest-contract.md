@@ -22,13 +22,15 @@ behaviour `jm` relies on. Everything here is implemented by
 | Failure marker | `/var/db/jm-provision-failed` | `provision.sh` EXIT trap on any non-zero exit |
 | Provisioning log | `/var/log/jm-provision.log` | `provision.sh` (`exec > … 2>&1`) |
 | Engine API socket | `/var/run/podman/podman.sock` | our `podman_service` rc script (`/usr/local/etc/rc.d/podman_service`) |
-| SSH | `sshd`, root, `PermitRootLogin prohibit-password`, `MaxAuthTries 20`, key from the seed | `provision.sh`; `jm start` adds `MaxAuthTries 20` to an older disk |
+| SSH | `sshd`, root, `PermitRootLogin prohibit-password`, `MaxAuthTries 20`, `ClientAliveInterval 30`, `ClientAliveCountMax 4`, key from the seed | `provision.sh`; `jm start` adds any of those lines an older disk lacks, checked with `sshd -t` |
 | ZFS ARC cap | `vfs.zfs.arc.max` (runtime sysctl, after lowering `vfs.zfs.arc.min` to half the cap when the ARC's floor is at or above it) and `vfs.zfs.arc.max="<bytes>"` in `/boot/loader.conf`, edited with `grep` because `sysrc(8)` refuses names with dots. When the machine's cap is `0`, the runtime value is set back to FreeBSD's default ceiling (a runtime `0` changes nothing) and the `loader.conf` line is removed. `seal.sh` removes the line from a prebaked image | `jm start` over SSH at every start, and `jm set --arc` on a running machine |
 | Container storage | `zroot/containers` mounted at `/var/db/containers` | `provision.sh` |
 | Share mount script | `/usr/local/etc/rc.d/jm_shares` (`jm_shares_enable=YES`) | `provision.sh`, on both paths |
 | Share table (guest) | `/var/db/jm/conf/shares.tab`, a read-only 9p share tagged `jmconf` | the backend, at every start |
 | Clock resync | `/usr/local/sbin/jm-rtcsync` + `/usr/local/etc/rc.d/jm_rtcsync` (`jm_rtcsync_enable=YES`) | `provision.sh`, on both paths |
 | Clock resync log | `/var/log/jm-rtcsync.log` | `jm_rtcsync` via `daemon(8)` |
+| Suspend mount list | `/var/run/jm-suspend.mounts`: the 9p mounts a suspend unmounted, one `mount -p` line each | jm over SSH before a suspend; removed once a wake has mounted every share again |
+| Suspend inhibitor | `/var/run/jm-nosleep`: while it exists the machine is never suspended automatically | the user (`jm ssh -- touch /var/run/jm-nosleep`); `/var/run` is cleared at boot |
 | Seed mount (transient) | `/media/nuageinit` | `nuageinit` rc script |
 | Seed cache | `/var/cache/nuageinit/user_data` (+ `runcmds`) | `nuageinit` |
 | First-boot sentinel | `/firstboot` | the image; removed by `rc(8)` at the end of every boot that had it |
@@ -119,6 +121,10 @@ with nothing rewriting the argument.
   force-unmounts on the way down.
 - `seal.sh` stops the service and removes `/var/db/jm` so the builder's
   host tree never reaches a published image.
+- **A suspend detaches the shares without force** and a wake attaches them
+  again with the same `jm_shares` service ([Suspend and wake](#suspend-and-wake-adr-0009)).
+  A share in use cancels the suspend. The forced unmount above happens only
+  on a real shutdown.
 
 Semantics are best-effort POSIX. The shares are exported with the 9p
 `mapped-xattr` security model, so guest ownership and modes are kept in host
@@ -233,6 +239,53 @@ was already running through a host sleep, or a guest too old to carry the
 service, is right before anything runs in it. `jm doctor` reports the skew
 and whether the service is running.
 
+A wake from suspend steps the clock unconditionally, before any client is
+served: the guest's wall clock stops while its state is saved, and
+`jm-rtcsync` alone would leave it behind for up to 10 s.
+
+## Suspend and wake (ADR 0009)
+
+Nothing is installed in the guest for suspend. jm runs every step over SSH,
+and the guest needs only its base tools: `jls`, `sockstat`, `ps`, `awk`,
+`mount`, `umount`, `zpool`, `date` and `service`.
+
+- **Idle probe**, every 15 s on one persistent SSH connection
+  (`internal/idle`): `jls jid`; the `sockstat -u` lines of `sshd` processes
+  connected to the podman socket (sockstat truncates the path to
+  `/var/run/podman/po`); the non-sshd children of `sshd-session` processes
+  from `ps -ax -o pid= -o ppid= -o comm=`, less the probe's own shell; and
+  whether `/var/run/jm-nosleep` exists. FreeBSD's `ps` takes everything
+  after `=` as the header, commas included, so each keyword has its own
+  `-o`. Counting relies on the `sshd-session` process title: a probe that
+  sees no sshd session at all is an error, so a guest whose titles change
+  never sleeps rather than always sleeping.
+- **Quiesce**, immediately before the guest is frozen: unless the suspend is
+  forced, the same counts twice, a second apart (exit 3 on any activity);
+  then `sync; zpool sync; sync`; `mount -p -t p9fs` saved to
+  `/var/run/jm-suspend.mounts`; then every 9p mount unmounted in reverse
+  order with a plain `umount`. Never `umount -f`, and never
+  `service jm_shares stop`, which forces. A mount that will not unmount puts
+  back what was already unmounted, and the script exits 4 with the busy path.
+  Hand-made 9p mounts are unmounted too, because they would block the save
+  as well.
+- **Remount** (`jm_remount`, after a wake or a cancelled suspend):
+  `service jm_shares start`, which mounts the configuration share first and
+  skips mounted paths, then every saved line still not mounted, in the saved
+  order (parents first), with `mount -t p9fs -o <opts> <tag> <path>`. A line
+  whose tag is no longer in `shares.tab` is skipped: that host path vanished
+  while the machine was suspended, and its device now carries an empty
+  read-only placeholder. The list is removed only once every share is back;
+  otherwise the next `jm start` tries again.
+- **After a wake**, one script, each step a warning rather than a failure:
+  `date -u -f %s <host epoch>`, always; the remount; the ZFS ARC cap, when
+  `--arc` changed while the machine was suspended; the DNS search list; and
+  `test -S /var/run/podman/podman.sock`.
+- **sshd** runs with `ClientAliveInterval 30` and `ClientAliveCountMax 4`,
+  so a session whose client has gone (a host that slept, a killed tunnel)
+  ends within two minutes and stops holding an idle machine awake.
+- `/var/run` is cleared at boot, so neither the inhibitor nor a stale mount
+  list survives a guest reboot.
+
 ## Image sources (`internal/image`)
 
 | `--image` | Source | Fetched from | Verified by | `image_trusted` |
@@ -254,9 +307,10 @@ to `--disk`. ZFS grows into the extra space on first boot (`growfs`).
 make image [RELEASE=15.1-RELEASE]   # = ./jm image build --release $(RELEASE) --out dist
 ```
 
-1. `jm --state-root dist/.work init --image official:<release> --ssh-port 2229 --arc 0 jm-image-build`
+1. `jm --state-root dist/.work init --image official:<release> --ssh-port 2229 --arc 0 --idle-suspend 0 jm-image-build`
    (`--arc 0`: the build guest keeps the stock ZFS ARC, so no cap is written
-   to the image's `loader.conf`)
+   to the image's `loader.conf`; `--idle-suspend 0`: the build machine is
+   never suspended while the build waits on it)
 2. `jm --state-root dist/.work start jm-image-build` (slow path, plus the
    kernel reboot if the pkgbase upgrade installed one)
 3. `guest/seal.sh` over ssh, which removes/does:

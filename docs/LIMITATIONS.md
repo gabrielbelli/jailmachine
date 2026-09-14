@@ -42,6 +42,8 @@ be enough.
 | Spot re-checks for this page | the author's machine, unchanged | same | 2026-08-21 |
 | Idle memory after 12 days | the author's own machine, 0 containers, 0 jails, guest FreeBSD 15.1 arm64 | the author's Mac, Activity Monitor and `top` | 2026-09-13 |
 | Balloon experiment | a 2048 MiB guest, FreeBSD 15.1 arm64, `virtio-balloon` | same Mac, QEMU 11.1.1 + HVF | 2026-09-13 |
+| Pause, `-daemonize`, suspend to disk and restore | a 2048 MiB guest, FreeBSD 15.1-RELEASE-p2 arm64, QEMU file migration (`mapped-ram`, `multifd`) | same Mac, QEMU 11.1.1 + HVF | 2026-09-13 |
+| 9p remount after a restore, idle-probe `ps` syntax, detached launches | a restored FreeBSD 15.1 guest; a cloned machine booted by the new binary | same Mac | 2026-09-14 |
 
 Two caveats that apply to every number below. The benchmark Mac was **loaded
 throughout** — Docker Desktop with 15 containers, two or three VMs — so
@@ -379,8 +381,8 @@ resource boundary and size the machine accordingly.
 | `--os=linux` costs a registry round trip | Every `podman run` against a registry name: **1.87 s**, against 0.39 s for a `localhost/` tag and 0.38 s with no flag. Under a Docker Hub rate limit the same command took **33.8 s** | **podman on the host**, but jailmachine's documented workflow requires the flag | Tag locally, pre-pull, or use `jdocker` | Should be tracked |
 | podman used to print an architecture error on every guest-side call | `level=error msg="Couldn't get cpu architecture: getCPUInfo for OS freebsd not implemented"` on stderr. **Not reproducible on guest podman 5.8.4** (the 15.1.0 prebaked image): `podman ps`, `info`, `version`, `images` and `system info` each produced 0 bytes of stderr, re-checked 2026-08-21. Recorded because an older guest may still show it | **podman-on-FreeBSD**, cosmetic | Ignore, or redirect stderr | — |
 | No jail management from the host | There is no `jm jail`; jails are reached with `jm ssh -- bastille …` | **ours** (ADR 0006 scope) | `jm ssh -- bastille bootstrap 15.1-RELEASE`, etc. | — |
-| No autostart at login | Nothing starts a machine at boot. `jpodman`/`jdocker` start a stopped machine on demand and nothing else does | **ours**, deliberate — `jm start` is one-shot and leaves four detached processes, which a launchd `KeepAlive` agent would fight | `JM_AUTOSTART=0` opts out of even the on-demand start | — |
-| No snapshots, suspend, GUI or in-place guest upgrade | Not implemented | **ours** (ADR 0006 scope; ADR 0003 says re-init to move guest versions) | `jm rm && jm init` for a new guest image | — |
+| No autostart at login | Nothing starts a machine at boot. `jpodman`/`jdocker` start a stopped machine on demand and nothing else does | **ours**, deliberate — `jm start` is one-shot and leaves five detached processes, which a launchd `KeepAlive` agent would fight | `JM_AUTOSTART=0` opts out of even the on-demand start | — |
+| No snapshots, GUI or in-place guest upgrade | Not implemented | **ours** (ADR 0006 scope; ADR 0003 says re-init to move guest versions) | `jm rm && jm init` for a new guest image | — |
 
 ---
 
@@ -397,8 +399,8 @@ resource boundary and size the machine accordingly.
 |---|---|---|---|---|
 | `jm init` allocates ~47 GiB | Settled free-space delta for one fresh booted machine: **46.87 GiB**; `st_blocks` agrees at 46.79 GiB; sampling 4000 random 4 KiB blocks of `disk.raw` finds **4.95 % non-zero (~3.17 GiB)**. One run in four landed at 12.87 GiB, the other three at 46–52 GiB | **ours** — the sparse writer in `internal/image/sparse.go` is not punching holes reliably | None today. Budget the disk, and `jm rm` machines you are not using | Should be tracked — the highest-value open bug on this page |
 | `jm init` is disk-bound, not download-bound | From a locally cached `.zst` with no network at all: **59.1 / 63.3 / 113.0 s**. The 802 MiB download by itself is **31 s** by `curl` on this link | **ours**, same root cause as the row above | None | Should be tracked |
-| Start and stop are slow | Warm start **36.7 s** on a loaded Mac against **10.4 s** for podman machine; stop **11.5 s** against 1.06 s. Almost all of it is guest boot | **ours** and **upstream tooling** (QEMU + FreeBSD boot, no fast-resume path) | None. The README's 12–25 s is a quiet Mac; 36.7 s is a busy one | — |
-| The VM keeps every page the guest has touched | On a **fresh** machine: total host RSS at idle **196 MiB** (142 MiB of it QEMU), and the QEMU process' `phys_footprint` ranges 1191–2902 MB for a 4096 MiB guest (2026-08-21). **After 12 days idle**, with 0 containers and 0 jails, the author's machine reached **6.92 GB** in Activity Monitor. Inside the guest the ZFS ARC was **3.18 GB** (`vfs.zfs.arc.max` unset, so its ceiling was about the guest's RAM less 1 GiB), wired memory 3.4 GiB, and the largest process 47 MiB (2026-09-13). Ballooning does **not** give the memory back: a `virtio-balloon` inflated from 2048 to 512 MiB dropped QEMU's RSS from about 3.1 GB to 54 MB, but its footprint stayed at 1855–1900 MB and `top`'s compressed-memory column rose from about 0.6 GB to about 3.8 GB (QEMU 11.1.1, HVF, 2048 MiB guest, 2026-09-13) | **upstream tooling** and **Apple/macOS** — QEMU maps guest RAM as ordinary anonymous memory and never hands a page back once the guest touched it, and on macOS the balloon's `madvise(MADV_DONTNEED)` only moves pages into the compressor. Apple's Virtualization.framework accounts differently, which is why `vfkit` reports 14 MB for a 2048 MiB guest; that 14 MB is not a real number either. **ours**, for leaving the ARC uncapped until 2026-09-13 | `jm init --arc` / `jm set --arc` caps the ARC (512 MiB by default, applied at every `jm start`); `jm set --memory` shrinks the guest. That the cap holds a long-idle machine's footprint near the guest's working set **is inferred, not yet measured** | — |
+| Start and stop are slow | Warm start **36.7 s** on a loaded Mac against **10.4 s** for podman machine; stop **11.5 s** against 1.06 s. Almost all of it is guest boot | **ours** and **upstream tooling** (QEMU + FreeBSD boot) | A machine left to [idle suspend](#idle-suspend) wakes in seconds instead of booting. The README's 12–25 s is a quiet Mac; 36.7 s is a busy one | — |
+| The VM keeps every page the guest has touched | On a **fresh** machine: total host RSS at idle **196 MiB** (142 MiB of it QEMU), and the QEMU process' `phys_footprint` ranges 1191–2902 MB for a 4096 MiB guest (2026-08-21). **After 12 days idle**, with 0 containers and 0 jails, the author's machine reached **6.92 GB** in Activity Monitor. Inside the guest the ZFS ARC was **3.18 GB** (`vfs.zfs.arc.max` unset, so its ceiling was about the guest's RAM less 1 GiB), wired memory 3.4 GiB, and the largest process 47 MiB (2026-09-13). Ballooning does **not** give the memory back: a `virtio-balloon` inflated from 2048 to 512 MiB dropped QEMU's RSS from about 3.1 GB to 54 MB, but its footprint stayed at 1855–1900 MB and `top`'s compressed-memory column rose from about 0.6 GB to about 3.8 GB (QEMU 11.1.1, HVF, 2048 MiB guest, 2026-09-13) | **upstream tooling** and **Apple/macOS** — QEMU maps guest RAM as ordinary anonymous memory and never hands a page back once the guest touched it, and on macOS the balloon's `madvise(MADV_DONTNEED)` only moves pages into the compressor. Apple's Virtualization.framework accounts differently, which is why `vfkit` reports 14 MB for a 2048 MiB guest; that 14 MB is not a real number either. **ours**, for leaving the ARC uncapped until 2026-09-13 | `jm init --arc` / `jm set --arc` caps the ARC (512 MiB by default, applied at every `jm start`); `jm set --memory` shrinks the guest. That the cap holds a long-idle machine's footprint near the guest's working set **is inferred, not yet measured**. [Idle suspend](#idle-suspend) returns all of it while the machine is asleep: after 30 idle minutes by default, or at once with `jm suspend` | — |
 | Disk grows only | `jm set --disk` extends; nothing shrinks | **ours** | `jm rm && jm init --disk` | — |
 | One SSH port per machine | Running several machines means `jm init --ssh-port 2223 dev` and `JM_MACHINE=dev jpodman ps` | **ours** | As above | — |
 
@@ -406,6 +408,50 @@ Where jailmachine is competitive, for balance, measured in the same sitting:
 image pull **6.35 s** against 3.55 s and 2.09 s; a five-step Debian build
 **8.45 s** against 5.49 s and 6.56 s. It is not slow at the work; it is slow
 at starting and at sharing files.
+
+---
+
+## Idle suspend
+
+> **The short version.** A machine idle for 30 minutes is saved to its
+> directory and its memory goes back to macOS; the first command wakes it.
+> The restore itself is fast: SSH answered **4.06 s** after launch on a
+> 2048 MiB guest. But several clients cannot wake a machine, and a few
+> situations keep one awake. `jm set --idle-suspend 0` turns all of it off.
+
+What was measured, on the sessions dated in
+[Where the numbers come from](#where-the-numbers-come-from):
+
+| Measured | Result |
+|---|---|
+| Returning memory with `virtio-balloon` | Pages move into the compressor; the footprint stays at 1855–1900 MB (see [The machine itself](#the-machine-itself)) |
+| Pausing the guest (QMP `stop`) | Every page is kept |
+| Saving a QEMU started with `-daemonize` | QEMU aborts with SIGABRT in `performForkChildInitialize`: under HVF, saving GIC state initialises Objective-C classes in a process that forked without exec |
+| Save after dirtying 800 MB | **9.98 s** wall; migration total-time 9213 ms, downtime 19 ms, 1.30 GB transferred |
+| Save with little dirty memory | **3.3 s** |
+| Saved image | **2.1 GB** logical, **1.3 GB** allocated (sparse) |
+| Restore, timed from the hypervisor launch | QMP answering 2.10 s, state loaded 3.61 s, guest continued 3.96 s, SSH answering **4.06 s** |
+| QEMU footprint just after the restore | **1452 MB** |
+| 9p after a restore (2026-09-14) | The restored guest remounted its share with `mount -t p9fs`, read the file written before the suspend and the one the host wrote while it was suspended, and a guest write appeared on the host |
+| The idle probe's `ps` (2026-09-14) | FreeBSD `ps -o pid=,ppid=,comm=` prints only the pid: everything after `=` is the header, commas included, so each keyword needs its own `-o`. `comm` is `sshd-session` for every session process; a pty and a non-pty command are both its children; a tunnel's session has none |
+| Detached launches (2026-09-14) | A cloned machine booted by the new binary: every helper reparented to pid 1, the ARC cap and `MaxAuthTries` applied, `jm stop` clean |
+
+| Limitation | What you see | Whose | Workaround | Tracking |
+|---|---|---|---|---|
+| First use after idle is slower | The first command against a suspended machine waits for the restore. About **5 s** to the first engine answer on a 2048 MiB guest is an **estimate**: the measured 4.06 s to SSH plus starting the network and reconnecting the engine socket. A 4096 MiB guest or a loaded Mac is slower, **not yet measured**. A saved state that cannot be restored becomes a cold boot: 12–25 s on a quiet Mac, 36.7 s on a loaded one | **ours** | `jm set --idle-suspend 0`, or `jm start` before the first command | — |
+| Published ports do not wake a suspended machine | Connection refused until a jm command, or a client of the engine socket or the SSH port, wakes it. Automatic suspend never happens with a container or jail running, so this only follows `jm suspend --force` | **ours** | Keep the machine awake, or run `jpodman ps` first | — |
+| After a Mac restart, or with the sleeper dead, only jm commands wake a suspended machine | `DOCKER_HOST` clients, VS Code and `podman --connection <name>` get connection refused; `jm doctor` warns on the `sleeper` row | **ours**, with no login agent by design | `jm start`, or any `jpodman`/`jdocker` command | — |
+| Clients with short timeouts | A client whose own connect or first-response timeout is shorter than the wake, such as the docker CLI's initial ping or an ssh `ConnectTimeout` of a few seconds, can fail once against a suspended machine. **Inferred** from the wake time, not yet reproduced | **upstream tooling** | `jpodman` and `jdocker` wake the machine before they run the client; otherwise retry | — |
+| New ssh:// connections during a wake | A `podman --connection <name>` or `ssh -p <port>` *started* while a wake is under way can be reset, because the network provider owns the SSH port for a few seconds before the guest runs. The window is an **estimate** of about 3.5 s. Connections that arrived before the wake started are held and served | **ours** | Retry | Follow-up: publish the SSH port only once the guest runs |
+| Short engine calls that bypass the wrappers are not seen | A machine used only through `DOCKER_HOST` or the `<name>-sock` connection, with calls that do not span two 15 s samples in a row (up to about 30 s), can be suspended between them, and each call then waits for a wake | **ours** | Use the wrappers, which mark every call as activity, or raise `--idle-suspend` | A wake within 10 minutes of the suspend doubles the idle period, up to 8× |
+| Suspend needs free disk | The saved state takes up to the guest's memory on the state-root volume. jm requires the memory plus 2 GiB free; otherwise the machine stays awake and `jm inspect` shows `idle_unavailable` | **ours**, and **Apple/macOS** for a full volume | Free space, or a smaller `--memory` | — |
+| A busy shared folder blocks sleep | A guest process with a file open or its working directory in a share keeps the machine awake: QEMU will not save a guest with a 9p share mounted, and jm never force-unmounts. `jm suspend` prints `a shared directory is in use in the guest: <path>`; `jm inspect` lists `share <path> in use` | **upstream tooling** (QEMU) | Leave the directory | — |
+| Detached guest jobs with no session | A `nohup` or `daemon(8)` job with no session, no container and little CPU can be suspended mid-run; it carries on after the wake, with the clock stepped | **ours** | `jm ssh -- touch /var/run/jm-nosleep` (removed at the next guest boot) | The CPU threshold, 25 % of one core, is not yet calibrated |
+| Saved state lost across upgrades | A QEMU or macOS update between suspend and wake can make the state unusable: the machine boots from disk with a warning, and the guest's processes are lost, not its disk | **upstream tooling** / **Apple/macOS** | `jm stop` before upgrading QEMU or macOS | — |
+| Hardware changes while suspended | `jm set --cpus`, `--memory`, `--ssh-port`, `--mount`, `--unmount`, `--no-mounts` and `--disk` are refused | **ours** | `jm stop` restores and shuts the machine down; `jm start` first for a live `--disk` | — |
+| Machines started by an older jm | `jm inspect` shows `idle_unavailable: hypervisor was started by an older jm; restart it once: jm stop && jm start`. That QEMU was launched with `-daemonize`, and saving it would abort it | **ours** / **Apple/macOS** (HVF and fork) | `jm stop && jm start`, once | — |
+| Guest clock jumps at wake | Time-based caches and timers see the time jump as after a long host sleep; the wake steps the clock at once | **ours**, by design | `--idle-suspend 0` | — |
+| The saved state holds guest memory | `suspend.state` is the guest's RAM, secrets included. It is mode 0600 in the machine directory and deleted after the restore, but not wiped, and APFS local snapshots or Time Machine may keep a copy | **ours** | FileVault; exclude `~/.jailmachine` from Time Machine | — |
 
 ---
 
@@ -509,9 +555,9 @@ or upstream — that would remove the limitation, in rough order of value.
 | To remove | Work needed | Where |
 |---|---|---|
 | ~47 GiB written for 3.17 GiB of content, and the slow `init` that follows from it | Fix hole-punching in `internal/image/sparse.go`, then re-measure the free-space delta and the `init` time. Both numbers should collapse together, and the README's timing claim becomes true again | **Us** — the highest-value bug on this page |
-| The idle footprint growing towards the guest's memory size | Re-measure a capped machine after days idle to confirm the ARC cap bounds it. A real return of memory to macOS needs a balloon or free-page-reporting path that releases pages instead of compressing them, which QEMU on macOS does not have today | **Us** (the measurement), then upstream QEMU |
-| Slow warm start | Profile the guest boot; there is no fast-resume path under QEMU today, and `jm start` deliberately holds no daemon | **Us**, then upstream QEMU/FreeBSD |
-| No fast machine suspend | QEMU savevm against a running FreeBSD guest, plus state-model work in ADR 0005 | **Us**, post-MVP |
+| The idle footprint growing towards the guest's memory size | Re-measure a capped machine after days idle to confirm the ARC cap bounds it. Suspend (ADR 0009) returns it entirely while asleep; returning memory from a machine that is *running* needs a balloon or free-page-reporting path that releases pages instead of compressing them, which QEMU on macOS does not have today | **Us** (the measurement), then upstream QEMU |
+| Slow warm start | Profile the guest boot. Idle suspend avoids it for a machine that was left running; a stopped machine, or a saved state that cannot be restored, still boots cold | **Us**, then upstream QEMU/FreeBSD |
+| Unmeasured wake of a larger guest, and an uncalibrated idle CPU threshold | Measure wake time and footprint of a 4096 MiB guest under memory pressure; calibrate the idle CPU threshold (25 % of one core today) from an hour of samples of an idle guest | **Us** |
 | Other host platforms | A Linux backend (QEMU + KVM, same argv) and a Windows one (Hyper-V) behind ADR 0002's backend interface | **Us**, post-MVP |
 
 ---

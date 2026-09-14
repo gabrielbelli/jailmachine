@@ -31,7 +31,9 @@ must be visible to a container at the same path), **resolution parity** (a
 name only the host can resolve must resolve in the guest, to the same
 address), the published-UDP **datagram limit** and the guest **clock** —
 printing a one-line fix per failure. That is 23 checks on a Mac with one
-machine. Note that it inspects the default state root
+machine; a running machine that can be suspended adds up to three more:
+`suspend <name>` (whether it can be), `sleeper <name>` and
+`idle suspend <name>` (how long it has been idle, or what holds it awake). Note that it inspects the default state root
 (`~/.jailmachine`, or `$JM_HOME`) unless you pass `--state-root`.
 
 ## Symptom → cause → fix
@@ -66,6 +68,15 @@ machine. Note that it inspects the default state root
 | UDP datagrams over 8972 bytes never arrive | The gvproxy link does not fragment, and its MTU is 9000 by default | Keep datagrams under 8972 bytes, or use TCP; `jm doctor` states the limit, and `JM_MTU` at `jm start` moves it. See *UDP in a Linux container* below |
 | `nc -u -l` in a Linux container → `Address family not supported by protocol` | busybox's UDP listener peeks its peer with a zero-length `recvmsg()`, which returns at once on FreeBSD where Linux blocks | `apk add netcat-openbsd`, or `socat UDP4-RECVFROM:…`. UDP itself works; see *UDP in a Linux container* below |
 | `jpodman ps` pauses and prints `starting jailmachine …` | Autostart is doing its job | Nothing. `JM_AUTOSTART=0` or `jpodman --no-autostart ps` to fail instead |
+| `jpodman ps` pauses and prints `waking jailmachine …` | The machine was suspended after sitting idle | Nothing. `jm set --idle-suspend 0` keeps it awake; `JM_AUTOSTART` does not apply to a suspended machine |
+| A machine never shows `suspended` in `jm list` | Something holds it awake, or suspend is unavailable for it | `jm inspect` (`Idle suspend:` row). See *it never sleeps* below |
+| `DOCKER_HOST`, VS Code or `podman --connection <name>` → `connection refused` while `jm list` says `suspended` | The sleeper that holds those endpoints is not running (a Mac restart, or it was killed) | `jm start`, or any `jpodman` command. See *it did not wake* below |
+| A published port refuses while `jm list` says `suspended` | Published ports do not wake a machine | `jpodman ps` wakes it |
+| `jm: could not restore the suspended state of <name> (…); booting from disk` | QEMU or macOS changed, or the disk changed, between suspend and wake | Nothing: it booted. See *could not restore* below |
+| `could not wake <name> (…)` | A transient failure; the saved state is kept | Fix what it names (`jm doctor`) and retry; `jm stop --force` discards the saved state |
+| `jm set` → `<name> is suspended; cpus, memory, the ssh port and the shared directories change only on a stopped machine` | Virtual hardware is fixed while suspended | `jm stop` (restores and shuts down), then `jm set`, then `jm start` |
+| `jm suspend` → `<name> is busy: a shared directory is in use in the guest: <path>` | A guest process has a file open, or its working directory, in that share | `jm ssh -- fstat -f <path>` names the process; leave the directory |
+| `cannot suspend <name>: hypervisor was started by an older jm; restart it once: jm stop && jm start` | That QEMU was launched with `-daemonize`, and saving it would abort it | `jm stop && jm start`, once |
 | `jdocker: the docker CLI is not on PATH` | Only the engine is provided by jm | `brew install docker` (the client alone), or use `jpodman` |
 | `no space left on device` in the guest | Guest disk full | `jm set --disk <bigger>` |
 | `jm doctor` warns on `socket paths` | `--state-root` so deep that sockets no longer fit in `sun_path` (103 bytes) and fall back to `$TMPDIR` | Harmless, but a shorter state root keeps every file in one directory |
@@ -121,7 +132,11 @@ jm stop      # converges both halves to stopped (asks the guest first if it is a
 jm start
 ```
 
-`jm start` on a broken machine does the same repair itself. If `stop` cannot
+`jm start` on a broken machine does the same repair itself, and then looks
+at the state again: a machine whose half-finished suspend left a complete
+saved state comes back `suspended` and is woken, not booted. `jm doctor`
+warning `a suspend or wake is in progress or was interrupted` means the same
+thing: if no jm command is running, `jm start` resolves it. If `stop` cannot
 finish, `jm stop --force` terminates the hypervisor outright, and
 `jm rm --force` always converges to "gone".
 
@@ -756,6 +771,71 @@ shows what it really occupies. Removing images inside the guest
 (`jpodman image prune -a`) frees guest space but does not shrink
 `disk.raw`.
 
+## Idle suspend
+
+A machine idle for its `--idle-suspend` time (30 minutes by default) with no
+containers or jails is suspended to disk, and the first command wakes it. Its
+sleeper, `jm _sleeper <name>`, decides when, runs the suspend, and holds
+`podman.sock` and the SSH port while the machine is asleep.
+
+### It never sleeps
+
+```bash
+jm inspect                       # the "Idle suspend:" row
+jm inspect --json | jq '{state, idle_suspend_min, idle_seconds, idle_suspend_after_seconds, idle_blockers, idle_unavailable, idle_disabled_reason, sleeper_state}'
+jm doctor                        # the suspend, sleeper and idle suspend rows
+tail -50 ~/.jailmachine/machines/jailmachine/sleeper.log
+```
+
+| What it says | Cause | Fix |
+|---|---|---|
+| `idle_suspend_min: 0`, `Idle suspend: off` | Turned off | `jm set --idle-suspend 30m` |
+| `1 jail or container running` | Any container, or a bastille jail. Automatic suspend never freezes a workload | Stop it, or `jm suspend --force` |
+| `1 engine client connected` | A podman or docker client holds a connection: `logs -f`, `events`, an attach, a Docker extension polling | Close it. The forwarder's own event stream is not counted |
+| `1 command session open` | A `jm ssh` shell, a `jm ssh -- cmd` still running, `scp` | End it. A session whose client vanished ends within two minutes |
+| `/var/run/jm-nosleep exists` | Someone asked for the machine to stay awake | `jm ssh -- rm /var/run/jm-nosleep` |
+| `a jm command used the machine` | A wrapper or `jm ssh` ran since the last 15 s sample | Nothing; the count starts again after it |
+| `guest CPU 31%` | QEMU used more than 25 % of one core: something in the guest is working | `jm ssh -- top` |
+| `share /Users/you/src in use` | The last automatic suspend found a guest process in that share | Leave the directory; `jm ssh -- fstat -f <path>` names the process |
+| `guest activity unreadable: …` | The probe failed, which never counts as idle | `sleeper.log`; `jm ssh -- ps -ax -o pid= -o ppid= -o comm=` should list `sshd-session` |
+| `idle_unavailable: hypervisor was started by an older jm; …` | QEMU was launched with `-daemonize` | `jm stop && jm start`, once |
+| `idle_unavailable: need 4.0 GiB free on the volume holding …, have …` | The volume lacks the guest's memory plus 2 GiB | Free space, or a smaller `--memory` (`jm stop` first) |
+| `idle_disabled_reason: automatic suspend failed 3 times in a row; …` | Three automatic attempts failed; `jm doctor` prints the last error | Read `sleeper.log`, fix the cause, then `jm stop && jm start` to restart the sleeper |
+| `sleeper_state: stopped` on a running machine | The sleeper died or was never started | `jm start` starts it |
+| `idle_suspend_after_seconds` larger than the setting | The machine was woken soon after its last suspend, so the idle period doubled (up to 8×) | Nothing; it resets after a suspension of an hour or more |
+
+### It did not wake
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `connection refused` on `podman.sock` or the SSH port; `jm doctor` says `sleeper <name>` is not running | After a Mac restart, or with the sleeper killed, nothing holds the endpoints | Any jm command wakes it: `jm start`, `jpodman ps`, `jm ssh` |
+| A client waited, then got EOF or a closed connection | The `jm _wake` the sleeper spawned failed; the saved state is kept and the sleeper waits 10 s before another try | `tail ~/.jailmachine/machines/<name>/wake.log`; `jm start` repeats the wake with the error in full |
+| A `podman --connection <name>` started during a wake is reset | For a few seconds the network provider owns the SSH port before the guest runs | Retry |
+| The docker CLI times out on its first request | Its own timeout is shorter than the wake | Use `jdocker`, which wakes the machine before it runs docker, or retry |
+| A held connection closed after two minutes | Nothing woke the machine in 120 s | See `wake.log` |
+
+### Could not restore the suspended state
+
+```
+jm: could not restore the suspended state of jailmachine (…); booting from disk: processes in the guest were not preserved, the disk is intact as of …
+```
+
+The saved state was refused, so jm discarded it and booted from disk in the
+same command. The usual causes are a QEMU upgrade that dropped the machine
+type, a load QEMU rejected, or a `disk.raw`, `efivars.fd` or record that
+changed since the suspend. Containers and jails with a restart policy come back; anything else
+that was running in the guest did not. When QEMU refused the load, its log is
+kept in `qemu.resume-failed.log`. To avoid it, `jm stop` a suspended machine
+before upgrading QEMU or macOS.
+
+### Woke, but ports or shares are missing
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| A published port is missing just after a wake | The forwarder re-exposes every mapping on the new gvproxy at its first resync | `jm ports`; `forwarder.log`; `jm start` restarts a forwarder that did not come back |
+| `warn: shares unmounted by the suspend are not all back (retried on the next start)` | A share could not be mounted again | `jm ssh -- cat /var/run/jm-suspend.mounts` lists what is pending; `jm start` retries |
+| `was restored but did not continue`, or a stage error after `waking from its saved state` | The guest runs, but a later wake step failed | `jm start` finishes the remaining stages |
+
 ## Where every log lives
 
 Host-side, under `~/.jailmachine/machines/<name>/` (or `$JM_HOME`, or
@@ -772,6 +852,12 @@ Host-side, under `~/.jailmachine/machines/<name>/` (or `$JM_HOME`, or
 | `resolver.log` | the host DNS resolver | A name resolves on the Mac but not in the guest or a container |
 | `resolver.addr` | the same resolver | You want the `127.0.0.1:<port>` the guest forwards its queries to |
 | `guest/shares.tab` | jm, at every start | You want the share table exactly as the guest reads it |
+| `sleeper.log` | the sleeper | A machine never suspends, or a suspend failed |
+| `sleeper.json` | the same sleeper | You want its last report: mode, idle time, blockers, last error; `jm inspect` reads it |
+| `wake.log` | the `jm _wake` processes the sleeper spawns | A client of `podman.sock` or the SSH port did not wake the machine |
+| `qemu.resume-failed.log` | jm, copying `qemu.log` | QEMU refused a saved state and jm booted from disk |
+| `suspend.json`, `suspend.state` | the QEMU backend | The journal and the saved memory of a suspended machine. Never edit them; `jm stop --force` discards them |
+| `qemu.argv` | the QEMU backend, at every launch | You want QEMU's exact command line, which a wake reuses |
 
 In the guest:
 
@@ -784,6 +870,8 @@ In the guest:
 | `/var/run/podman/podman.sock` | The engine API the host connects to |
 | `/var/db/jm/conf/shares.tab` | The share table, mounted read-only from the host |
 | `/var/log/jm-rtcsync.log` | The clock resync daemon that steps the guest from the EFI RTC |
+| `/var/run/jm-suspend.mounts` | The 9p mounts a suspend unmounted, until a wake mounts them again |
+| `/var/run/jm-nosleep` | If present, the machine is never suspended automatically |
 
 ```bash
 jm inspect                    # prints console, network and forwarder log paths

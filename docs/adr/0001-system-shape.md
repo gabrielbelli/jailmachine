@@ -33,3 +33,14 @@ Host tools that speak the engine's API (podman CLI, Docker CLI) are
   channel, never by pushing code into the guest at runtime.
 - The same `jm` binary can drive a remote FreeBSD box: the hypervisor layer
   becomes optional, the control channel does not.
+
+## Addendum (2026-09-14): the endpoint while a machine is suspended
+
+"`jm` only hands them an endpoint" keeps its meaning for a running machine: jm
+is never in its data path. While a machine is suspended (**ADR 0009**) nothing
+of the guest is there to answer, so jm's per-machine supervisor holds that same
+endpoint itself. A connection that arrives before the engine is back is held
+unread and then relayed opaquely, byte for byte, for its lifetime; jm parses,
+answers or alters nothing, and a connection it cannot hand over is closed.
+Answering on the engine's behalf, peeking at requests, or staying in the path of
+a running machine would each need a new ADR.

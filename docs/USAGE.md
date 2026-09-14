@@ -34,6 +34,9 @@ jpodman run --rm --os=linux docker.io/alpine echo hi
   answers for the guest. See [Name resolution](#name-resolution). One
   exception: a container cannot resolve **another container** by name —
   see [Containers cannot resolve each other by name](#containers-cannot-resolve-each-other-by-name).
+- A machine left idle for 30 minutes is **suspended to disk** and gives its
+  memory back to macOS; the first command wakes it in seconds. See
+  [Idle suspend](#idle-suspend).
 
 ## Conventions shared by every command
 
@@ -73,6 +76,7 @@ finished steps are skipped and a partial download resumes.
 | `--cpus <n>` | `4` | Virtual CPUs (at least 1) |
 | `--memory <MiB>` | `2048` | Memory in MiB (at least 256; a bare number, no units here) |
 | `--arc <size>` | `512`, or half of a `--memory` below 1024 MiB | Cap on the guest's ZFS ARC: a bare number is MiB, or use a unit (`1GiB`). `0` is the guest's own default. Otherwise at least 64 MiB and below `--memory`. See [Memory and the ZFS ARC](#memory-and-the-zfs-arc) |
+| `--idle-suspend <time>` | `30m` | How long a running machine may sit idle before it is suspended to disk; it wakes on first use. `30m`, `2h`, or a bare number of minutes; `0`, `off` or `never` turns it off. Otherwise between 5 minutes and 168 hours. See [Idle suspend](#idle-suspend) |
 | `--disk <GiB>` | `64` | Disk size in GiB. `disk.raw` is sparse, so this is a ceiling, not an allocation |
 | `--image <ref>` | `prebaked` | Image source — see [Image sources](#image-sources) |
 | `--ssh-port <port>` | `2222` | Host loopback port forwarded to the guest's sshd |
@@ -84,6 +88,7 @@ finished steps are skipped and a partial download resumes.
 jm init
 jm init --cpus 2 --memory 4096 dev
 jm init --memory 8192 --arc 2GiB big              # a bigger file cache for a bigger machine
+jm init --idle-suspend 2h dev                      # suspend after two idle hours instead of 30 minutes
 jm init --image official:15.1-RELEASE --disk 32
 jm init --mount /work --mount "/srv/data:ro"       # in zsh, brace a :ro on a variable
 jm init --no-mounts --publish-addr 127.0.0.1
@@ -151,7 +156,9 @@ hypervisor, with one 9p device per share) → **ssh** (wait for sshd) →
 **provision** (wait for the guest's ready marker) → **dns** again (point the
 guest at the host resolver and push the search domains) → **connect**
 (register the podman connections) → **forwarder** (start the detached
-port-publishing loop).
+port-publishing loop) → **sleeper** (start the detached helper that
+suspends the machine when it sits idle and holds its endpoints while it is
+suspended).
 
 Before the backend stage, `jm start` reconciles the machine's share set
 against the host: a shared directory that has vanished (an unplugged disk) is
@@ -164,6 +171,13 @@ Starting a machine that is already running re-checks the ssh, provision,
 dns, connect and forwarder stages, so an interrupted start finishes rather
 than needing a stop first. A *broken* machine (half of it running, or a stale
 pid file) is stopped and started again.
+
+A **suspended** machine is woken instead of booted: the network and resolver
+come back, QEMU restores the saved state, and one guest script steps the
+clock, mounts the shares again and applies an `--arc` changed meanwhile.
+When the saved state cannot be restored, `jm start` discards it with a
+warning and boots from disk in the same invocation. Before anything else,
+`jm start` resolves a suspend or wake that a killed jm left half done.
 
 | Flag | Effect |
 |---|---|
@@ -196,7 +210,14 @@ a no-op. It also repairs a "broken" machine (a pid file with no process).
 
 | Flag | Effect |
 |---|---|
-| `-f`, `--force` | Terminate the hypervisor without asking the guest to shut down |
+| `-f`, `--force` | Terminate the hypervisor without asking the guest to shut down; discards a suspended machine's saved state |
+
+The sleeper is stopped first. A **suspended** machine is restored and then
+shut down cleanly, so nothing in the guest dies uncleanly; `--force`
+discards the saved state instead. If the restore fails for a transient
+reason (a busy port, a timeout), the machine stays suspended and the hint
+names `jm stop --force`; if the saved state cannot be restored at all, it is
+discarded with a message and the machine is stopped.
 
 ```bash
 jm stop
@@ -205,6 +226,42 @@ jm stop --force dev
 
 Exit codes: `0` stopped (including "already stopped"); `1` if a component
 refused to stop; `2` usage.
+
+## `jm suspend [name]`
+
+Save a running machine's complete state to its directory now, end its
+processes, and give its memory back to macOS. The idle monitor does the same
+on its own after `--idle-suspend`; this is the manual trigger. `jpodman`,
+`jdocker`, `jm start`, `jm ssh` and any client of the machine's endpoints
+wake it again, with every guest process as it was. See
+[Idle suspend](#idle-suspend).
+
+| Flag | Effect |
+|---|---|
+| `-f`, `--force` | Suspend even with jails or containers running, an engine client connected, a command session open or `/var/run/jm-nosleep` present. A shared directory in use in the guest still refuses |
+
+```bash
+jm suspend
+jm suspend --force dev   # containers keep running after the wake
+```
+
+The suspend runs in the machine's sleeper, which is started first if it is
+not alive: it has to outlive the command, because it holds the endpoints
+while the machine is suspended. It refuses, changing nothing, when:
+
+| Refusal | Why |
+|---|---|
+| `<name> is busy: 1 jail or container running` (or an engine client, a command session, the inhibit file) | Guest activity; `--force` overrides |
+| `<name> is busy: a shared directory is in use in the guest: <path>` | A 9p share will not unmount without force, and QEMU will not save a guest with one mounted |
+| `cannot suspend <name>: hypervisor was started by an older jm; restart it once: jm stop && jm start` | That QEMU was launched with `-daemonize` |
+| `cannot suspend <name>: need <size> free on the volume holding <dir>, have <size>` | The volume lacks the guest's memory plus 2 GiB |
+| `suspend of <name> cancelled: a client arrived` | A client connected before the guest was frozen; it is served normally |
+| `another jm command is operating on "<name>"` | The lock is held |
+
+Exit codes: `0` suspended, or already suspended; `1` refused or failed (the
+machine is left running, except when the hypervisor exits during the save:
+the machine is then stopped and `jm start` boots it from disk); `2` usage. On a stopped machine it fails with
+`<name> is not running`.
 
 ## `jm ssh [name] [-- command...]`
 
@@ -224,7 +281,9 @@ jm ssh dev tail -f /var/log/jm-provision.log
 
 `jm ssh` replaces itself with `ssh`, so **the exit code is the remote
 command's** (or `255` when the connection itself fails). It refuses with
-exit `1` if the machine is not running.
+exit `1` if the machine is not running. A **suspended** machine is woken
+first, with one `waking jailmachine "<name>"...` line on stderr, because
+ssh's own connect timeout is shorter than a wake.
 
 ## `jm list` (alias `jm ls`)
 
@@ -232,7 +291,8 @@ List every machine with its runtime state. Nothing is cached: the
 hypervisor and the network provider are asked on every call.
 
 Columns: `NAME STATE CPUS MEMORY DISK SSH PORTS` — `PORTS` is the number of
-published container ports.
+published container ports. `STATE` is `running`, `stopped`, `suspended` or
+`broken`; `jm list` never wakes a suspended machine.
 
 ```bash
 jm list
@@ -246,7 +306,7 @@ jailmachine  running  4     2048 MiB  64 GiB  127.0.0.1:2222  0
 `--json` prints the same records as `jm inspect --json` in an array:
 
 ```bash
-jm ls --json | jq -r '.[] | select(.state == "running") | .name'
+jm ls --json | jq -r '.[] | select(.state == "running" or .state == "suspended") | .name'
 ```
 
 Exit code `0` even when there are no machines (an empty table).
@@ -269,6 +329,7 @@ Image trusted:     true
 CPUs:              4
 Memory:            2048 MiB
 ZFS ARC cap:       512 MiB
+Idle suspend:      after 30 min (idle 12 min)
 Disk:              64 GiB
 MAC:               5a:94:ef:e4:0c:ee
 Guest IP:          192.168.127.2
@@ -288,6 +349,8 @@ Resolver log:      /Users/you/.jailmachine/machines/jailmachine/resolver.log
 Publish address:   0.0.0.0
 Forwarder:         running
 Forwarder log:     /Users/you/.jailmachine/machines/jailmachine/forwarder.log
+Sleeper:           running
+Sleeper log:       /Users/you/.jailmachine/machines/jailmachine/sleeper.log
 Port:              0.0.0.0:8080 -> 192.168.127.2:8080 tcp (ok)
 Share:             /Users/you (rw)
 Share:             /Volumes (rw)
@@ -299,16 +362,24 @@ Created:           2026-08-21T16:16:47Z
 ```
 
 One `Port:` line is printed per published mapping and one `Share:` line per
-shared host directory, between `Forwarder log:` and `Dir:`; a machine
+shared host directory, between `Sleeper log:` and `Dir:`; a machine
 publishing nothing, or sharing nothing, has none. A share is annotated
 `— missing on the host, not shared` when its path has vanished, and
 `— ignored: backend "<name>" cannot share host directories` when the backend
 has no file-sharing capability at all.
 
+While the machine is suspended the `State:` row reads
+`suspended (since 14:02; image 1.3 GiB; wakes on first use)`. The
+`Idle suspend:` row is `off`, `after 30 min`, `after 30 min (idle 12 min)`
+while the idle monitor watches a running machine, `held awake by: 1 engine
+client connected` when something keeps it awake, or
+`unavailable (<reason>)`, such as a hypervisor started by an older jm.
+
 `--json` prints one object with snake_case keys: `name`, `state`
-(`running` | `stopped` | `broken`), `backend_state`, `network_state`,
+(`running` | `stopped` | `suspended` | `broken`), `backend_state`, `network_state`,
 `backend`, `network`, `image`, `cpus`, `memory_mib`, `arc_mib` (the guest's
-ZFS ARC cap in MiB; `0` is the guest's own default), `disk_gib`, `mac`,
+ZFS ARC cap in MiB; `0` is the guest's own default), `idle_suspend_min`
+(minutes idle before a suspend; `0` never; always present), `disk_gib`, `mac`,
 `ssh_port`, `ssh_user`, `guest_ip`, `mtu` (the link size gvproxy and the
 guest agree on — the plain-text output has no row for it; `jm doctor` states
 the resulting UDP ceiling), `ssh` (host:port), `ssh_key`,
@@ -320,8 +391,17 @@ error}`), `forwarder_state`, `forwarder_log`, `publish_addr_effective`
 `publish_addr_pending` (the record's value when it differs and is waiting for
 a restart),
 `shares` (array of `{host_path, guest_path, read_only, tag}`),
-`file_sharing`, `resolver_state`, `resolver_addr`, `resolver_log` and
-`autostart`. Empty values are omitted.
+`file_sharing`, `resolver_state`, `resolver_addr`, `resolver_log`,
+`autostart`, `sleeper_state` (`running` | `stopped`) and `sleeper_log`.
+From the sleeper's last report, when known: `last_wake_by` (`socket`,
+`ssh-port`, `wrapper` or `jm start`), `last_resume_ms` and
+`last_suspend_ms`. Only while suspended: `suspended_at` (RFC 3339),
+`suspend_image` (the saved state's path) and `suspend_image_bytes` (the
+space it takes on disk). Only while the machine runs and its sleeper watches
+it: `idle_seconds`, `idle_suspend_after_seconds` (the idle period,
+lengthened after quick wakes), `idle_blockers` (what holds it awake),
+`idle_unavailable` (why it cannot be suspended) and `idle_disabled_reason`
+(why automatic suspend is off). Empty values are omitted.
 
 ```bash
 jm inspect --json | jq -r .podman_sock_uri
@@ -348,6 +428,9 @@ literally.
 | Flag | Effect |
 |---|---|
 | `-f`, `--force` | Kill the hypervisor and ignore errors along the way |
+
+A suspended machine's saved state is discarded, never restored first, and
+its sleeper is stopped before anything else.
 
 ```bash
 jm rm
@@ -385,6 +468,11 @@ The exports are only useful while the machine is **running**: `jm env` on a
 stopped machine still exits `0` and still prints them, but the socket they
 name does not exist, so every podman and docker call in that shell fails
 with a connection error until you `jm start`.
+
+On a **suspended** machine the exports are printed as usual and a warning on
+stderr says the socket answers once the machine wakes. While its sleeper
+runs, the first connection to that socket wakes the machine and is served a
+few seconds later.
 
 Requires a provider that proxies the API socket — that is gvproxy, the
 default. With `JM_NETWORK=user` there is no socket and `jm env` fails with
@@ -426,7 +514,9 @@ guest-side redirect not yet in place. Failed mappings are retried on every
 resync, so the error is a live status, not a permanent verdict.
 
 If the forwarder is not running, a `#` comment line says so above the table.
-The exit code is still `0`.
+The exit code is still `0`. On a suspended machine the table is kept and a
+`#` line says the ports answer after the machine wakes: connecting to a
+published port does **not** wake it.
 
 `--json` prints the entries as an array of `{proto, local, remote, since,
 error}` (an empty array when there are none).
@@ -446,6 +536,7 @@ Change a machine's resources.
 | `--no-mounts` | machine stopped | Drop **every** share. Cannot be combined with `--mount` or `--unmount` |
 | `--publish-addr <addr>` | takes effect on the next start | **Default** host address published ports bind to; a `-p` that names one binds that instead |
 | `--arc <size>` | stopped **or** running | Cap on the guest's ZFS ARC: a bare number is MiB, or use a unit. `0` is the guest's own default; otherwise at least 64 MiB and below the memory (the new `--memory` when both are given). See [Memory and the ZFS ARC](#memory-and-the-zfs-arc) |
+| `--idle-suspend <time>` | any state, applies at once | Idle time before the machine is suspended to disk: `30m`, `2h`, a bare number of minutes, or `0`/`off`/`never`. Between 5 minutes and 168 hours. See [Idle suspend](#idle-suspend) |
 
 `--publish-addr` is accepted while the machine runs: it is recorded, and jm
 prints the `jm stop && jm start` needed to apply it. `--mount`, `--unmount`
@@ -462,6 +553,15 @@ partition and ZFS pool are extended immediately; on a stopped one they are
 extended on the next `jm start`. If the guest side fails, the record keeps a
 pending flag and the next start retries it.
 
+A **suspended** machine keeps the virtual hardware it was saved with:
+`--cpus`, `--memory`, `--ssh-port`, `--mount`, `--unmount` and `--no-mounts`
+are refused with `<name> is suspended; …`, and `--disk` is refused because the
+disk grows only on a running or stopped machine (`jm start` first to grow it
+live, or `jm stop`). `--arc`, `--publish-addr` and `--idle-suspend` are
+recorded; an `--arc` changed while suspended is applied when the machine
+wakes. `--idle-suspend` logs the change (`idle suspend: 30 min -> off`), and
+a running machine's sleeper reads it at its next sample.
+
 ```bash
 jm stop && jm set --cpus 8 --memory 8GiB && jm start
 jm set --disk 128                       # works while running
@@ -470,6 +570,7 @@ jm stop && jm set --no-mounts && jm start  # drop every share
 jm set --mount "${P}:ro"                # braces, not quotes — see the zsh note below
 jm set --publish-addr 127.0.0.1
 jm set --arc 1GiB                       # works while running
+jm set --idle-suspend 0                 # never suspend this machine
 ```
 
 Exit codes: `0`; `2` for no flags at all, an out-of-range value, a shrink, or
@@ -505,7 +606,13 @@ wrappers and whether autostart is on — then, per machine: its state, host and
 guest resolver parity, the share set, **share parity** (a file written on the
 host really is visible to a container at the same path), the published-UDP
 datagram limit, and the guest clock. A healthy Mac with one machine reports
-23 checks.
+23 checks. A running machine that can be suspended adds up to three:
+`suspend <name>` (whether it can be, or why not, such as an older jm's
+hypervisor or too little free space), `sleeper <name>`, and `idle suspend <name>` (how long
+it has been idle, what holds it awake, or that automatic suspend was turned
+off after repeated failures). A suspended machine reports
+`suspended since <date> <time>, image <size> (wakes on first use; qemu, gvproxy)`;
+`jm doctor` never wakes it and skips its guest checks.
 
 Each row that is not `[ ok ]` carries a `fix:` line. See
 [INSTALL.md](INSTALL.md#verify-the-install) for a full sample report.
@@ -592,6 +699,11 @@ JM_AUTOSTART=0 jpodman ps
 
 Note that `podman version` (the subcommand, not the flag) *does* start the
 machine: it reports the engine's version, which is a fact about the machine.
+
+A **suspended** machine is woken regardless of `--no-autostart` and
+`JM_AUTOSTART`, with `waking jailmachine "<name>"...` on stderr: those govern
+stopped machines only. With autostart off, a machine that was stopped while
+the wrapper waited for the lock stays stopped.
 
 With several machines and none named `jailmachine`, `jpodman` cannot pick
 one; the error suggests `JM_MACHINE=<name> jpodman ...`, because this command
@@ -695,12 +807,15 @@ Cobra's generated shell completion script (`bash`, `zsh`, `fish`,
 `powershell`). `jm completion --help` explains how to install it for your
 shell.
 
-## `jm _forwarder`, `jm _resolver` (internal)
+## `jm _forwarder`, `jm _resolver`, `jm _sleeper`, `jm _wake` (internal)
 
-The hidden foreground entry points of the port-publishing loop and the host
-name resolver. `jm start` launches each detached and `jm stop` terminates
-them; there is no reason to run either by hand. They are documented here only
-so you recognise them in `ps` output and in `forwarder.log` / `resolver.log`.
+The hidden foreground entry points of the port-publishing loop, the host
+name resolver, the idle-suspend helper and a detached wake. `jm start`
+launches the first three detached and `jm stop` terminates them; the sleeper
+spawns `jm _wake <name>` when a connection arrives for a suspended machine.
+There is no reason to run any of them by hand. They are documented here only
+so you recognise them in `ps` output and in `forwarder.log`, `resolver.log`,
+`sleeper.log` and `wake.log`.
 
 ---
 
@@ -714,7 +829,7 @@ machine record.
 |---|---|---|
 | `JM_HOME` | all commands | State root, same as `--state-root`. The flag wins if both are given. Default `~/.jailmachine` |
 | `JM_MACHINE` | `jm podman` / `jpodman`, `jm docker` / `jdocker` | Which machine to talk to, instead of the default resolution |
-| `JM_AUTOSTART` | the client wrappers | `JM_AUTOSTART=0` (also `false`, `no`, `off`) makes `jpodman`/`jdocker` fail on a stopped machine instead of starting it |
+| `JM_AUTOSTART` | the client wrappers | `JM_AUTOSTART=0` (also `false`, `no`, `off`) makes `jpodman`/`jdocker` fail on a stopped machine instead of starting it. A suspended machine is woken regardless |
 | `JM_NO_AUTOSTART` | the client wrappers | The same switch spelt the other way round: `JM_NO_AUTOSTART=1` disables autostart |
 | `JM_PUBLISH_ADDR` | `jm start` | Host address published container ports bind to, folded into the machine record at start so `jm inspect` and `jm ports` show what the detached forwarder really binds. Same values as `--publish-addr` |
 | `DOCKER_DEFAULT_PLATFORM` | `jm docker` / `jdocker` | Defaulted to `linux/<arch>` by the wrapper; set it yourself (even to the empty string) to opt out and pull the engine's own OS |
@@ -726,6 +841,13 @@ machine record.
 | `JM_GVPROXY` | gvproxy provider | Path to the `gvproxy` binary, instead of `PATH` and then `/opt/homebrew/opt/podman/libexec/podman/gvproxy` |
 | `JM_MTU` | `jm start` (gvproxy provider) | Link size gvproxy and the guest agree on. Default **9000**, the virtio-net jumbo frame; clamped to **576–16384** (a value below 576 or that is not a number falls back to the default; one above 16384 clamps to 16384). It caps published UDP at the MTU less 28 bytes — 8972 by default, 1472 with `JM_MTU=1500`, which is Docker's link size. Read from the environment at every `jm start` and **not** stored in the machine record, so a machine uses whatever was set when it was last started; the guest picks it up over DHCP. See [Datagrams are capped at 8972 bytes](#datagrams-are-capped-at-8972-bytes) |
 | `JM_E2E` | `make e2e` | `JM_E2E=1` enables the end-to-end test; it is skipped otherwise |
+
+There is no variable for idle suspend: it is the machine's
+`--idle-suspend` setting. The sleeper and the `jm _wake` processes it
+spawns run with every `JM_*` variable removed except `JM_GVPROXY`, and a
+wake never reads `JM_MTU`, `JM_PUBLISH_ADDR`, `JM_QEMU_ACCEL` or
+`JM_9P_SECURITY`: it uses the record and the hypervisor command line the
+machine was saved with.
 
 Testing an unpublished guest image:
 
@@ -773,6 +895,15 @@ Everything jm creates at runtime lives under the state root
 | `resolver.addr` | The `127.0.0.1:<port>` the resolver listens on, which the guest's `local_unbound` forwards to |
 | `resolver.port` | The port the resolver reuses across restarts, so a rebooted guest resolves through the same address before `jm start` reaches it |
 | `guest/shares.tab` | The share table, exported to the guest read-only as the `jmconf` 9p share so it can mount the shares declaratively at boot |
+| `qemu.argv` | QEMU's exact command line at its last launch, as a JSON array; a wake reuses it |
+| `suspend.json` | The suspend journal: present while a suspend or wake is in flight, and while the machine is suspended |
+| `suspend.state` | The saved guest state of a suspended machine (sparse, up to the guest's memory); deleted after a wake. It contains the guest's RAM |
+| `qemu.resume-failed.log` | A copy of `qemu.log` kept when QEMU refused a saved state |
+| `sleeper.log`, `sleeper.pid` | The idle-suspend helper |
+| `sleeper.sock` | The sleeper's control socket |
+| `sleeper.json` | The sleeper's last report (mode, idle time, blockers, last error); `jm inspect` and `jm doctor` read it |
+| `activity` | An empty file whose mtime the wrappers, `jm ssh` and a wake bump, so the idle monitor sees short commands |
+| `wake.log` | Output of the `jm _wake` processes the sleeper spawns |
 
 > Long state-root paths can overflow the 103-byte unix socket path limit;
 > `jm doctor` has a `socket paths` check for exactly that and suggests a
@@ -1120,8 +1251,8 @@ jpodman ps            # "starting jailmachine "jailmachine"..." then podman's ou
 
 That is the whole mechanism. There is deliberately **no login agent and no
 `jm autostart` command**: `jm start` is one-shot and leaves qemu, gvproxy,
-the forwarder and the resolver detached, so a launchd `KeepAlive` agent would
-loop. Nothing starts a machine unless you, or a wrapper, ask.
+the forwarder, the resolver and the sleeper detached, so a launchd
+`KeepAlive` agent would loop. Nothing starts a machine unless you, or a wrapper, ask.
 
 | Opt out | Scope |
 |---|---|
@@ -1130,11 +1261,120 @@ loop. Nothing starts a machine unless you, or a wrapper, ask.
 | `JM_NO_AUTOSTART=1` | The same, spelt the other way round |
 
 With autostart off, a stopped machine is an error naming the `jm start` that
-would fix it. Concurrent wrappers are safe: the start waits on the
+would fix it. A **suspended** machine is woken whatever the opt-outs say,
+with `waking jailmachine "<name>"...` on stderr: a machine left running is
+running from your point of view, even while it sleeps. Concurrent wrappers are safe: the start waits on the
 per-machine lock rather than failing, so the second of two racing wrappers
 finds the machine running by the time it gets in.
 
 `jm inspect` shows `Autostart: on` or `off ($JM_AUTOSTART)`.
+
+---
+
+# Idle suspend
+
+A running machine that nobody uses for **30 minutes** is suspended to disk:
+its complete running state is saved to `suspend.state` in the machine
+directory, QEMU and gvproxy exit, and its memory goes back to macOS. The
+first command that needs the engine wakes it, with every process in the guest
+as it was. Measured on a 2048 MiB guest, the restore reached SSH in
+**4.06 s**; a cold boot is 12–25 s. The design is
+[ADR 0009](adr/0009-idle-suspend-and-wake-on-use.md), and the numbers and
+limits are in [LIMITATIONS](LIMITATIONS.md#idle-suspend).
+
+```bash
+jm set --idle-suspend 2h     # 30m, 2h, 45 (minutes); 0, off or never turns it off
+jm suspend                   # now, without waiting
+jm list                      # STATE suspended
+jpodman ps                   # "waking jailmachine "jailmachine"..." then podman's output
+```
+
+## The setting
+
+`--idle-suspend` is a machine setting (`idle_suspend_min` in the record),
+given at `jm init` and changed with `jm set` in any state, taking effect at
+once. It is not an environment variable. Machines created before it existed
+get 30 minutes. `jm image build` turns it off for its build machine.
+
+A machine whose QEMU was started by an older jm cannot be suspended until it
+is restarted once (`jm stop && jm start`): that QEMU was daemonized, and
+saving it would abort it. `jm inspect` and `jm doctor` say so.
+
+## What keeps a machine awake
+
+The machine's sleeper samples it every 15 seconds. A sample is idle only when
+every signal is:
+
+| Signal | Keeps it awake when |
+|---|---|
+| Containers and jails | Any is running, in any sample. Automatic suspend never freezes a workload |
+| Engine clients | A podman or docker client holds a connection to the engine (`logs -f`, `events`, attach, a pull or build) in two samples in a row. jm's own forwarder does not count |
+| Command sessions | A `jm ssh` shell, a `jm ssh -- cmd` still running, `scp`, in two samples in a row |
+| `/var/run/jm-nosleep` in the guest | It exists |
+| jm commands on the host | A wrapper or `jm ssh` ran since the last sample, however short |
+| Guest CPU | QEMU used more than 25 % of one core since the last sample |
+
+Each quiet sample adds at most 30 s of idle time, so a Mac that slept with
+its lid closed does not count down. A machine woken within 10 minutes of its
+suspend waits twice as long before the next one (up to 8×), reset by a
+suspension of an hour or more. Three failed automatic attempts in a row turn
+automatic suspend off until the sleeper restarts. Just before the freeze, jm
+checks again under the lock and inside the guest; a share in use there, or a
+client arriving, cancels the suspend and leaves everything running.
+
+To keep a machine awake for a job with no session, container or CPU load:
+
+```bash
+jm ssh -- touch /var/run/jm-nosleep   # until removed, or until the guest reboots
+jm ssh -- rm /var/run/jm-nosleep
+```
+
+`jm inspect` shows the idle time or what holds the machine awake on its
+`Idle suspend:` row, and the `idle_*` keys in `--json`.
+
+## What wakes a suspended machine
+
+| Client | Wakes it? |
+|---|---|
+| `jpodman`, `jdocker`, `jm podman`, `jm docker` | Yes, before running the client, whatever `JM_AUTOSTART` says |
+| `jm start`, `jm ssh` | Yes |
+| A client of `podman.sock`: `DOCKER_HOST` from `jm env`, `podman --connection <name>-sock`, an IDE's Docker extension | Yes, while the sleeper runs: the connection is held, the machine wakes, and the connection is relayed a few seconds later |
+| A client of the SSH port: `podman --connection <name>`, `ssh -p <port> root@127.0.0.1` | Yes, while the sleeper runs. A new connection started *during* a wake can be reset; retry |
+| A published container port | **No**: connection refused until something else wakes the machine |
+| `jm list`, `inspect`, `env`, `ports`, `console`, `doctor`, `version` | Never |
+
+After a Mac restart, or if the sleeper was killed, only jm commands wake the
+machine; `jm doctor` warns about it. A client whose own timeout is shorter
+than the wake can fail once; the wrappers avoid that by waking first.
+
+## Stopping, removing and changing a suspended machine
+
+| Command | On a suspended machine |
+|---|---|
+| `jm stop` | Restores the guest, then shuts it down cleanly |
+| `jm stop --force`, `jm rm` | Discard the saved state without restoring it |
+| `jm set --cpus`, `--memory`, `--ssh-port`, `--mount`, `--unmount`, `--no-mounts`, `--disk` | Refused: the machine keeps the hardware it was saved with |
+| `jm set --arc`, `--publish-addr`, `--idle-suspend` | Recorded; `--arc` is applied when it wakes |
+
+If a wake fails for a transient reason (a busy port, a timeout, QEMU missing),
+the saved state is kept, the machine stays suspended, and the error says
+`could not wake <name> (…)`. If the saved state cannot be restored at all, after
+a QEMU or macOS update or a change to the disk or record, jm discards it
+and boots from disk in the same command, printing
+`could not restore the suspended state of <name> (…); booting from disk: processes in the guest were not preserved, the disk is intact as of <time>`.
+`jm stop` before upgrading QEMU avoids that.
+
+## Shares, clock and ports across a suspend
+
+- **Shares** are unmounted in the guest, without force, just before the
+  freeze, and mounted again after the wake before any client is served.
+  Files the Mac changed meanwhile are seen (measured). A shared directory
+  that a guest process is using refuses the suspend.
+- **The clock** is stepped to the Mac's time as the guest resumes.
+- **Published ports** go away with gvproxy and come back when the forwarder
+  resyncs after the wake; `forwards.json` is kept meanwhile.
+- **The DNS search list** is pushed again at wake, so a VPN joined while the
+  machine slept applies.
 
 ---
 
@@ -1888,6 +2128,7 @@ and podman machine, in numbers, is [docs/COMPARISON.md](COMPARISON.md).
 |---|---|
 | Resolving another container by its name | `nc: bad address 'redis'`. The guest's podman runs the CNI backend, `netavark` is not packaged for FreeBSD and neither is the CNI `dnsname` plugin, so `podman network inspect podman` reports `dns_enabled: false`. Use a Pod (`localhost`), `network_mode: "service:<name>"`, or `--add-host`/`extra_hosts`. Published ports are unaffected. See [Containers cannot resolve each other by name](#containers-cannot-resolve-each-other-by-name) and [#5](https://github.com/gabrielbelli/jailmachine/issues/5) |
 | busybox `nc -u -l` in a Linux container | Fails with `Address family not supported by protocol`. It is the only known casualty of FreeBSD returning at once from a zero-length `recvmsg()` where Linux blocks. UDP itself works — `apk add netcat-openbsd`, `socat`, or any real UDP server. See [UDP from a container](#udp-from-a-container) |
+| Published ports on a suspended machine | They refuse connections until a jm command or an engine client wakes the machine. Automatic suspend never happens with containers running, so this follows only `jm suspend --force`. See [Idle suspend](#idle-suspend) |
 | UDP datagrams over 8972 bytes | Dropped in silence: the gvproxy link does not fragment, and its MTU is 9000 by default. `jm doctor` states the limit per machine, and `JM_MTU` at `jm start` moves it (576–16384; `JM_MTU=1500` is Docker's link size and its 1472-byte cap). Keep datagrams under the limit, or use TCP. See [Datagrams are capped at 8972 bytes](#datagrams-are-capped-at-8972-bytes) |
 
 **Not planned for the MVP:**

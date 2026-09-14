@@ -2,7 +2,8 @@
 
 - Status: accepted (2026-08-20), amended twice (2026-08-21) — see
   [the guest side of a host-bound publish](#amendment-2026-08-21-the-guest-side-of-a-host-bound-publish)
-  and [the default link size](#amendment-2026-08-21-the-default-link-size-is-the-jumbo-frame)
+  and [the default link size](#amendment-2026-08-21-the-default-link-size-is-the-jumbo-frame);
+  addendum (2026-09-14) on [the provider across a suspend](#addendum-2026-09-14-the-provider-across-a-suspend)
 
 ## Context
 
@@ -114,3 +115,21 @@ size. `jm doctor` names the knob alongside the limit it reports.
 This does not make the link fragment. There is still a hard ceiling and still
 no error when a datagram exceeds it — the wall is simply six times further
 out, and now movable.
+
+## Addendum (2026-09-14): the provider across a suspend
+
+A suspended machine (**ADR 0009**) has no provider running. The provider is
+**restarted, not preserved**, across a suspend: its dynamic mapping table is
+rebuilt by the forwarder's startup resync, exactly as after a crash, and the
+link size recorded at the machine's cold start is reused, because the restored
+guest keeps the size it negotiated then.
+
+Two provider operations are added for this. **Park** stops the provider without
+removing a host engine socket that someone else is serving. **Stopping the API
+forward** ends the helper that serves that socket while leaving the path in
+place. Together they let jm's supervisor hold the host engine socket while the
+provider is down, and hand it back without any moment where the path is
+missing: a client dialling the socket during a suspend or a resume finds either
+the supervisor or the engine, never nothing. The forwarder is stopped before a
+suspend, because its event stream would count as a client and it would wake the
+machine.

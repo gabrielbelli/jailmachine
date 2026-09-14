@@ -61,7 +61,10 @@ is; jm never repoints a default you already had (`jm start --set-default` opts
 in, and on a Mac with no podman connections at all, podman itself promotes the
 first one jm registers). **Both wrappers start a stopped machine for you**,
 printing one line on stderr while it boots — `JM_AUTOSTART=0`, or
-`--no-autostart` as the first argument, makes them fail instead.
+`--no-autostart` as the first argument, makes them fail instead. A machine
+left idle for 30 minutes is **suspended to disk** and gives its memory back
+to macOS; the wrappers wake it again in seconds, whatever `JM_AUTOSTART`
+says.
 
 The guest is FreeBSD, so **Linux images need `--os=linux`** with podman:
 
@@ -296,16 +299,17 @@ Every flag and environment variable is in [docs/USAGE.md](docs/USAGE.md).
 
 | Command | Does |
 |---|---|
-| `jm init [name]` | Create a machine: SSH key, image download and SHA256 check, grow disk, NoCloud seed. `--cpus`, `--memory` (2048 MiB by default), `--arc` (the guest's ZFS cache cap, 512 MiB by default), `--disk`, `--image`, `--ssh-port`, `--mount`, `--no-mounts`, `--publish-addr` |
-| `jm start [name]` | Boot, provision on first boot, connect podman, mount the shares, start the port forwarder and the host resolver; idempotent |
-| `jm stop [name]` | Stop the forwarder and resolver, ask the guest to power off, then the hypervisor and the network provider |
+| `jm init [name]` | Create a machine: SSH key, image download and SHA256 check, grow disk, NoCloud seed. `--cpus`, `--memory` (2048 MiB by default), `--arc` (the guest's ZFS cache cap, 512 MiB by default), `--idle-suspend` (30 min by default, `0` never), `--disk`, `--image`, `--ssh-port`, `--mount`, `--no-mounts`, `--publish-addr` |
+| `jm start [name]` | Boot, provision on first boot, connect podman, mount the shares, start the port forwarder, the host resolver and the sleeper; wakes a suspended machine instead of booting it; idempotent |
+| `jm stop [name]` | Stop the sleeper, forwarder and resolver, ask the guest to power off, then the hypervisor and the network provider. A suspended machine is restored first; `--force` discards its saved state |
+| `jm suspend [name]` | Save a running machine to disk now and give its memory back; the first use wakes it. Refuses while containers, jails, engine clients or sessions are active unless `--force`, and always while a shared directory is in use |
 | `jm ssh [name] [-- cmd]` | Root shell, or a command, in the guest |
-| `jm podman` / `jpodman` | Run the host podman against the machine, whatever your default connection is; starts it if stopped |
-| `jm docker` / `jdocker` | Run the host docker CLI (and compose) against the machine's engine, leaving your docker contexts alone; starts it if stopped |
+| `jm podman` / `jpodman` | Run the host podman against the machine, whatever your default connection is; starts it if stopped, wakes it if suspended |
+| `jm docker` / `jdocker` | Run the host docker CLI (and compose) against the machine's engine, leaving your docker contexts alone; starts it if stopped, wakes it if suspended |
 | `jm env [name]` | Shell exports (`CONTAINER_HOST`, `DOCKER_HOST`) for podman and docker clients |
 | `jm ports [name]` | Published container ports, where they bind, and the error per mapping |
-| `jm list` / `jm inspect` | Machines and their computed state, shares and publish address (`--json` on both) |
-| `jm set [name]` | Change `--cpus`, `--memory`, `--ssh-port`, `--disk` (grows only, live if running), `--mount`/`--unmount`/`--no-mounts`, `--publish-addr`, `--arc` (live if running) |
+| `jm list` / `jm inspect` | Machines and their computed state (`running`, `stopped`, `suspended` or `broken`), shares, publish address and what keeps an idle machine awake (`--json` on both) |
+| `jm set [name]` | Change `--cpus`, `--memory`, `--ssh-port`, `--disk` (grows only, live if running), `--mount`/`--unmount`/`--no-mounts`, `--publish-addr`, `--arc` (live if running), `--idle-suspend` (any state, applies at once) |
 | `jm console [name]` | Guest serial console log (`-f` to follow) |
 | `jm rm [name]` | Remove the machine, its directory and its podman connections |
 | `jm doctor` | Check qemu, HVF, EDK2 firmware, gvproxy, podman, ssh, the state root, share parity, resolver parity and every machine |
@@ -373,7 +377,8 @@ The full matrix, both workarounds, and the script that produced it
 | Host directory sharing | Works — host paths appear in the guest at the **same absolute path** over 9p; defaults are your home tree, `/Volumes`, `/private/tmp` and `$TMPDIR`'s root. Slow (~70 MB/s), `utimes` is a no-op, an `inotify` watch cannot be created on a share at all, and guest ownership and modes live in host xattrs |
 | Container DNS matching the host | Works for **external** names — the host's own resolver answers for the guest, so VPN, split-horizon, `/etc/hosts` and `.local` names all match, and the Mac is `host.docker.internal` |
 | Resolving another **container** by its name | **No.** The guest's podman uses the CNI backend and `netavark` is not packaged for FreeBSD, so the `podman` network has `dns_enabled: false` and `nc: bad address 'redis'` is what you get. Use a Pod (`localhost`), `network_mode: "service:<name>"`, or `--add-host`/`extra_hosts` ([#5](https://github.com/gabrielbelli/jailmachine/issues/5)) |
-| Autostart | Works on demand: `jpodman` and `jdocker` start a stopped machine. There is deliberately **no** login agent — `JM_AUTOSTART=0` opts out |
+| Autostart | Works on demand: `jpodman` and `jdocker` start a stopped machine. There is deliberately **no** login agent — `JM_AUTOSTART=0` opts out. A **suspended** machine is woken regardless: by the wrappers, `jm start` and `jm ssh`, and by a client of `podman.sock` or the SSH port while its sleeper runs |
+| Idle memory | Works — a machine idle for 30 minutes (`--idle-suspend`) with no containers or jails is suspended to disk and its memory goes back to macOS; the restore measured 4.06 s to SSH on a 2048 MiB guest. Published ports do not wake it, and after a Mac restart only jm commands do. See [idle suspend](docs/LIMITATIONS.md#idle-suspend) |
 | `docker.io/nginx` (Linux) | Works with **one config line**: `accept_mutex on;` in the `events` block. Stock nginx registers its listening socket with `EPOLLEXCLUSIVE` when `worker_processes > 1`, which FreeBSD's `linux_epoll` rejects. A ready-made image is in [demo/](demo/README.md#the-nginx-finding) |
 | Publishing ports (`-p 8080:80`) | Works — reconciled onto the host by the forwarder, binding every interface by default (`--publish-addr` to change the default) |
 | `-p 127.0.0.1:8080:80`, `-p [::1]:…`, ranges, `/udp` | Works — a host address in the flag binds that address **on the Mac** and nothing else, as under Docker Desktop. `-p localhost:…` is rejected by podman itself |
@@ -399,6 +404,7 @@ The full matrix, both workarounds, and the script that produced it
 | `nc -u -l` in a Linux container says `Address family not supported` | Only busybox's UDP listener is affected — `apk add netcat-openbsd`, or use `socat`. UDP itself works |
 | UDP datagrams over 8972 bytes never arrive | The gvproxy link does not fragment, so its MTU (9000 by default) is a hard ceiling; `jm doctor` states the limit per machine, and `JM_MTU` at `jm start` changes it (576–16384) |
 | Stale state after a crash or reboot | `jm stop` repairs "broken" (pid file without process); `jm rm && jm init` is always a clean slate |
+| A machine never suspends, or a client did not wake it | `jm inspect` lists `Idle suspend: held awake by: …`; `sleeper.log` and `wake.log` say what the sleeper and the wake did |
 
 Host-side logs, all under `~/.jailmachine/machines/<name>/`:
 
@@ -409,6 +415,8 @@ Host-side logs, all under `~/.jailmachine/machines/<name>/`:
 | `gvproxy.log` | network provider |
 | `forwarder.log` | port-publishing loop |
 | `resolver.log` | host DNS resolver (name-resolution parity) |
+| `sleeper.log` | the helper that suspends an idle machine and holds its endpoints while it is suspended |
+| `wake.log` | wakes started by a connection to a suspended machine |
 
 More symptoms and fixes in
 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
