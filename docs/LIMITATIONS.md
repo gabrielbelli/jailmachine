@@ -44,6 +44,7 @@ be enough.
 | Balloon experiment | a 2048 MiB guest, FreeBSD 15.1 arm64, `virtio-balloon` | same Mac, QEMU 11.1.1 + HVF | 2026-09-13 |
 | Pause, `-daemonize`, suspend to disk and restore | a 2048 MiB guest, FreeBSD 15.1-RELEASE-p2 arm64, QEMU file migration (`mapped-ram`, `multifd`) | same Mac, QEMU 11.1.1 + HVF | 2026-09-13 |
 | 9p remount after a restore, idle-probe `ps` syntax, detached launches | a restored FreeBSD 15.1 guest; a cloned machine booted by the new binary | same Mac | 2026-09-14 |
+| Suspend and wake end to end | a clone of the author's machine (4 vCPU / 4096 MiB, one 9p share), `jm` built from `6a06a39` | same Mac, QEMU 11.1.1 + HVF | 2026-09-14 |
 
 Two caveats that apply to every number below. The benchmark Mac was **loaded
 throughout** — Docker Desktop with 15 containers, two or three VMs — so
@@ -415,8 +416,8 @@ at starting and at sharing files.
 
 > **The short version.** A machine idle for 30 minutes is saved to its
 > directory and its memory goes back to macOS; the first command wakes it.
-> The restore itself is fast: SSH answered **4.06 s** after launch on a
-> 2048 MiB guest. But several clients cannot wake a machine, and a few
+> The wake itself is fast: on a 4096 MiB machine the first engine answer
+> came **0.69–0.77 s** after the request (2026-09-14). But several clients cannot wake a machine, and a few
 > situations keep one awake. `jm set --idle-suspend 0` turns all of it off.
 
 What was measured, on the sessions dated in
@@ -435,14 +436,19 @@ What was measured, on the sessions dated in
 | 9p after a restore (2026-09-14) | The restored guest remounted its share with `mount -t p9fs`, read the file written before the suspend and the one the host wrote while it was suspended, and a guest write appeared on the host |
 | The idle probe's `ps` (2026-09-14) | FreeBSD `ps -o pid=,ppid=,comm=` prints only the pid: everything after `=` is the header, commas included, so each keyword needs its own `-o`. `comm` is `sshd-session` for every session process; a pty and a non-pty command are both its children; a tunnel's session has none |
 | Detached launches (2026-09-14) | A cloned machine booted by the new binary: every helper reparented to pid 1, the ARC cap and `MaxAuthTries` applied, `jm stop` clean |
+| `jm suspend`, 4096 MiB machine (2026-09-14) | **5.6–6.5 s** over three runs; QEMU, gvproxy, the forward, forwarder and resolver all exit, the sleeper holds `podman.sock`; image **4.4 GB** logical, **615–640 MiB** allocated |
+| Wake, timed from the client's request (2026-09-14) | Engine socket `_ping` with no wrapper **0.69 s**; `jpodman ps` **0.77 s**; `podman --connection <name> ps` over ssh:// **10.87 s** |
+| State after the wake (2026-09-14) | A `/tmp` marker written before the first suspend was intact; the 9p share was remounted and readable; the guest clock was within 1 s of the host |
+| Idle timer (2026-09-14) | `--idle-suspend 5` on an idle machine: suspended after **312 s** |
+| `jm stop` on a suspended machine (2026-09-14) | **11.9 s** (restore, then a clean guest power-off); no process left |
 
 | Limitation | What you see | Whose | Workaround | Tracking |
 |---|---|---|---|---|
-| First use after idle is slower | The first command against a suspended machine waits for the restore. About **5 s** to the first engine answer on a 2048 MiB guest is an **estimate**: the measured 4.06 s to SSH plus starting the network and reconnecting the engine socket. A 4096 MiB guest or a loaded Mac is slower, **not yet measured**. A saved state that cannot be restored becomes a cold boot: 12–25 s on a quiet Mac, 36.7 s on a loaded one | **ours** | `jm set --idle-suspend 0`, or `jm start` before the first command | — |
+| First use after idle is slower | The first command against a suspended machine waits for the restore. On a 4096 MiB machine with about 615 MiB of saved state, the first engine answer came **0.69 s** after the request through the engine socket and **0.77 s** through `jpodman` (2026-09-14). A guest with more memory in use, or a Mac under memory pressure, is slower and **not yet measured**. A saved state that cannot be restored becomes a cold boot: 12–25 s on a quiet Mac, 36.7 s on a loaded one | **ours** | `jm set --idle-suspend 0`, or `jm start` before the first command | — |
 | Published ports do not wake a suspended machine | Connection refused until a jm command, or a client of the engine socket or the SSH port, wakes it. Automatic suspend never happens with a container or jail running, so this only follows `jm suspend --force` | **ours** | Keep the machine awake, or run `jpodman ps` first | — |
 | After a Mac restart, or with the sleeper dead, only jm commands wake a suspended machine | `DOCKER_HOST` clients, VS Code and `podman --connection <name>` get connection refused; `jm doctor` warns on the `sleeper` row | **ours**, with no login agent by design | `jm start`, or any `jpodman`/`jdocker` command | — |
 | Clients with short timeouts | A client whose own connect or first-response timeout is shorter than the wake, such as the docker CLI's initial ping or an ssh `ConnectTimeout` of a few seconds, can fail once against a suspended machine. **Inferred** from the wake time, not yet reproduced | **upstream tooling** | `jpodman` and `jdocker` wake the machine before they run the client; otherwise retry | — |
-| New ssh:// connections during a wake | A `podman --connection <name>` or `ssh -p <port>` *started* while a wake is under way can be reset, because the network provider owns the SSH port for a few seconds before the guest runs. The window is an **estimate** of about 3.5 s. Connections that arrived before the wake started are held and served | **ours** | Retry | Follow-up: publish the SSH port only once the guest runs |
+| New ssh:// connections during a wake | A `podman --connection <name>` or `ssh -p <port>` *started* while a wake is under way can be reset, because the network provider owns the SSH port for a few seconds before the guest runs. The window is an **estimate** of about 3.5 s. Connections that arrived before the wake started are held and served: `podman --connection <name> ps` against a suspended machine succeeded, in **10.87 s** against 0.77 s for `jpodman` (2026-09-14) | **ours** | Retry | Follow-up: publish the SSH port only once the guest runs |
 | Short engine calls that bypass the wrappers are not seen | A machine used only through `DOCKER_HOST` or the `<name>-sock` connection, with calls that do not span two 15 s samples in a row (up to about 30 s), can be suspended between them, and each call then waits for a wake | **ours** | Use the wrappers, which mark every call as activity, or raise `--idle-suspend` | A wake within 10 minutes of the suspend doubles the idle period, up to 8× |
 | Suspend needs free disk | The saved state takes up to the guest's memory on the state-root volume. jm requires the memory plus 2 GiB free; otherwise the machine stays awake and `jm inspect` shows `idle_unavailable` | **ours**, and **Apple/macOS** for a full volume | Free space, or a smaller `--memory` | — |
 | A busy shared folder blocks sleep | A guest process with a file open or its working directory in a share keeps the machine awake: QEMU will not save a guest with a 9p share mounted, and jm never force-unmounts. `jm suspend` prints `a shared directory is in use in the guest: <path>`; `jm inspect` lists `share <path> in use` | **upstream tooling** (QEMU) | Leave the directory | — |
@@ -557,7 +563,7 @@ or upstream — that would remove the limitation, in rough order of value.
 | ~47 GiB written for 3.17 GiB of content, and the slow `init` that follows from it | Fix hole-punching in `internal/image/sparse.go`, then re-measure the free-space delta and the `init` time. Both numbers should collapse together, and the README's timing claim becomes true again | **Us** — the highest-value bug on this page |
 | The idle footprint growing towards the guest's memory size | Re-measure a capped machine after days idle to confirm the ARC cap bounds it. Suspend (ADR 0009) returns it entirely while asleep; returning memory from a machine that is *running* needs a balloon or free-page-reporting path that releases pages instead of compressing them, which QEMU on macOS does not have today | **Us** (the measurement), then upstream QEMU |
 | Slow warm start | Profile the guest boot. Idle suspend avoids it for a machine that was left running; a stopped machine, or a saved state that cannot be restored, still boots cold | **Us**, then upstream QEMU/FreeBSD |
-| Unmeasured wake of a larger guest, and an uncalibrated idle CPU threshold | Measure wake time and footprint of a 4096 MiB guest under memory pressure; calibrate the idle CPU threshold (25 % of one core today) from an hour of samples of an idle guest | **Us** |
+| Unmeasured wake under memory pressure, a slow ssh:// wake, and an uncalibrated idle CPU threshold | A 4096 MiB machine wakes in under a second on this Mac (2026-09-14); measure it with most of its memory in use and the Mac swapping; find where the 10.87 s of an ssh:// client's wake goes; calibrate the idle CPU threshold (25 % of one core today) from an hour of samples of an idle guest | **Us** |
 | Other host platforms | A Linux backend (QEMU + KVM, same argv) and a Windows one (Hyper-V) behind ADR 0002's backend interface | **Us**, post-MVP |
 
 ---
