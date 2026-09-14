@@ -95,6 +95,9 @@ func machineChecks(ctx context.Context) []doctor.Result {
 			if res, ok := suspendReadinessCheck(m); ok {
 				out = append(out, res)
 			}
+			if res, ok := sleeperCheck(m); ok {
+				out = append(out, res)
+			}
 		}
 	}
 	return out
@@ -224,6 +227,41 @@ func suspendReadinessCheck(m *machine.Machine) (doctor.Result, bool) {
 		return res, true
 	}
 	res.Status, res.Detail = doctor.OK, "can be suspended ('jm suspend "+m.Name+"')"
+	return res, true
+}
+
+// sleeperCheck reports on the helper that holds a suspended machine's
+// endpoints and runs a suspend (ADR 0009), for a running or suspended machine
+// whose components can suspend. It reads the pid file and the process table
+// only; it never asks the sleeper and never wakes the machine.
+func sleeperCheck(m *machine.Machine) (doctor.Result, bool) {
+	res := doctor.Result{Name: "sleeper " + m.Name}
+	b, p, err := components(m)
+	if err != nil || m.Dir == "" || !sleeperSupported(b, p) {
+		return res, false
+	}
+	st, err := stateOf(m, b, p)
+	if err != nil {
+		return res, false
+	}
+	pr := sleeperProcess(m)
+	_, alive := pr.Alive()
+	switch {
+	case st == backend.Suspended && alive:
+		res.Status, res.Detail = doctor.OK, "holding the engine socket and the SSH port; a connection there wakes the machine"
+	case st == backend.Suspended:
+		res.Status = doctor.Warn
+		res.Detail = "not running: jpodman, jdocker, 'jm start' and 'jm ssh' still wake the machine, but clients of the engine socket or the SSH port are refused"
+		res.Fix = "jm start " + m.Name
+	case ready(m, st) && alive:
+		res.Status, res.Detail = doctor.OK, "running (log: "+pr.LogPath()+")"
+	case ready(m, st):
+		res.Status = doctor.Warn
+		res.Detail = "not running: 'jm suspend' starts it, and a suspended machine's endpoints would not wake it"
+		res.Fix = "jm start " + m.Name
+	default:
+		return res, false
+	}
 	return res, true
 }
 

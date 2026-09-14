@@ -45,7 +45,7 @@ func newStartCmd() *cobra.Command {
 		Use:   "start [name]",
 		Short: "Boot a machine and connect podman to it",
 		Long: "Boot a machine in stages: network provider, hypervisor, SSH, first-boot\n" +
-			"provisioning, podman connection, port forwarder. Starting a running machine\n" +
+			"provisioning, podman connection, port forwarder, sleeper. Starting a running machine\n" +
 			"re-checks the ssh, provision, dns, connect and forwarder stages (so an interrupted start can be\n" +
 			"finished); a broken one (half of it running) is stopped and started again.\n\n" +
 			"On failure the error names the stage and the log to read: qemu.log and\n" +
@@ -65,7 +65,7 @@ func newStartCmd() *cobra.Command {
 }
 
 func runStart(ctx context.Context, args []string) error {
-	return startMachine(ctx, args, startOpts{})
+	return startMachine(ctx, args, startOpts{wakeBy: "jm start"})
 }
 
 // startOpts vary "jm start" for autostart (see autostart.go).
@@ -88,6 +88,9 @@ type startOpts struct {
 	// autostart off): the state they saw unlocked may be gone by the time
 	// the lock is theirs, and a machine stopped meanwhile stays stopped.
 	wakeOnly bool
+	// wakeBy names the caller in the sleeper's status when this start wakes
+	// a suspended machine.
+	wakeBy string
 }
 
 // startMachine is "jm start", with the variations autostart needs.
@@ -141,7 +144,7 @@ func startMachine(ctx context.Context, args []string, opts startOpts) error {
 		return withHint(fmt.Errorf("%s was stopped before it could be woken", m.Name), "run 'jm start"+nameHint(m.Name)+"'")
 	}
 	if st == backend.Suspended {
-		resumed, err := wakeMachine(ctx, m, b, p, wakeOpts{FromHelper: opts.fromHelper})
+		resumed, err := wakeMachine(ctx, m, b, p, wakeOpts{FromHelper: opts.fromHelper, By: opts.wakeBy})
 		if err != nil {
 			return err
 		}
@@ -307,6 +310,13 @@ func startMachine(ctx context.Context, args []string, opts startOpts) error {
 	// containers (ADR 0004); detached, so it outlives this command.
 	if err := startForwarder(m, p, ep); err != nil {
 		return err
+	}
+
+	// Stage: sleeper. It runs a suspend and holds the machine's endpoints
+	// while it is suspended (ADR 0009); detached, and started only if it is
+	// not alive. The machine is usable without it, so a failure is a warning.
+	if err := startSleeper(ctx, m, b, p); err != nil {
+		fmt.Fprintf(stderr, "jm: warning: %v; 'jm start%s' retries it\n", err, nameHint(m.Name))
 	}
 	logf(stdout, "ready: try 'jpodman run --rm --os=linux docker.io/alpine echo hi'")
 	return nil

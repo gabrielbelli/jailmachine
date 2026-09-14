@@ -9,6 +9,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -18,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -202,7 +204,7 @@ func startFakeGuest(t *testing.T, root, name string, reply func(string) guestRep
 	}()
 	fakeNet.endpoint = &netprov.Endpoint{
 		SSHHost: "127.0.0.1", SSHPort: ln.Addr().(*net.TCPAddr).Port,
-		APISocket: filepath.Join(root, "podman-"+name+".sock"),
+		APISocket: filepath.Join(shortSocketDir(t), "podman-"+name+".sock"),
 	}
 	return func() []string {
 		mu.Lock()
@@ -442,6 +444,7 @@ func seedRunningForSuspend(t *testing.T, root, name string) *machine.Machine {
 	seedFakeRecord(t, root, name)
 	fakeBE.state, fakeNet.state = backend.Running, backend.Running
 	plentyOfSpace(t)
+	inProcessSleeper(t)
 	return mustLoad(t, root, name)
 }
 
@@ -450,8 +453,32 @@ func TestSuspendRollbackOnBusyShare(t *testing.T) {
 	root := t.TempDir()
 	m := seedRunningForSuspend(t, root, "sl")
 	startFakeGuest(t, root, "sl", suspendGuest(nil, &guestReply{"quiesce", "busy /Users/me/src\n", quiesceBusy}, nil))
+	// The engine socket forward serves podman.sock while the suspend starts.
+	forward, err := net.Listen("unix", fakeNet.endpoint.APISocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forward.Close()
+	go func() {
+		for {
+			c, err := forward.Accept()
+			if err != nil {
+				return
+			}
+			_, _ = c.Write([]byte("forward"))
+			c.Close()
+		}
+	}()
+	inode := func(path string) uint64 {
+		st, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return st.Sys().(*syscall.Stat_t).Ino
+	}
+	forwardIno := inode(fakeNet.endpoint.APISocket)
 
-	_, err := run(t, root, "suspend", "sl")
+	_, err = run(t, root, "suspend", "sl")
 	if err == nil || !strings.Contains(err.Error(), "shared directory is in use") || !strings.Contains(err.Error(), "/Users/me/src") {
 		t.Fatalf("suspend = %v", err)
 	}
@@ -462,7 +489,9 @@ func TestSuspendRollbackOnBusyShare(t *testing.T) {
 	if slices.Contains(events, "commit") {
 		t.Errorf("the guest must never be frozen: %v", events)
 	}
-	if !inOrder(events, "prepare", "api-unforward", "ssh:quiesce", "ssh:remount", "cancel", "api-forward") {
+	// The forward is stopped only after the quiesce (S8); the stand-in holds
+	// the socket from before it (S6).
+	if slices.Contains(events, "api-unforward") || !inOrder(events, "prepare", "ssh:quiesce", "ssh:remount", "cancel", "api-forward") {
 		t.Errorf("rollback order = %v", events)
 	}
 	if _, err := os.Stat(fakeJournal(m)); !os.IsNotExist(err) {
@@ -470,6 +499,48 @@ func TestSuspendRollbackOnBusyShare(t *testing.T) {
 	}
 	if fakeBE.state != backend.Running {
 		t.Errorf("state = %s", fakeBE.state)
+	}
+	// A rollback before S8 gives the running forward its socket back rather
+	// than cutting the clients streaming through it.
+	if got := inode(fakeNet.endpoint.APISocket); got != forwardIno {
+		t.Error("the rollback did not put the forward's socket back")
+	}
+	c, err := net.Dial("unix", fakeNet.endpoint.APISocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if got, _ := io.ReadAll(c); string(got) != "forward" {
+		t.Errorf("podman.sock after the rollback answered %q", got)
+	}
+	if _, err := os.Lstat(filepath.Dir(fakeNet.endpoint.APISocket)); err != nil {
+		t.Fatal(err)
+	}
+	if entries, _ := os.ReadDir(filepath.Dir(fakeNet.endpoint.APISocket)); len(entries) != 1 {
+		t.Errorf("litter beside podman.sock: %v", entries)
+	}
+}
+
+// A wrapper that finds the journal saving sends abort. One that arrives
+// before the stand-in holds the engine socket still cancels the suspend, and
+// before the guest is quiesced.
+func TestSuspendAbortBeforeStandinCancels(t *testing.T) {
+	resetFakes(t)
+	root := t.TempDir()
+	m := seedRunningForSuspend(t, root, "sl")
+	startFakeGuest(t, root, "sl", defaultGuest)
+	fakeBE.onPrepare = func(pm *machine.Machine) { abortSuspendInFlight(context.Background(), pm) }
+
+	_, err := run(t, root, "suspend", "sl")
+	if err == nil || !strings.Contains(err.Error(), "cancelled") {
+		t.Fatalf("suspend = %v", err)
+	}
+	events := takeFakeEvents()
+	if slices.Contains(events, "commit") || slices.Contains(events, "ssh:quiesce") || !inOrder(events, "prepare", "cancel", "api-forward") {
+		t.Errorf("events = %v", events)
+	}
+	if _, err := os.Stat(fakeJournal(m)); !os.IsNotExist(err) {
+		t.Errorf("journal survived the abort: %v", err)
 	}
 }
 
@@ -515,7 +586,7 @@ func TestSuspendForceAndSuccess(t *testing.T) {
 		t.Fatalf("suspend --force: %v\n%s", err, out)
 	}
 	events := takeFakeEvents()
-	if !inOrder(events, "prepare", "api-unforward", "ssh:quiesce", "commit", "park") {
+	if !inOrder(events, "prepare", "ssh:quiesce", "api-unforward", "commit", "park") {
 		t.Errorf("events = %v", events)
 	}
 	if len(quiesced) != 1 || !strings.Contains(quiesced[0], "JM_FORCE=1") {
@@ -848,6 +919,13 @@ func TestEnsureRunningNotReadyWithJournal(t *testing.T) {
 	errOut := captureStderr(t)
 	woke := stubWake(t, nil)
 	ctx := context.Background()
+	var sent []string
+	oldReq := sleeperRequest
+	sleeperRequest = func(_ context.Context, _ *machine.Machine, line string) (string, error) {
+		sent = append(sent, line)
+		return "ok", nil
+	}
+	t.Cleanup(func() { sleeperRequest = oldReq })
 
 	// Running with an answering socket and no journal: ready.
 	fakeBE.state, fakeNet.state = backend.Running, backend.Running
@@ -861,6 +939,9 @@ func TestEnsureRunningNotReadyWithJournal(t *testing.T) {
 	if err := ensureRunning(ctx, "sl", false); err != nil || *woke != 1 {
 		t.Errorf("running with a journal: %v, wakes %d", err, *woke)
 	}
+	if !slices.Equal(sent, []string{"abort"}) {
+		t.Errorf("a saving journal must send the sleeper an abort: %q", sent)
+	}
 	// Suspended wakes whatever JM_AUTOSTART says.
 	if err := os.WriteFile(fakeJournal(m), []byte("saved"), 0o600); err != nil {
 		t.Fatal(err)
@@ -868,6 +949,9 @@ func TestEnsureRunningNotReadyWithJournal(t *testing.T) {
 	fakeBE.state, fakeNet.state = backend.Suspended, backend.Stopped
 	if err := ensureRunning(ctx, "sl", false); err != nil || *woke != 2 || !lastWakeOnly {
 		t.Errorf("suspended with autostart off: %v, wakes %d, wake only %v", err, *woke, lastWakeOnly)
+	}
+	if len(sent) != 1 {
+		t.Errorf("a saved journal must not send an abort: %q", sent)
 	}
 	if !strings.Contains(errOut.String(), `waking jailmachine "sl"...`) {
 		t.Errorf("stderr = %q", errOut.String())

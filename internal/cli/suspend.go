@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"syscall"
@@ -15,6 +16,7 @@ import (
 	"github.com/gabrielbelli/jailmachine/internal/backend"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
 	"github.com/gabrielbelli/jailmachine/internal/netprov"
+	"github.com/gabrielbelli/jailmachine/internal/sleeper"
 	"github.com/gabrielbelli/jailmachine/internal/sshx"
 )
 
@@ -118,7 +120,9 @@ func detail(err error, sentinels ...error) string {
 // idle tracker keeps its time and tries again on the next tick.
 var errSuspendSkipped = fmt.Errorf("suspend skipped: %w", machine.ErrLocked)
 
-// runSuspend is "jm suspend".
+// runSuspend is "jm suspend". The suspend itself runs in the machine's
+// sleeper, which is started if it is not alive: the sleeper must outlive the
+// transition, because it holds the machine's endpoints while it is suspended.
 func runSuspend(ctx context.Context, m *machine.Machine, force bool) error {
 	b, p, err := components(m)
 	if err != nil {
@@ -142,7 +146,32 @@ func runSuspend(ctx context.Context, m *machine.Machine, force bool) error {
 	if err := suspendPreflight(m, b, p); err != nil {
 		return err
 	}
-	return suspendMachine(ctx, m, b, p, suspendOpts{Reason: "jm suspend", Manual: true, Force: force})
+	logPath := sleeperProcess(m).LogPath()
+	if err := startSleeper(ctx, m, b, p); err != nil {
+		return withHint(fmt.Errorf("cannot suspend %s: %w", m.Name, err), "see "+logPath)
+	}
+	line := "suspend"
+	if force {
+		line += " force"
+	}
+	logf(stdout, "suspending %s; its sleeper holds the engine socket meanwhile (log: %s)", m.Name, logPath)
+	began := time.Now()
+	reply, err := sleeperRequest(ctx, m, line)
+	if err != nil {
+		return withHint(fmt.Errorf("cannot suspend %s: asking its sleeper: %w", m.Name, err), "see "+logPath)
+	}
+	word, rest := sleeper.SplitReply(reply)
+	if word != "ok" {
+		return suspendReplyError(m, reply)
+	}
+	image := ""
+	if f := strings.Fields(rest); len(f) == 2 {
+		if n, err := strconv.ParseInt(f[1], 10, 64); err == nil && n > 0 {
+			image = "; image " + humanBytes(n) + " allocated"
+		}
+	}
+	logf(stdout, "done: suspended %s in %.1f s%s", m.Name, time.Since(began).Seconds(), image)
+	return nil
 }
 
 // suspendPreflight checks, without the lock and without changing anything,
@@ -180,10 +209,11 @@ func suspendPreflight(m *machine.Machine, b backend.Backend, p netprov.Provider)
 // ahead puts the machine back as it was (the R-A and R-B rollbacks), and
 // only a hypervisor that died during the save leaves it stopped (R-C).
 //
-// In this version the command runs the suspend in its own process and holds
-// the lock throughout; clients that arrive meanwhile find the engine socket
-// gone and a wrapper waits for the lock, then wakes the machine.
-func suspendMachine(ctx context.Context, m *machine.Machine, b backend.Backend, p netprov.Provider, opts suspendOpts) error {
+// It runs inside the sleeper, whose stand-in sl takes the engine socket
+// before the guest is quiesced (S6) and the SSH port once the provider is
+// gone (S17). A client that arrives before the freeze cancels the suspend,
+// and is relayed to the engine by the rollback.
+func suspendMachine(ctx context.Context, m *machine.Machine, b backend.Backend, p netprov.Provider, sl *sleeper.Standin, opts suspendOpts) error {
 	began := time.Now()
 	s, ok := b.(backend.Suspender)
 	if !ok {
@@ -193,6 +223,12 @@ func suspendMachine(ctx context.Context, m *machine.Machine, b backend.Backend, 
 	if !ok {
 		return refuse(backend.ErrSuspendUnavailable, "cannot suspend %s: network provider %q cannot hand its endpoints over", m.Name, p.Name())
 	}
+
+	// From here until the freeze a suspend is cancellable: a wrapper that
+	// finds the journal sends abort, and a client parked by the stand-in
+	// counts as one. Armed before the journal exists, so no abort is lost.
+	sl.Arm()
+	defer sl.Disarm()
 
 	// S1: lock, never waiting.
 	unlock, err := store().Lock(m.Name)
@@ -270,6 +306,9 @@ func suspendMachine(ctx context.Context, m *machine.Machine, b backend.Backend, 
 	if perr == nil {
 		meta["containers"] = strconv.Itoa(act.jails)
 	}
+	if sl.Aborted() {
+		return refuse(backend.ErrSuspendAborted, "suspend of %s cancelled: a client arrived", m.Name)
+	}
 	logf(stdout, "suspending %s (%s)", m.Name, opts.Reason)
 	if err := s.PrepareSuspend(ctx, m, backend.SuspendPlan{Reason: opts.Reason, Meta: meta}); err != nil {
 		if errors.Is(err, backend.ErrSuspendUnavailable) {
@@ -279,16 +318,22 @@ func suspendMachine(ctx context.Context, m *machine.Machine, b backend.Backend, 
 	}
 
 	// From here a failure before the commit puts the machine back.
-	rb := &suspendRollback{m: m, s: s, p: p, f: f, ep: ep, client: &client}
+	rb := &suspendRollback{m: m, s: s, p: p, f: f, ep: ep, sl: sl, client: &client}
 
 	// S5: the forwarder releases its mappings while the provider is up.
 	stopForwarder(ctx, m, p)
-	// S6: no new engine client reaches the guest. Without a stand-in to hold
-	// the socket, the forward itself is stopped here (S8 has nothing left).
+	// S6: new engine clients reach the stand-in, which parks them unread;
+	// each one cancels the suspend until the guest is frozen. The forward's
+	// socket is kept aside until S8, so a rollback before then gives it back
+	// with its live connections.
 	if ep.APISocket != "" {
-		if err := f.StopAPIForward(ctx, m); err != nil {
-			return rb.guestRunning(ctx, fmt.Errorf("cannot suspend %s: stopping the engine socket forward: %w", m.Name, err))
+		if err := sl.TakeUnixKeepingPrevious(ep.APISocket); err != nil {
+			return rb.guestRunning(ctx, fmt.Errorf("cannot suspend %s: holding the engine socket: %w", m.Name, err))
 		}
+	}
+	// A wrapper's abort since the journal was written saves the quiesce.
+	if sl.Aborted() {
+		return rb.guestRunning(ctx, refuse(backend.ErrSuspendAborted, "suspend of %s cancelled: a client arrived", m.Name))
 	}
 	// S7: quiesce the guest.
 	qctx, qcancel := context.WithTimeout(ctx, suspendGuestTimeout)
@@ -306,12 +351,26 @@ func suspendMachine(ctx context.Context, m *machine.Machine, b backend.Backend, 
 		return rb.guestRunning(ctx, fmt.Errorf("cannot suspend %s: quiescing the guest exited %d: %s", m.Name, code, lastLine(out)))
 	}
 
-	// S9 to S14: the backend freezes, saves and commits. Nothing in this
-	// version can ask for an abort, and the ssh session must not outlive
-	// the guest it talks to.
+	// S8: the engine socket forward goes. S7 found no engine client, and
+	// the socket file is the stand-in's now, so it stays.
+	if ep.APISocket != "" {
+		if err := f.StopAPIForward(ctx, m); err != nil {
+			return rb.guestRunning(ctx, fmt.Errorf("cannot suspend %s: stopping the engine socket forward: %w", m.Name, err))
+		}
+		rb.forwardStopped = true
+		sl.DropPrevious()
+	}
+	// S9: a client that arrived since S6, or a wrapper's abort, cancels.
+	if sl.Aborted() {
+		return rb.guestRunning(ctx, refuse(backend.ErrSuspendAborted, "suspend of %s cancelled: a client arrived", m.Name))
+	}
+
+	// S10 to S14: the backend freezes, saves and commits. The ssh session
+	// must not outlive the guest it talks to; the last abort check (S11)
+	// runs immediately before the freeze.
 	closeClient()
 	logf(stdout, "saving %s's memory (%d MiB)", m.Name, m.MemoryMiB)
-	if err := s.CommitSuspend(ctx, m, func() bool { return false }); err != nil {
+	if err := s.CommitSuspend(ctx, m, sl.CheckAndFreeze); err != nil {
 		if cerr := rb.afterCommitError(ctx, b, err); cerr != nil {
 			return cerr
 		}
@@ -324,6 +383,11 @@ func suspendMachine(ctx context.Context, m *machine.Machine, b backend.Backend, 
 		fmt.Fprintf(stderr, "jm: warning: stopping %s networking: %v; continuing\n", m.Name, err)
 	}
 	stopResolver(ctx, m)
+	// S17: the SSH port, once the provider has let go of it.
+	addr := net.JoinHostPort(ep.SSHHost, strconv.Itoa(ep.SSHPort))
+	if err := takeTCPWithin(ctx, sl, addr, takeTCPTimeout); err != nil {
+		fmt.Fprintf(stderr, "jm: warning: ssh:// clients will not wake %s: %v\n", m.Name, err)
+	}
 
 	// S18.
 	image := ""
@@ -334,6 +398,22 @@ func suspendMachine(ctx context.Context, m *machine.Machine, b backend.Backend, 
 	return nil
 }
 
+// takeTCPWithin retries TakeTCP until the provider's exit has freed the port.
+func takeTCPWithin(ctx context.Context, sl *sleeper.Standin, addr string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		err := sl.TakeTCP(addr)
+		if err == nil || time.Now().After(deadline) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
 // suspendRollback puts a machine back when a suspend does not go ahead.
 type suspendRollback struct {
 	m      *machine.Machine
@@ -341,12 +421,16 @@ type suspendRollback struct {
 	p      netprov.Provider
 	f      netprov.APIForwarder
 	ep     netprov.Endpoint
+	sl     *sleeper.Standin
 	client **sshx.Client
+	// forwardStopped is set once S8 has stopped the engine socket forward.
+	forwardStopped bool
 }
 
 // guestRunning is R-A: the guest was never frozen, or has been continued.
-// Its shares are mounted again, the journal goes, and the engine socket
-// forward and the forwarder come back. cause is returned.
+// Its shares are mounted again, the journal goes, the engine socket forward
+// comes back and takes the socket from the stand-in, which relays the
+// connections it parked, and the forwarder comes back. cause is returned.
 func (r *suspendRollback) guestRunning(ctx context.Context, cause error) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
 	defer cancel()
@@ -365,9 +449,23 @@ func (r *suspendRollback) guestRunning(ctx context.Context, cause error) error {
 		return errors.Join(cause, fmt.Errorf("removing the suspend journal: %w", err))
 	}
 	if r.ep.APISocket != "" {
+		// Before S8 the forward still serves the socket the stand-in took,
+		// and clients may be streaming through it: put that socket back, so
+		// the start below finds the forward serving and leaves it running.
+		if !r.forwardStopped {
+			r.sl.RestorePrevious()
+		}
 		if err := r.f.StartAPIForward(ctx, m); err != nil {
 			fmt.Fprintf(stderr, "jm: warning: %s: the engine socket forward did not come back: %v; 'jm start%s' restores it\n", m.Name, err, nameHint(m.Name))
 		}
+	}
+	r.sl.Disarm()
+	if n := r.sl.HandOver(func() (net.Conn, error) {
+		return net.DialTimeout("unix", r.ep.APISocket, handOverDialTimeout)
+	}, func() (net.Conn, error) {
+		return net.DialTimeout("tcp", net.JoinHostPort(r.ep.SSHHost, strconv.Itoa(r.ep.SSHPort)), handOverDialTimeout)
+	}); n > 0 {
+		logf(stdout, "handed %d waiting connection(s) to %s's engine", n, m.Name)
 	}
 	if err := startForwarder(m, r.p, r.ep); err != nil {
 		fmt.Fprintf(stderr, "jm: warning: %v; 'jm start%s' restores it\n", err, nameHint(m.Name))
@@ -423,6 +521,9 @@ func (r *suspendRollback) hypervisorDied(ctx context.Context, cause error) error
 	if err := r.s.DiscardSuspend(m, "hypervisor exited while suspending"); err != nil {
 		fmt.Fprintf(stderr, "jm: warning: %s: %v\n", m.Name, err)
 	}
+	// Nothing will wake a stopped machine for them.
+	r.sl.Disarm()
+	r.sl.CloseHeld()
 	if err := parkProvider(ctx, m, r.p); err != nil {
 		fmt.Fprintf(stderr, "jm: warning: %s: %v\n", m.Name, err)
 	}

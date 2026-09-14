@@ -48,6 +48,9 @@ func newStopCmd() *cobra.Command {
 // set; without it, or with discard (for "jm rm"), its saved state is
 // discarded and nothing is restored (ADR 0009).
 func stopMachine(ctx context.Context, m *machine.Machine, graceful, discard bool) error {
+	// The sleeper goes first: it holds a suspended machine's endpoints, and
+	// must not start a suspend or a wake of a machine being stopped.
+	stopSleeper(ctx, m)
 	b, p, err := components(m)
 	if err != nil {
 		return err

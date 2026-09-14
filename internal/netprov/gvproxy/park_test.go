@@ -15,6 +15,7 @@ import (
 	"github.com/gabrielbelli/jailmachine/internal/machine"
 	"github.com/gabrielbelli/jailmachine/internal/netprov"
 	"github.com/gabrielbelli/jailmachine/internal/procx"
+	"github.com/gabrielbelli/jailmachine/internal/sleeper"
 )
 
 // The test binary doubles as a fake ssh and a fake gvproxy, launched through
@@ -166,9 +167,32 @@ func TestStartForwardWaitsForNewInode(t *testing.T) {
 	defer standin.Close()
 	before := mustInode(t, p.Podman)
 
+	// The path is never missing while the forward takes it over.
+	stopWatch, watched := make(chan struct{}), make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-stopWatch:
+				watched <- nil
+				return
+			default:
+			}
+			if _, err := os.Lstat(p.Podman); err != nil {
+				watched <- err
+				return
+			}
+		}
+	}()
 	began := time.Now()
 	if err := startForward(context.Background(), m, p); err != nil {
 		t.Fatal(err)
+	}
+	close(stopWatch)
+	if err := <-watched; err != nil {
+		t.Fatalf("podman.sock went missing while the forward took it: %v", err)
+	}
+	if _, err := os.Lstat(p.FwdSock); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the beside name was left behind: %v", err)
 	}
 	if took := time.Since(began); took < delay {
 		t.Fatalf("startForward returned after %s, before the helper bound (%s)", took, delay)
@@ -336,12 +360,115 @@ func TestParkLeavesPodmanSocket(t *testing.T) {
 		t.Fatalf("state after Park = %s", st)
 	}
 
-	// Once nothing serves it, a second Park removes the stale file.
+	// Park never decides by a dial, so even a socket nothing serves stays.
 	standin.Close()
 	if err := pr.Park(context.Background(), m); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Lstat(p.Podman); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("a stale podman.sock was left behind: %v", err)
+	if cur, ok := socketInode(p.Podman); !ok || cur != held {
+		t.Fatalf("Park removed podman.sock")
+	}
+}
+
+// Park, Repair and Start never dial podman.sock to decide whose it is: a dial
+// to the stand-in of a suspended machine is a held connection, and a held
+// connection wakes the machine. A socket the stand-in holds stays and holds
+// nothing; a dead forward's own socket (its recorded inode) goes, and a
+// stale socket nobody recorded stays.
+func TestStartAndRepairKeepServedPodmanSocket(t *testing.T) {
+	dir := shortDir(t)
+	m := sampleMachine(dir)
+	p := PathsFor(dir)
+	ctx := context.Background()
+	if err := os.MkdirAll(filepath.Join(dir, machine.SSHDir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p.Key, []byte("key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fake := filepath.Join(t.TempDir(), "gvproxy")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexit 3\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(BinaryEnv, fake)
+	writeRuntime := func() {
+		t.Helper()
+		for _, f := range []string{p.Net, p.API} {
+			if err := os.WriteFile(f, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.WriteFile(p.PID, []byte("999999\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gone := func(step string, files ...string) {
+		t.Helper()
+		for _, f := range files {
+			if _, err := os.Lstat(f); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("%s left %s: %v", step, filepath.Base(f), err)
+			}
+		}
+	}
+	var pr Provider
+
+	sl := &sleeper.Standin{}
+	defer sl.Close()
+	if err := sl.TakeUnix(p.Podman); err != nil {
+		t.Fatal(err)
+	}
+	held := mustInode(t, p.Podman)
+	writeRuntime()
+	if err := pr.Park(ctx, m); err != nil {
+		t.Fatalf("Park: %v", err)
+	}
+	gone("Park", p.Net, p.API, p.PID)
+	writeRuntime()
+	if err := pr.Repair(m); err != nil {
+		t.Fatalf("Repair: %v", err)
+	}
+	gone("Repair", p.Net, p.API, p.PID)
+	writeRuntime()
+	if _, _, err := pr.Start(ctx, m); err == nil {
+		t.Fatal("Start with an exiting gvproxy succeeded")
+	}
+	gone("Start", p.Net, p.API)
+	if cur, ok := socketInode(p.Podman); !ok || cur != held {
+		t.Fatal("a provider step removed the stand-in's socket")
+	}
+	time.Sleep(100 * time.Millisecond) // an accepted dial is parked asynchronously
+	if n := sl.Held(); n != 0 {
+		t.Fatalf("the stand-in holds %d connection(s): a provider step dialled it", n)
+	}
+
+	// A dead forward's own socket goes, with its inode record.
+	if err := sl.CloseUnix(true); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := listenBeside(p.Podman)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.Close()
+	if err := os.WriteFile(p.FwdIno, []byte(strconv.FormatUint(mustInode(t, p.Podman), 10)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeRuntime()
+	if _, _, err := pr.Start(ctx, m); err == nil {
+		t.Fatal("Start with an exiting gvproxy succeeded")
+	}
+	gone("Start over a dead forward's socket", p.Podman, p.FwdIno)
+
+	// A stale socket nobody recorded is not provably anyone's, and stays.
+	stale, err = listenBeside(p.Podman)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.Close()
+	if err := pr.Repair(m); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := socketInode(p.Podman); !ok {
+		t.Error("Repair removed a socket it cannot tell is its own")
 	}
 }

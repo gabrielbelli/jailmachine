@@ -38,6 +38,9 @@ type wakeOpts struct {
 	// FromHelper is a wake run by a detached jm helper rather than a user's
 	// command; the environment of the shell that started it is not read.
 	FromHelper bool
+	// By names what woke the machine for the sleeper's status ("wrapper",
+	// "jm start"); empty lets the sleeper name the endpoint it held.
+	By string
 }
 
 // wakeMachine restores a suspended machine (steps W0 to W10). The caller holds
@@ -65,6 +68,13 @@ func wakeMachine(ctx context.Context, m *machine.Machine, b backend.Backend, p n
 		logf(stdout, "%s: restoring %s to shut it down", machine.StageBackend, m.Name)
 	} else {
 		logf(stdout, "%s: waking %s from its saved state", machine.StageBackend, m.Name)
+	}
+
+	// W1: a sleeper holding the SSH port lets go of it for this process.
+	if ep, err := p.Endpoint(m); err == nil {
+		if err := releaseSleeperTCP(ctx, m, ep); err != nil {
+			return false, wakeTransient(m, err)
+		}
 	}
 
 	// W2: the network, and the resolver beside it.
@@ -130,9 +140,21 @@ func wakeMachine(ctx context.Context, m *machine.Machine, b backend.Backend, p n
 		}
 	}
 
-	// W10: the forwarder re-exposes its mappings on the new provider.
+	// W9: the sleeper hands its held connections over now, rather than on
+	// its next check.
+	by := opts.By
+	if by == "" {
+		by = "-"
+	}
+	tellSleeper(ctx, m, fmt.Sprintf("woke %s %d", by, time.Since(began).Milliseconds()))
+
+	// W10: the forwarder re-exposes its mappings on the new provider, and a
+	// machine woken without its sleeper gets one back.
 	if err := startForwarder(m, p, ep); err != nil {
 		return true, err
+	}
+	if err := startSleeper(ctx, m, b, p); err != nil {
+		fmt.Fprintf(stderr, "jm: warning: %v; %s is awake, but nothing will suspend it or hold its endpoints\n", err, m.Name)
 	}
 	bumpActivity(m)
 	logf(stdout, "done: woke %s in %.1f s", m.Name, time.Since(began).Seconds())

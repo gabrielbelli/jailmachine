@@ -13,6 +13,7 @@ import (
 	"github.com/gabrielbelli/jailmachine/internal/backend"
 	"github.com/gabrielbelli/jailmachine/internal/forwarder"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
+	"github.com/gabrielbelli/jailmachine/internal/sleeper"
 )
 
 // info is the inspect/list view: the record plus computed runtime facts.
@@ -60,7 +61,16 @@ type info struct {
 	SuspendedAt       *time.Time `json:"suspended_at,omitempty"`
 	SuspendImage      string     `json:"suspend_image,omitempty"`
 	SuspendImageBytes int64      `json:"suspend_image_bytes,omitempty"`
-	networkString     string
+	// Sleeper is the per-machine helper that runs a suspend and holds the
+	// machine's endpoints while it is suspended (ADR 0009). LastWakeBy,
+	// LastResumeMS and LastSuspendMS come from its status file and are
+	// omitted when unknown.
+	Sleeper       backend.State `json:"sleeper_state"`
+	SleeperLog    string        `json:"sleeper_log,omitempty"`
+	LastWakeBy    string        `json:"last_wake_by,omitempty"`
+	LastResumeMS  int64         `json:"last_resume_ms,omitempty"`
+	LastSuspendMS int64         `json:"last_suspend_ms,omitempty"`
+	networkString string
 }
 
 // describe computes the runtime view of m; read-only, never blocks.
@@ -72,6 +82,7 @@ func describe(m *machine.Machine) info {
 		Ports:         []forwarder.Entry{},
 		Forwarder:     backend.Stopped,
 		Resolver:      backend.Stopped,
+		Sleeper:       backend.Stopped,
 	}
 	fw := forwardState(m)
 	if fw.Owned != nil {
@@ -87,6 +98,14 @@ func describe(m *machine.Machine) info {
 		}
 		rp := resolverProcess(m)
 		i.ResolverLog, i.ResolverAddr, i.Resolver = rp.LogPath(), rp.Addr(), resolverState(m)
+		sp := sleeperProcess(m)
+		i.SleeperLog = sp.LogPath()
+		if _, ok := sp.Alive(); ok {
+			i.Sleeper = backend.Running
+		}
+		if st, err := sleeper.LoadStatus(sp.StatusPath()); err == nil {
+			i.LastWakeBy, i.LastResumeMS, i.LastSuspendMS = st.LastWakeBy, st.LastResumeMS, st.LastSuspendMS
+		}
 	}
 	i.PublishAddr, i.PublishAddrPending = publishAddrs(m, running, fw)
 	b, p, err := components(m)
@@ -145,6 +164,9 @@ state is read from the hypervisor and the network provider on every call.
   publish_addr_pending (the record's value when it differs and is waiting
   for a restart),
   resolver_state, resolver_addr, resolver_log,
+  sleeper_state (running|stopped), sleeper_log, last_wake_by (socket,
+  ssh-port, wrapper or jm start), last_resume_ms and last_suspend_ms (from
+  the sleeper's last report; omitted when unknown),
   suspended_at (RFC 3339), suspend_image (the saved state's path) and
   suspend_image_bytes (the space it takes on disk): only while suspended.
 
@@ -248,6 +270,10 @@ func newInspectCmd() *cobra.Command {
 			row("Forwarder", i.Forwarder)
 			if i.ForwarderLog != "" {
 				row("Forwarder log", i.ForwarderLog)
+			}
+			row("Sleeper", i.Sleeper)
+			if i.SleeperLog != "" {
+				row("Sleeper log", i.SleeperLog)
 			}
 			for _, e := range i.Ports {
 				row("Port", fmt.Sprintf("%s -> %s %s (%s)", e.Local, remoteOrDash(e.Remote), e.Proto, e.Status()))

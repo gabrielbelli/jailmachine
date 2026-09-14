@@ -436,6 +436,8 @@ type fakeBackend struct {
 	savedAt             time.Time
 	allocated           int64
 	meta                map[string]string
+	// onPrepare runs once PrepareSuspend has written the journal.
+	onPrepare func(m *machine.Machine)
 }
 
 func (f *fakeBackend) Name() string     { return "fakebe" }
@@ -477,7 +479,13 @@ func (f *fakeBackend) SuspendStatus(m *machine.Machine) (backend.SuspendStatus, 
 func (f *fakeBackend) PrepareSuspend(_ context.Context, m *machine.Machine, plan backend.SuspendPlan) error {
 	fakeEvent("prepare")
 	f.meta = plan.Meta
-	return os.WriteFile(fakeJournal(m), []byte("saving"), 0o600)
+	if err := os.WriteFile(fakeJournal(m), []byte("saving"), 0o600); err != nil {
+		return err
+	}
+	if f.onPrepare != nil {
+		f.onPrepare(m)
+	}
+	return nil
 }
 func (f *fakeBackend) CommitSuspend(_ context.Context, m *machine.Machine, abort func() bool) error {
 	fakeEvent("commit")

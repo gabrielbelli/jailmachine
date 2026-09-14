@@ -19,6 +19,8 @@ package gvproxy
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -128,11 +130,14 @@ type Paths struct {
 	FwdPID string // forward.pid
 	FwdLog string // forward.log
 	FwdIno string // forward.ino
+	// FwdSock is where the forward binds before it is renamed over
+	// podman.sock, so the path is never missing while it is taken back.
+	FwdSock string
 }
 
 // PathsFor returns the paths for a machine directory.
 func PathsFor(dir string) Paths {
-	return Paths{
+	p := Paths{
 		Net:    backend.SocketPath(dir, NetSockFile),
 		API:    backend.SocketPath(dir, APISockFile),
 		Podman: backend.SocketPath(dir, PodmanSockFile),
@@ -143,6 +148,18 @@ func PathsFor(dir string) Paths {
 		FwdLog: filepath.Join(dir, ForwardLogFile),
 		FwdIno: filepath.Join(dir, ForwardInoFile),
 	}
+	p.FwdSock = forwardBesidePath(p.Podman)
+	return p
+}
+
+// forwardBesidePath is the name the forward binds under before the socket is
+// renamed over podman: in the same directory (rename is atomic only there),
+// shorter than podman.sock so it fits wherever that fits, and distinct per
+// path, because a socket that fell back to the shared temp directory sits
+// next to other machines' sockets.
+func forwardBesidePath(podman string) string {
+	sum := sha256.Sum256([]byte(podman))
+	return filepath.Join(filepath.Dir(podman), ".jmf"+hex.EncodeToString(sum[:2]))
 }
 
 // Sockets lists the unix sockets, the ones that may live out of tree.
@@ -266,7 +283,35 @@ func (Provider) Repair(m *machine.Machine) error {
 		return ErrNoDir
 	}
 	p := PathsFor(m.Dir)
-	return errors.Join(stopForward(context.Background(), p, false), removeAll(append(p.Sockets(), p.PID)...))
+	return errors.Join(stopForward(context.Background(), p, false), removeRuntime(p))
+}
+
+// removeRuntime removes gvproxy's own sockets and pid file. podman.sock is
+// not gvproxy's and is never touched here: while a machine is suspended the
+// stand-in holds it (ADR 0009). Its owner is told by inode, never by a dial,
+// because a dial to a stand-in is a held connection that wakes the machine
+// (stopForward, removeForwardLeftover).
+func removeRuntime(p Paths) error {
+	return removeAll(p.Net, p.API, p.PID)
+}
+
+// removeForwardLeftover removes a podman.sock that a dead forward left
+// behind (its recorded inode), or a file there that is not a socket at all.
+// A socket of anyone else stays.
+func removeForwardLeftover(p Paths) error {
+	if _, alive := forwardAlive(p); alive {
+		return nil
+	}
+	cur, exists := fileInode(p.Podman)
+	if !exists {
+		return removeAll(p.FwdIno)
+	}
+	want, recorded := readInode(p.FwdIno)
+	_, isSocket := socketInode(p.Podman)
+	if (recorded && cur == want) || !isSocket {
+		return removeAll(p.Podman, p.FwdIno)
+	}
+	return nil
 }
 
 // Start implements netprov.Provider: launches gvproxy detached and waits
@@ -301,8 +346,9 @@ func (pr Provider) Start(ctx context.Context, m *machine.Machine) (backend.NetAt
 			return backend.NetAttachment{}, netprov.Endpoint{}, fmt.Errorf("gvproxy: socket path %q is %d bytes; unix sockets are limited to %d (use a shorter --state-root or $TMPDIR)", s, len(s), backend.MaxSocketPath)
 		}
 	}
-	// gvproxy refuses to start over stale sockets.
-	if err := removeAll(p.Sockets()...); err != nil {
+	// gvproxy refuses to start over stale sockets. podman.sock is not
+	// gvproxy's: only a dead forward's own leftover goes.
+	if err := errors.Join(removeRuntime(p), removeForwardLeftover(p)); err != nil {
 		return backend.NetAttachment{}, netprov.Endpoint{}, fmt.Errorf("gvproxy: removing stale sockets: %w", err)
 	}
 
@@ -317,7 +363,7 @@ func (pr Provider) Start(ctx context.Context, m *machine.Machine) (backend.NetAt
 			_ = syscall.Kill(pid, syscall.SIGKILL)
 			procx.WaitExit(context.Background(), pid, stopTimeout)
 		}
-		_ = removeAll(append(p.Sockets(), p.PID)...)
+		_ = removeRuntime(p)
 		return backend.NetAttachment{}, netprov.Endpoint{}, fmt.Errorf("gvproxy: %w: %s", err, tailOf(p.Log))
 	}
 	// gvproxy writes -pid-file itself; make sure State agrees before we
@@ -397,9 +443,8 @@ func terminate(ctx context.Context, p Paths) error {
 
 // Park implements netprov.Parker for a suspend (ADR 0009): gvproxy and the
 // podman socket forward are stopped and their runtime files removed, but
-// podman.sock is removed only when nothing answers on it, so a stand-in
-// holding the endpoint keeps it. forwards.json is not this provider's and
-// is left alone.
+// podman.sock is left alone: a machine is parked while a stand-in holds that
+// endpoint. forwards.json is not this provider's and is left alone too.
 func (pr Provider) Park(ctx context.Context, m *machine.Machine) error {
 	if m.Dir == "" {
 		return ErrNoDir
@@ -414,12 +459,7 @@ func (pr Provider) Park(ctx context.Context, m *machine.Machine) error {
 			return err
 		}
 	}
-	errs := []error{stopForward(ctx, p, true)}
-	if staleSocket(p.Podman) {
-		errs = append(errs, removeAll(p.Podman))
-	}
-	errs = append(errs, removeAll(p.Net, p.API, p.PID))
-	return errors.Join(errs...)
+	return errors.Join(stopForward(ctx, p, true), removeRuntime(p))
 }
 
 // StopAPIForward implements netprov.APIForwarder: the podman socket forward
@@ -455,7 +495,8 @@ func (Provider) Cleanup(m *machine.Machine) error {
 		return ErrNoDir
 	}
 	var out []string
-	for _, s := range PathsFor(m.Dir).Sockets() {
+	p := PathsFor(m.Dir)
+	for _, s := range append(p.Sockets(), p.FwdSock) {
 		if !backend.InTree(m.Dir, s) {
 			out = append(out, s)
 		}

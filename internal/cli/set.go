@@ -386,6 +386,15 @@ func runSet(ctx context.Context, args []string, o setOpts) error {
 	if err := store().Save(m); err != nil {
 		return err
 	}
+	if c.idleSuspendSet && ready(m, st) {
+		// A running machine without its sleeper gets one now; a live
+		// sleeper reads the record itself.
+		if b, p, err := components(m); err == nil {
+			if err := startSleeper(ctx, m, b, p); err != nil {
+				fmt.Fprintf(stderr, "jm: warning: %v\n", err)
+			}
+		}
+	}
 	if arcChanged {
 		// Saved first, so a cap the guest does not take is still applied
 		// by the next start.

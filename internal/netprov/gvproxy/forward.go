@@ -24,11 +24,14 @@ import (
 // by pid plus argv (the host socket path is unique per machine).
 //
 // The socket path can be held by someone else while the machine is
-// suspended (ADR 0009), so the forwarder never removes it before it starts:
-// ssh's StreamLocalBindUnlink replaces the file, and startForward waits for
-// a socket with a different inode that answers. The inode the helper bound
-// is recorded in forward.ino, and a stop removes the socket only while it is
-// still that inode.
+// suspended (ADR 0009), so the forwarder never removes it and never binds it
+// directly: ssh binds a name beside it (Paths.FwdSock), and once that answers
+// it is renamed over podman.sock, so a client never finds the path missing.
+// (ssh's own StreamLocalBindUnlink unlinks and then binds, which would leave
+// a moment with no socket.) The inode is recorded in forward.ino, and a stop
+// removes the socket only while it is still that inode. Nothing here decides
+// who owns the path with a dial: a dial to a stand-in is a held connection,
+// and a held connection wakes the machine.
 
 // Forward readiness. Variables so tests can shorten them.
 var (
@@ -47,7 +50,10 @@ func forwardAlive(p Paths) (int, bool) {
 		return 0, false
 	}
 	argv := commandLine(pid)
-	return pid, strings.Contains(argv, "ssh") && strings.Contains(argv, p.Podman+":")
+	// A forward started before the beside name was used bound podman.sock
+	// itself.
+	bound := strings.Contains(argv, p.FwdSock+":") || strings.Contains(argv, p.Podman+":")
+	return pid, strings.Contains(argv, "ssh") && bound
 }
 
 // socketInode returns the inode of the unix socket at path, false when there
@@ -87,15 +93,6 @@ func socketAnswers(path string) bool {
 	return true
 }
 
-// staleSocket reports whether something is at path and nothing answers
-// there.
-func staleSocket(path string) bool {
-	if _, err := os.Lstat(path); err != nil {
-		return false
-	}
-	return !socketAnswers(path)
-}
-
 // readInode parses forward.ino.
 func readInode(path string) (uint64, bool) {
 	data, err := os.ReadFile(path)
@@ -107,7 +104,8 @@ func readInode(path string) (uint64, bool) {
 }
 
 // startForward launches the forwarder unless one is already serving the
-// socket it bound, and waits until the path is a new socket that answers.
+// socket it bound, and waits until the helper's socket answers beside the
+// path before renaming it over the path.
 func startForward(ctx context.Context, m *machine.Machine, p Paths) error {
 	if _, ok := forwardAlive(p); ok {
 		want, recorded := readInode(p.FwdIno)
@@ -120,11 +118,13 @@ func startForward(ctx context.Context, m *machine.Machine, p Paths) error {
 	if err != nil {
 		return fmt.Errorf("gvproxy: ssh binary not found for the podman socket forward: %w", err)
 	}
-	// Whatever is at the path now (a stand-in's socket) must not satisfy
-	// the wait below, and must not be removed if the helper fails.
-	before, existed := fileInode(p.Podman)
+	// Whatever is at the beside name is litter of an earlier helper; what is
+	// at the path itself (a stand-in's socket) stays until the rename.
+	if err := removeAll(p.FwdSock); err != nil {
+		return fmt.Errorf("gvproxy: %w", err)
+	}
 	// Detached through procx: the forward must outlive this jm invocation.
-	pid, err := procx.StartDetached(bin, sshx.ForwardArgs(machine.SSHHost, m.SSHPort, m.SSHUser, p.Key, p.Podman, machine.GuestPodmanSocket), nil, p.FwdLog, true)
+	pid, err := procx.StartDetached(bin, sshx.ForwardArgs(machine.SSHHost, m.SSHPort, m.SSHUser, p.Key, p.FwdSock, machine.GuestPodmanSocket), nil, p.FwdLog, true)
 	if err != nil {
 		return fmt.Errorf("gvproxy: starting podman socket forward: %w", err)
 	}
@@ -132,17 +132,20 @@ func startForward(ctx context.Context, m *machine.Machine, p Paths) error {
 		_ = syscall.Kill(pid, syscall.SIGKILL)
 		return fmt.Errorf("gvproxy: writing %s: %w", p.FwdPID, err)
 	}
-	ino, err := waitNewSocket(ctx, pid, p.Podman, before, existed)
-	if err != nil {
+	fail := func(err error) error {
 		if procx.Alive(pid) {
 			_ = syscall.Kill(pid, syscall.SIGKILL)
 			procx.WaitExit(context.Background(), pid, stopTimeout)
 		}
-		if cur, ok := fileInode(p.Podman); ok && (!existed || cur != before) {
-			_ = removeAll(p.Podman) // the helper's own leftover only
-		}
-		_ = removeAll(p.FwdPID, p.FwdIno)
+		_ = removeAll(p.FwdSock, p.FwdPID, p.FwdIno) // the helper's own files only
 		return fmt.Errorf("gvproxy: podman socket forward: %w: %s", err, tailOf(p.FwdLog))
+	}
+	ino, err := waitNewSocket(ctx, pid, p.FwdSock, 0, false)
+	if err != nil {
+		return fail(err)
+	}
+	if err := os.Rename(p.FwdSock, p.Podman); err != nil {
+		return fail(err)
 	}
 	if err := os.WriteFile(p.FwdIno, []byte(strconv.FormatUint(ino, 10)+"\n"), 0o600); err != nil {
 		return fmt.Errorf("gvproxy: writing %s: %w", p.FwdIno, err)
@@ -176,10 +179,12 @@ func waitNewSocket(ctx context.Context, pid int, path string, before uint64, exi
 // stopForward terminates a live forwarder and removes its pid and inode
 // files. Unless keepSocket is set, podman.sock is removed too, but only
 // while it is still the socket the helper bound (or, for a helper started
-// before inodes were recorded, while nothing answers on it): a socket that
-// replaced it belongs to someone else.
+// before inodes were recorded, when that helper was just stopped), or when
+// it is not a socket at all: a socket that replaced it belongs to someone
+// else.
 func stopForward(ctx context.Context, p Paths, keepSocket bool) error {
-	if pid, ok := forwardAlive(p); ok {
+	pid, killed := forwardAlive(p)
+	if killed {
 		if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && procx.Alive(pid) {
 			return fmt.Errorf("gvproxy: SIGTERM forward pid %d: %w", pid, err)
 		}
@@ -194,11 +199,12 @@ func stopForward(ctx context.Context, p Paths, keepSocket bool) error {
 	if !keepSocket {
 		want, recorded := readInode(p.FwdIno)
 		cur, exists := fileInode(p.Podman)
-		if exists && ((recorded && cur == want) || (!recorded && staleSocket(p.Podman))) {
+		_, isSocket := socketInode(p.Podman)
+		if exists && ((recorded && cur == want) || (!recorded && killed) || !isSocket) {
 			errs = append(errs, removeAll(p.Podman))
 		}
 	}
-	errs = append(errs, removeAll(p.FwdPID, p.FwdIno))
+	errs = append(errs, removeAll(p.FwdSock, p.FwdPID, p.FwdIno))
 	err := errors.Join(errs...)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil

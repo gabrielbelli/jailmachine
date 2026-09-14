@@ -94,6 +94,11 @@ func ensureRunning(ctx context.Context, name string, autostart bool) error {
 	}
 	if err == nil && (st == backend.Suspended || st == backend.Running) && suspendedOrTransition(m, st) {
 		fmt.Fprintf(stderr, "waking jailmachine %q...\n", name)
+		if st == backend.Running {
+			// A suspend that has not frozen the guest yet is cancelled
+			// rather than waited for.
+			abortSuspendInFlight(ctx, m)
+		}
 		ctx, cancel := context.WithTimeout(ctx, autostartLockWait)
 		defer cancel()
 		// With autostart off the wake must not turn into a boot: a "jm stop"
@@ -160,7 +165,7 @@ func runQuietly(ctx context.Context, name string, wakeOnly bool) error {
 	was := quiet
 	quiet = true
 	defer func() { quiet = was }()
-	return startMachine(ctx, []string{name}, startOpts{waitLock: true, skipIfReady: true, wakeOnly: wakeOnly})
+	return startMachine(ctx, []string{name}, startOpts{waitLock: true, skipIfReady: true, wakeOnly: wakeOnly, wakeBy: "wrapper"})
 }
 
 // lockMaybeWait takes the per-machine lock, waiting for it when wait is

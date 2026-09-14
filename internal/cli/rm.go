@@ -59,6 +59,7 @@ func newRmCmd() *cobra.Command {
 				// backendFor fails below; the directory still goes.
 				backendName, _ := backend.DefaultForHost()
 				m = &machine.Machine{Name: name, Backend: backendName, Network: netprov.DefaultForHost(), Dir: s.Dir(name)}
+				stopSleeper(ctx, m)
 				if p, perr := providerFor(m); perr == nil {
 					stopForwarder(ctx, m, p)
 				}
@@ -82,7 +83,8 @@ func newRmCmd() *cobra.Command {
 					}
 					fmt.Fprintf(stderr, "jm: %v; continuing\n", err)
 					// stopMachine may have failed before reaching the
-					// forwarder; never leave one behind.
+					// helpers; never leave one behind.
+					stopSleeper(ctx, m)
 					if p, perr := providerFor(m); perr == nil {
 						stopForwarder(ctx, m, p)
 					}
@@ -107,6 +109,9 @@ func newRmCmd() *cobra.Command {
 						fmt.Fprintf(stderr, "jm: %v; continuing\n", cerr)
 					}
 				}
+			}
+			if cerr := sleeperProcess(m).Cleanup(); cerr != nil {
+				fmt.Fprintf(stderr, "jm: %v; continuing\n", cerr)
 			}
 			if err := s.Delete(name); err != nil {
 				return err

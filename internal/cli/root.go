@@ -103,6 +103,8 @@ func NewRootCmd() *cobra.Command {
 		newPortsCmd(),
 		newForwarderCmd(),
 		newResolverCmd(),
+		newSleeperCmd(),
+		newWakeCmd(),
 		newDoctorCmd(),
 		newSetCmd(),
 		newConsoleCmd(),
