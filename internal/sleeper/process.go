@@ -313,6 +313,18 @@ func (w *Waker) Reap() bool {
 	return true
 }
 
+// Forget drops the child spawned last without a backoff, alive or not. The
+// sleeper calls it once the machine is seen running with no saved-state
+// journal, or when a suspend starts: that child did its job. Without it, a
+// child that exited after a successful wake would still be on record when the
+// machine is suspended again before the next Reap, and read as a wake that
+// left the machine suspended.
+func (w *Waker) Forget() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.pid = 0
+}
+
 // StartBackoff refuses new children for Backoff from now.
 func (w *Waker) StartBackoff() {
 	w.mu.Lock()

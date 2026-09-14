@@ -196,3 +196,34 @@ func TestOneWakerWithBackoff(t *testing.T) {
 		t.Errorf("failed spawn = %v, %v, backing off %v", ok, err, w.BackingOff())
 	}
 }
+
+func TestWakerForgetDropsTheChildWithoutABackoff(t *testing.T) {
+	alive := map[int]bool{}
+	spawned := 0
+	w := &Waker{
+		Spawn:   func() (int, error) { spawned++; pid := 200 + spawned; alive[pid] = true; return pid, nil },
+		Alive:   func(pid int) bool { return alive[pid] },
+		Backoff: 10 * time.Second,
+	}
+	if ok, err := w.Ensure(); !ok || err != nil {
+		t.Fatalf("Ensure = %v, %v", ok, err)
+	}
+	// The child did its job and exits; the sleeper forgets it before anything
+	// reaps it, so the exit is never read as a failed wake.
+	w.Forget()
+	alive[201] = false
+	if w.Reap() {
+		t.Error("Reap reported a forgotten child")
+	}
+	if w.BackingOff() {
+		t.Error("Forget started a backoff")
+	}
+	// A live child can be forgotten too; the next Ensure spawns at once.
+	if ok, _ := w.Ensure(); !ok || spawned != 2 {
+		t.Fatalf("no spawn after forgetting an exited child (%d)", spawned)
+	}
+	w.Forget()
+	if w.Running() != 0 {
+		t.Errorf("Running = %d after Forget", w.Running())
+	}
+}

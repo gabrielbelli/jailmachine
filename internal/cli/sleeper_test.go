@@ -400,6 +400,78 @@ func TestSleeperDaemonHoldsWakesAndHandsOver(t *testing.T) {
 	}
 }
 
+// A held connection wakes the machine, its waker exits, and a suspend follows
+// before the sleeper evaluates the running machine (a "jm suspend" run within
+// one idle tick of the wake). The exited waker must not be read as a wake that
+// left the machine suspended: that closed the next client's held connection
+// and made it wait out the 10 s backoff (measured 2026-09-14: docker compose
+// ls against a suspended machine took 12.15 s instead of about 2 s).
+func TestSleeperSuspendRightAfterAWakeDoesNotBackOff(t *testing.T) {
+	resetFakes(t)
+	root := t.TempDir()
+	oldRoot := stateRoot
+	stateRoot = root
+	t.Cleanup(func() { stateRoot = oldRoot })
+	m := seedSuspended(t, root, "sl")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+	sock := filepath.Join(shortSocketDir(t), "podman.sock")
+	fakeNet.endpoint = &netprov.Endpoint{SSHHost: "127.0.0.1", SSHPort: port, APISocket: sock}
+
+	d := newSleeperDaemon(m, fakeBE, fakeNet, log.New(io.Discard, "", 0))
+	defer d.sl.Close()
+	alive, spawned := false, 0
+	d.waker.Spawn = func() (int, error) { spawned++; alive = true; return 1 << 30, nil }
+	d.waker.Alive = func(int) bool { return alive }
+
+	d.evaluate()
+	c1, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+	waitUntil(t, "a held connection", func() bool { return d.sl.Held() == 1 })
+	d.evaluate()
+	if spawned != 1 {
+		t.Fatalf("spawned %d wakers for one held connection", spawned)
+	}
+
+	// The wake succeeds and its waker exits, with no evaluation in between.
+	fakeBE.state, fakeNet.state = backend.Running, backend.Running
+	if err := os.Remove(fakeJournal(m)); err != nil {
+		t.Fatal(err)
+	}
+	alive = false
+
+	// A suspend starts. Refusing it at the preflight is enough: the waker is
+	// forgotten before anything else happens.
+	fakeBE.suspendable = "refused by the test"
+	if _, _, err := d.runSuspend(context.Background(), suspendOpts{Reason: "jm suspend", Manual: true}); err == nil {
+		t.Fatal("runSuspend passed a preflight the test refuses")
+	}
+
+	// The machine reads suspended again, as after a suspend that committed.
+	if err := os.WriteFile(fakeJournal(m), []byte("saved"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fakeBE.state, fakeNet.state = backend.Suspended, backend.Stopped
+	d.evaluate()
+	if d.waker.BackingOff() {
+		t.Fatal("an exited waker from a successful wake started the backoff")
+	}
+	if spawned != 2 {
+		t.Errorf("the held connection waited instead of spawning a waker at once (%d spawned)", spawned)
+	}
+	_ = c1.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if _, err := c1.Read(make([]byte, 1)); errors.Is(err, io.EOF) {
+		t.Error("the held connection was closed as if the wake had failed")
+	}
+}
+
 // A wake that continues the guest and then fails before the engine socket
 // forward takes the path back leaves a running machine behind with the
 // stand-in's socket. Once no wake is in flight the sleeper lets go of it, so

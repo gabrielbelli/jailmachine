@@ -809,6 +809,11 @@ func (d *sleeperDaemon) runSuspend(ctx context.Context, opts suspendOpts) (ms, a
 	// A wake is measured from triggers that arrive from here on.
 	d.triggerAt, d.wokeAt = time.Time{}, time.Time{}
 	d.mu.Unlock()
+	// A suspend starts from a running machine, so any waker on record did its
+	// job; forget it before the machine reads suspended again. A suspend that
+	// follows a wake within one idle tick would otherwise find that exited
+	// waker, count it as a failed wake and hold new clients for the backoff.
+	d.waker.Forget()
 	defer func() {
 		d.suspendWG.Done()
 		d.suspending.Store(false)
