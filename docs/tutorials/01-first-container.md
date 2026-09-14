@@ -7,7 +7,7 @@ guest, and shut it down again.
 
 | | |
 |---|---|
-| You need | macOS 14+ on Apple Silicon, about 10 GB free disk, about 4 GB free RAM |
+| You need | macOS 14+ on Apple Silicon, about 10 GB free disk, about 2 GB free RAM |
 | Time | 3–5 minutes of typing, plus roughly 2 minutes of downloading and booting |
 | You end with | A working machine, then a stopped one — and the option to delete it entirely |
 
@@ -86,7 +86,7 @@ verifying SHA256
 decompressing (sparse)
 image ready: /Users/you/.jailmachine/machines/jailmachine/disk.raw
 ==> seed: writing first-boot seed /Users/you/.jailmachine/machines/jailmachine/seed.iso
-==> done: created jailmachine (4 cpus, 4096 MiB, 64 GiB). Next: jm start jailmachine
+==> done: created jailmachine (4 cpus, 2048 MiB, 64 GiB). Next: jm start jailmachine
 ```
 
 Expect **60–115 s**. The 800 MiB download is only part of it; writing
@@ -117,9 +117,10 @@ jm start
 
 ```text
 ==> network: starting gvproxy networking
-==> backend: booting jailmachine (4 cpus, 4096 MiB, ssh on 127.0.0.1:2222)
+==> backend: booting jailmachine (4 cpus, 2048 MiB, ssh on 127.0.0.1:2222)
 ==> ssh: waiting for sshd
 ...........
+==> ssh: capping the guest's ZFS ARC at 512 MiB
 ==> provision: waiting for /var/db/jm-provisioned
 ==> dns: pointing the guest at the host resolver on 192.168.127.254:53984 (search mygateway)
 ==> connect: forwarding /var/folders/.../jm-c3771d1ab4c4.sock to the guest podman socket

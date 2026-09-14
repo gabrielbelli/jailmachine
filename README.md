@@ -296,7 +296,7 @@ Every flag and environment variable is in [docs/USAGE.md](docs/USAGE.md).
 
 | Command | Does |
 |---|---|
-| `jm init [name]` | Create a machine: SSH key, image download and SHA256 check, grow disk, NoCloud seed. `--cpus`, `--memory`, `--disk`, `--image`, `--ssh-port`, `--mount`, `--no-mounts`, `--publish-addr` |
+| `jm init [name]` | Create a machine: SSH key, image download and SHA256 check, grow disk, NoCloud seed. `--cpus`, `--memory` (2048 MiB by default), `--arc` (the guest's ZFS cache cap, 512 MiB by default), `--disk`, `--image`, `--ssh-port`, `--mount`, `--no-mounts`, `--publish-addr` |
 | `jm start [name]` | Boot, provision on first boot, connect podman, mount the shares, start the port forwarder and the host resolver; idempotent |
 | `jm stop [name]` | Stop the forwarder and resolver, ask the guest to power off, then the hypervisor and the network provider |
 | `jm ssh [name] [-- cmd]` | Root shell, or a command, in the guest |
@@ -305,7 +305,7 @@ Every flag and environment variable is in [docs/USAGE.md](docs/USAGE.md).
 | `jm env [name]` | Shell exports (`CONTAINER_HOST`, `DOCKER_HOST`) for podman and docker clients |
 | `jm ports [name]` | Published container ports, where they bind, and the error per mapping |
 | `jm list` / `jm inspect` | Machines and their computed state, shares and publish address (`--json` on both) |
-| `jm set [name]` | Change `--cpus`, `--memory`, `--ssh-port`, `--disk` (grows only, live if running), `--mount`/`--unmount`/`--no-mounts`, `--publish-addr` |
+| `jm set [name]` | Change `--cpus`, `--memory`, `--ssh-port`, `--disk` (grows only, live if running), `--mount`/`--unmount`/`--no-mounts`, `--publish-addr`, `--arc` (live if running) |
 | `jm console [name]` | Guest serial console log (`-f` to follow) |
 | `jm rm [name]` | Remove the machine, its directory and its podman connections |
 | `jm doctor` | Check qemu, HVF, EDK2 firmware, gvproxy, podman, ssh, the state root, share parity, resolver parity and every machine |

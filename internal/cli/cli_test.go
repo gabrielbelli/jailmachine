@@ -438,6 +438,9 @@ func (f *fakeBackend) Capabilities() backend.Capabilities            { return ba
 type fakeProvider struct {
 	state backend.State
 	stops int
+	// endpoint, when set, replaces the default 127.0.0.1:2222 endpoint, so
+	// a test can point the machine's sshd at an in-process server.
+	endpoint *netprov.Endpoint
 }
 
 func (f *fakeProvider) Name() string                   { return "fakenet" }
@@ -456,6 +459,9 @@ func (f *fakeProvider) Stop(context.Context, *machine.Machine) error {
 }
 func (f *fakeProvider) State(*machine.Machine) (backend.State, error) { return f.state, nil }
 func (f *fakeProvider) Endpoint(*machine.Machine) (netprov.Endpoint, error) {
+	if f.endpoint != nil {
+		return *f.endpoint, nil
+	}
 	return netprov.Endpoint{SSHHost: machine.SSHHost, SSHPort: 2222}, nil
 }
 func (f *fakeProvider) Expose(context.Context, *machine.Machine, netprov.Mapping) error {

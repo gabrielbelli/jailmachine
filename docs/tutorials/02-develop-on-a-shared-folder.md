@@ -169,7 +169,7 @@ missing:
 
 ```console
 $ jm set --mount $P:ro
-==> jailmachine: 4 cpus, 4096 MiB, 64 GiB, ssh port 2222, publishing on 0.0.0.0
+==> jailmachine: 4 cpus, 2048 MiB, 64 GiB, ssh port 2222, publishing on 0.0.0.0
 ```
 
 No `==> share:` lines, no "attached on the next start" notice. Compare that

@@ -197,6 +197,9 @@ func startMachine(ctx context.Context, args []string, opts startOpts) error {
 	// through a host sleep, or a guest too old to carry the resync service,
 	// is right before anything is built or run in it.
 	syncGuestClock(ctx, m, client)
+	// The ZFS ARC cap is pushed at every start (see arc.go), so a record
+	// changed while stopped, or a guest that lost loader.conf, converges.
+	syncGuestArc(ctx, m, client)
 
 	// Stage: provision.
 	logf(stdout, "%s: waiting for %s", machine.StageProvision, machine.GuestProvisionMarker)
@@ -218,6 +221,9 @@ func startMachine(ctx context.Context, args []string, opts startOpts) error {
 	// devices and mounts nothing, which is silent everywhere else (ADR
 	// 0007); say so here, as the clock check does for jm_rtcsync.
 	warnMissingShareSupport(ctx, m, client)
+	// Disks provisioned before provision.sh raised MaxAuthTries get it here
+	// (see sshd.go); after provisioning, so it never races provision.sh.
+	syncGuestSSHD(ctx, m, client)
 
 	// Stage: dns (guest half): the guest and its containers get exactly one
 	// nameserver, the host resolver started above.

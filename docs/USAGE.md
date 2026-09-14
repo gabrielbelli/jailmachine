@@ -71,7 +71,8 @@ finished steps are skipped and a partial download resumes.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--cpus <n>` | `4` | Virtual CPUs (at least 1) |
-| `--memory <MiB>` | `4096` | Memory in MiB (at least 256; a bare number, no units here) |
+| `--memory <MiB>` | `2048` | Memory in MiB (at least 256; a bare number, no units here) |
+| `--arc <size>` | `512`, or half of a `--memory` below 1024 MiB | Cap on the guest's ZFS ARC: a bare number is MiB, or use a unit (`1GiB`). `0` is the guest's own default. Otherwise at least 64 MiB and below `--memory`. See [Memory and the ZFS ARC](#memory-and-the-zfs-arc) |
 | `--disk <GiB>` | `64` | Disk size in GiB. `disk.raw` is sparse, so this is a ceiling, not an allocation |
 | `--image <ref>` | `prebaked` | Image source — see [Image sources](#image-sources) |
 | `--ssh-port <port>` | `2222` | Host loopback port forwarded to the guest's sshd |
@@ -81,7 +82,8 @@ finished steps are skipped and a partial download resumes.
 
 ```bash
 jm init
-jm init --cpus 2 --memory 2048 dev
+jm init --cpus 2 --memory 4096 dev
+jm init --memory 8192 --arc 2GiB big              # a bigger file cache for a bigger machine
 jm init --image official:15.1-RELEASE --disk 32
 jm init --mount /work --mount "/srv/data:ro"       # in zsh, brace a :ro on a variable
 jm init --no-mounts --publish-addr 127.0.0.1
@@ -90,6 +92,33 @@ jm init --no-mounts --publish-addr 127.0.0.1
 Exit codes: `0` created; `2` for an invalid flag value or a bad machine
 name; `1` for anything else (image download or checksum failure, the name
 already exists, a missing host tool).
+
+### Memory and the ZFS ARC
+
+The default machine has **2048 MiB**. Machines created before that default
+changed keep the **4096 MiB** they were created with: nothing rewrites a
+machine's memory. To shrink one, stop it and run
+`jm set --memory 2048`.
+
+QEMU keeps every page of guest RAM the guest has ever touched, and FreeBSD's
+ZFS file cache (the ARC) grows, unless capped, to nearly all of the guest's
+memory. An idle machine therefore takes more and more of the Mac's memory
+over days. `--arc` caps the cache; `jm start` applies the cap in the guest
+at every boot, as the runtime sysctl `vfs.zfs.arc.max` and in
+`/boot/loader.conf`. Every machine has a cap of **512 MiB** unless you set
+one, including machines created before the setting existed; a machine with
+less than 1024 MiB gets half its memory instead. On a guest so large that
+the ARC's floor (a 32nd of its memory) reaches the cap, jm lowers the floor
+to half the cap first. A cap the guest still refuses is a warning, not a
+failed start.
+
+```bash
+jm set --arc 1GiB     # applied at once on a running machine
+jm set --arc 0        # the guest's own default ceiling, also at once
+```
+
+See [the row "The VM keeps every page the guest has touched" in docs/LIMITATIONS.md](LIMITATIONS.md#the-machine-itself)
+for the measurements behind the cap.
 
 ### Image sources
 
@@ -211,7 +240,7 @@ jm list
 
 ```
 NAME         STATE    CPUS  MEMORY    DISK    SSH             PORTS
-jailmachine  running  4     4096 MiB  64 GiB  127.0.0.1:2222  0
+jailmachine  running  4     2048 MiB  64 GiB  127.0.0.1:2222  0
 ```
 
 `--json` prints the same records as `jm inspect --json` in an array:
@@ -238,7 +267,8 @@ Network:           gvproxy
 Image:             prebaked:15.1.0
 Image trusted:     true
 CPUs:              4
-Memory:            4096 MiB
+Memory:            2048 MiB
+ZFS ARC cap:       512 MiB
 Disk:              64 GiB
 MAC:               5a:94:ef:e4:0c:ee
 Guest IP:          192.168.127.2
@@ -277,7 +307,8 @@ has no file-sharing capability at all.
 
 `--json` prints one object with snake_case keys: `name`, `state`
 (`running` | `stopped` | `broken`), `backend_state`, `network_state`,
-`backend`, `network`, `image`, `cpus`, `memory_mib`, `disk_gib`, `mac`,
+`backend`, `network`, `image`, `cpus`, `memory_mib`, `arc_mib` (the guest's
+ZFS ARC cap in MiB; `0` is the guest's own default), `disk_gib`, `mac`,
 `ssh_port`, `ssh_user`, `guest_ip`, `mtu` (the link size gvproxy and the
 guest agree on — the plain-text output has no row for it; `jm doctor` states
 the resulting UDP ceiling), `ssh` (host:port), `ssh_key`,
@@ -414,11 +445,17 @@ Change a machine's resources.
 | `--unmount <dir>` | machine stopped | Stop sharing a host directory, from the next start. Repeatable |
 | `--no-mounts` | machine stopped | Drop **every** share. Cannot be combined with `--mount` or `--unmount` |
 | `--publish-addr <addr>` | takes effect on the next start | **Default** host address published ports bind to; a `-p` that names one binds that instead |
+| `--arc <size>` | stopped **or** running | Cap on the guest's ZFS ARC: a bare number is MiB, or use a unit. `0` is the guest's own default; otherwise at least 64 MiB and below the memory (the new `--memory` when both are given). See [Memory and the ZFS ARC](#memory-and-the-zfs-arc) |
 
 `--publish-addr` is accepted while the machine runs: it is recorded, and jm
 prints the `jm stop && jm start` needed to apply it. `--mount`, `--unmount`
 and `--no-mounts` change the share set, which needs the machine **stopped**;
 the new set is attached at the next start.
+
+`--arc` is applied to a running guest at once, and saved; on a stopped
+machine it is saved and applied at the next start. A `--memory` that would
+leave the recorded cap at or above the memory is refused: give a lower `--arc`
+in the same call.
 
 `--disk` extends `disk.raw` sparsely. On a running machine the guest's
 partition and ZFS pool are extended immediately; on a stopped one they are
@@ -432,6 +469,7 @@ jm stop && jm set --mount /work --unmount /Volumes && jm start
 jm stop && jm set --no-mounts && jm start  # drop every share
 jm set --mount "${P}:ro"                # braces, not quotes — see the zsh note below
 jm set --publish-addr 127.0.0.1
+jm set --arc 1GiB                       # works while running
 ```
 
 Exit codes: `0`; `2` for no flags at all, an out-of-range value, a shrink, or
@@ -946,7 +984,7 @@ port and the shared directories change only on a stopped machine` and exits
 >
 > ```console
 > $ jm set --mount $P:ro          # zsh, mangled
-> ==> jailmachine: 4 cpus, 4096 MiB, 64 GiB, ssh port 2222, publishing on 0.0.0.0
+> ==> jailmachine: 4 cpus, 2048 MiB, 64 GiB, ssh port 2222, publishing on 0.0.0.0
 >
 > $ jm set --mount "${P}:ro"      # braced, correct
 > ==> share: /Users/you (rw)
@@ -954,7 +992,7 @@ port and the shared directories change only on a stopped machine` and exits
 > ==> share: /Volumes (rw)
 > ...
 > ==> the shared directories are attached on the next start: jm start jailmachine
-> ==> jailmachine: 4 cpus, 4096 MiB, 64 GiB, ssh port 2222, publishing on 0.0.0.0
+> ==> jailmachine: 4 cpus, 2048 MiB, 64 GiB, ssh port 2222, publishing on 0.0.0.0
 > ```
 >
 > If `jm set --mount` prints no `share:` lines, it added nothing. `jm inspect`

@@ -60,7 +60,7 @@ func TestGenerateKey(t *testing.T) {
 
 func TestArgs(t *testing.T) {
 	got := strings.Join(Args("127.0.0.1", 2222, "root", "/k", []string{"uname", "-a"}), " ")
-	want := "-i /k -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=3 -p 2222 root@127.0.0.1 uname -a"
+	want := "-i /k -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=3 -p 2222 root@127.0.0.1 uname -a"
 	if got != want {
 		t.Errorf("Args = %q\nwant %q", got, want)
 	}
@@ -258,7 +258,7 @@ func TestSocketExists(t *testing.T) {
 
 func TestForwardArgs(t *testing.T) {
 	got := strings.Join(ForwardArgs("127.0.0.1", 2222, "root", "/k", "/h/podman.sock", "/var/run/podman/podman.sock"), " ")
-	for _, want := range []string{"-i /k", "-p 2222", " root@127.0.0.1", " -N ", "-o ExitOnForwardFailure=yes", "-o StreamLocalBindUnlink=yes", "-L /h/podman.sock:/var/run/podman/podman.sock"} {
+	for _, want := range []string{"-i /k", "-o IdentitiesOnly=yes", "-p 2222", " root@127.0.0.1", " -N ", "-o ExitOnForwardFailure=yes", "-o StreamLocalBindUnlink=yes", "-L /h/podman.sock:/var/run/podman/podman.sock"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("ForwardArgs missing %q: %s", want, got)
 		}

@@ -182,6 +182,10 @@ func WaitReady(ctx context.Context, host string, port int, user, keyPath string,
 func Args(host string, port int, user, keyPath string, args []string) []string {
 	a := []string{
 		"-i", keyPath,
+		// Offer only the machine key: an ssh-agent holding many keys
+		// otherwise runs the server's MaxAuthTries out before -i is tried
+		// ("Too many authentication failures").
+		"-o", "IdentitiesOnly=yes",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "LogLevel=ERROR",

@@ -22,7 +22,8 @@ behaviour `jm` relies on. Everything here is implemented by
 | Failure marker | `/var/db/jm-provision-failed` | `provision.sh` EXIT trap on any non-zero exit |
 | Provisioning log | `/var/log/jm-provision.log` | `provision.sh` (`exec > … 2>&1`) |
 | Engine API socket | `/var/run/podman/podman.sock` | our `podman_service` rc script (`/usr/local/etc/rc.d/podman_service`) |
-| SSH | `sshd`, root, `PermitRootLogin prohibit-password`, key from the seed | `provision.sh` |
+| SSH | `sshd`, root, `PermitRootLogin prohibit-password`, `MaxAuthTries 20`, key from the seed | `provision.sh`; `jm start` adds `MaxAuthTries 20` to an older disk |
+| ZFS ARC cap | `vfs.zfs.arc.max` (runtime sysctl, after lowering `vfs.zfs.arc.min` to half the cap when the ARC's floor is at or above it) and `vfs.zfs.arc.max="<bytes>"` in `/boot/loader.conf`, edited with `grep` because `sysrc(8)` refuses names with dots. When the machine's cap is `0`, the runtime value is set back to FreeBSD's default ceiling (a runtime `0` changes nothing) and the `loader.conf` line is removed. `seal.sh` removes the line from a prebaked image | `jm start` over SSH at every start, and `jm set --arc` on a running machine |
 | Container storage | `zroot/containers` mounted at `/var/db/containers` | `provision.sh` |
 | Share mount script | `/usr/local/etc/rc.d/jm_shares` (`jm_shares_enable=YES`) | `provision.sh`, on both paths |
 | Share table (guest) | `/var/db/jm/conf/shares.tab`, a read-only 9p share tagged `jmconf` | the backend, at every start |
@@ -76,7 +77,14 @@ Consequences:
 
 1. Always: `hostname` from `JM_HOSTNAME`, `/root/.ssh/authorized_keys`
    from `JM_SSH_PUBKEY`, `sshd_enable`, `PermitRootLogin
-   prohibit-password`, `service sshd keygen`, restart sshd.
+   prohibit-password`, `MaxAuthTries 20` (added only when the line is
+   missing), `service sshd keygen`, restart sshd. `MaxAuthTries` is raised
+   from sshd's default of 6 because podman-remote's `ssh://` client
+   (`jpodman`, the port forwarder) offers the host's ssh-agent keys as well as
+   the machine key; jm's own `ssh` invocations pass `IdentitiesOnly=yes`
+   instead. `provision.sh` runs once per disk, so on a disk that predates the
+   line `jm start` adds it after provisioning, checks it with `sshd -t` and
+   reloads sshd.
 2. **If `/var/db/jm-provisioned` exists (prebaked image)**: make sure
    `zfs`, `linux`, `pf`, `podman_service` (and `podman`, `bastille`) are
    enabled and started, wait for the podman socket, `exit 0`. Seconds.
@@ -246,12 +254,16 @@ to `--disk`. ZFS grows into the extra space on first boot (`growfs`).
 make image [RELEASE=15.1-RELEASE]   # = ./jm image build --release $(RELEASE) --out dist
 ```
 
-1. `jm --state-root dist/.work init --image official:<release> --ssh-port 2229 jm-image-build`
+1. `jm --state-root dist/.work init --image official:<release> --ssh-port 2229 --arc 0 jm-image-build`
+   (`--arc 0`: the build guest keeps the stock ZFS ARC, so no cap is written
+   to the image's `loader.conf`)
 2. `jm --state-root dist/.work start jm-image-build` (slow path, plus the
    kernel reboot if the pkgbase upgrade installed one)
 3. `guest/seal.sh` over ssh, which removes/does:
    - `/root/.ssh/authorized_keys`, `/etc/ssh/ssh_host_*`, `hostname` in
      `rc.conf`
+   - any `vfs.zfs.arc.max` line in `/boot/loader.conf` (the ARC cap is a
+     machine setting `jm start` writes, not part of the image)
    - `/var/log/jm-provision.log`, `/var/db/jm-provision-failed`,
      `/var/log/nuageinit.log`, truncates every file under `/var/log`
    - `/var/cache/nuageinit`, `/root/.history`, `/tmp/*`, `/var/tmp/*`

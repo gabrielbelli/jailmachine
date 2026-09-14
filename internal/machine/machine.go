@@ -26,7 +26,26 @@ const (
 	MachinesDir        = "machines"
 	DefaultName        = "jailmachine"
 	DefaultImage       = "prebaked"
+	// DefaultArcMiB is the ZFS ARC cap a new machine gets. Unset, FreeBSD
+	// lets the ARC grow to nearly all guest RAM, and QEMU keeps every page
+	// the guest has ever touched, so an idle machine's footprint on the
+	// host creeps up to its full memory size over days.
+	DefaultArcMiB = 512
+	// MinArcMiB is the smallest cap OpenZFS accepts for vfs.zfs.arc.max.
+	MinArcMiB = 64
 )
+
+// DefaultArcFor is the ZFS ARC cap a machine with memoryMiB gets when none
+// was chosen: DefaultArcMiB, but never more than half the memory, so a
+// small machine's default is still a cap the guest accepts. It is 0 (the
+// guest's own default) when half the memory is below MinArcMiB.
+func DefaultArcFor(memoryMiB int) int {
+	arc := min(DefaultArcMiB, memoryMiB/2)
+	if arc < MinArcMiB {
+		return 0
+	}
+	return arc
+}
 
 // Guest-side fixed paths (ADR 0003).
 const (
@@ -52,9 +71,14 @@ type Machine struct {
 	CPUs      int    `json:"cpus"`
 	MemoryMiB int    `json:"memory_mib"`
 	DiskGiB   int    `json:"disk_gib"`
-	MAC       string `json:"mac"`
-	SSHPort   int    `json:"ssh_port"`
-	SSHUser   string `json:"ssh_user"`
+	// ArcMiB caps the guest's ZFS ARC (vfs.zfs.arc.max), pushed over SSH
+	// at every start. 0 leaves the guest's own default. It has no
+	// omitempty: an explicit 0 must survive a save and load, and records
+	// written before the field existed load as DefaultArcMiB.
+	ArcMiB  int    `json:"arc_mib"`
+	MAC     string `json:"mac"`
+	SSHPort int    `json:"ssh_port"`
+	SSHUser string `json:"ssh_user"`
 	// Network is the network provider that created the machine's
 	// attachment (ADR 0004). Records written before providers existed have
 	// it empty, which means the slirp "user" provider.
@@ -99,7 +123,8 @@ func Defaults() Machine {
 		Name:         DefaultName,
 		Image:        DefaultImage,
 		CPUs:         4,
-		MemoryMiB:    4096,
+		MemoryMiB:    2048,
+		ArcMiB:       DefaultArcMiB,
 		DiskGiB:      64,
 		MAC:          "5a:94:ef:e4:0c:ee",
 		SSHPort:      2222,

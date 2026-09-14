@@ -14,6 +14,9 @@ rm -rf /var/db/jm
 rm -f /root/.ssh/authorized_keys
 rm -f /etc/ssh/ssh_host_*
 sysrc -x hostname || true
+# The ZFS ARC cap is a machine setting jm writes at every start, not part of
+# the image (sysrc(8) cannot edit it: the name has dots in it).
+[ -f /boot/loader.conf ] && sed -i '' -e '/^[[:space:]]*vfs\.zfs\.arc\.max[[:space:]]*=/d' /boot/loader.conf || true
 # Logs and state of this build's first boot.
 rm -f /var/log/jm-provision.log /var/db/jm-provision-failed /var/log/nuageinit.log
 find /var/log -type f -exec truncate -s 0 {} +

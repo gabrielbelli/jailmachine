@@ -110,8 +110,10 @@ func runImageBuild(ctx context.Context, o imageBuildOpts) error {
 	defer restorePodmanDefault(ctx, prevDefault)
 
 	// Stage: init + start, exactly as a user would, against the work root.
+	// The build guest keeps the stock ZFS ARC ("--arc 0"), so no cap is
+	// written to the loader.conf that ships in the image.
 	sub := func(args ...string) error { return runSubcommand(ctx, work, args...) }
-	if err := sub("init", "--image", "official:"+o.release, "--ssh-port", fmt.Sprint(imageBuildSSHPort), imageBuildName); err != nil {
+	if err := sub("init", "--image", "official:"+o.release, "--ssh-port", fmt.Sprint(imageBuildSSHPort), "--arc", "0", imageBuildName); err != nil {
 		return fmt.Errorf("image build: init: %w", err)
 	}
 	if err := sub("start", imageBuildName); err != nil {

@@ -56,7 +56,7 @@ func TestArgs(t *testing.T) {
 		{"-M", "virt,accel=" + Accel()},
 		{"-cpu", CPUModel(Accel())},
 		{"-smp", "4"},
-		{"-m", "4096"},
+		{"-m", "2048"},
 		{"-drive", "if=pflash,format=raw,readonly=on,file=" + p.Code},
 		{"-drive", "if=pflash,format=raw,file=" + p.Vars},
 		{"-drive", "file=" + p.Disk + ",format=raw,if=virtio,cache=writeback,discard=unmap"},

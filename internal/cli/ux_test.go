@@ -165,7 +165,7 @@ func TestListColumns(t *testing.T) {
 	if strings.Join(strings.Fields(lines[0]), " ") != "NAME STATE CPUS MEMORY DISK SSH PORTS" {
 		t.Errorf("header = %q", lines[0])
 	}
-	if f := strings.Fields(lines[1]); len(f) != 9 || f[0] != "dev" || f[1] != "stopped" || f[2] != "4" || f[3] != "4096" || f[5] != "64" || f[8] != "0" {
+	if f := strings.Fields(lines[1]); len(f) != 9 || f[0] != "dev" || f[1] != "stopped" || f[2] != "4" || f[3] != "2048" || f[5] != "64" || f[8] != "0" {
 		t.Errorf("row = %q", lines[1])
 	}
 	out, err = run(t, root, "--json", "list")
@@ -176,7 +176,7 @@ func TestListColumns(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &rows); err != nil || len(rows) != 1 {
 		t.Fatalf("json list = %q, %v", out, err)
 	}
-	for _, k := range []string{"name", "state", "cpus", "memory_mib", "disk_gib", "ssh", "ports"} {
+	for _, k := range []string{"name", "state", "cpus", "memory_mib", "arc_mib", "disk_gib", "ssh", "ports"} {
 		if _, ok := rows[0][k]; !ok {
 			t.Errorf("json list lacks %q", k)
 		}

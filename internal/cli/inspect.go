@@ -113,7 +113,8 @@ state is read from the hypervisor and the network provider on every call.
 --json prints one object with snake_case keys:
 
   name, state (running|stopped|broken), backend_state, network_state,
-  backend, network, image, cpus, memory_mib, disk_gib, mac, ssh_port,
+  backend, network, image, cpus, memory_mib, arc_mib (the guest's ZFS ARC
+  cap in MiB; 0 is the guest's own default), disk_gib, mac, ssh_port,
   ssh_user, guest_ip, ssh (host:port), ssh_key, podman_uri,
   podman_sock_uri, api_socket, dns, console, network_logs, dir,
   provisioned, image_trusted (false for a BYO image without a .sha256 sidecar),
@@ -162,6 +163,7 @@ func newInspectCmd() *cobra.Command {
 			row("Image trusted", i.ImageTrusted)
 			row("CPUs", i.CPUs)
 			row("Memory", fmt.Sprintf("%d MiB", i.MemoryMiB))
+			row("ZFS ARC cap", arcWord(i.ArcMiB))
 			row("Disk", fmt.Sprintf("%d GiB", i.DiskGiB))
 			row("MAC", i.MAC)
 			if i.GuestIP != "" {

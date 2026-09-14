@@ -40,6 +40,8 @@ be enough.
 | Limitation audit, syscall probes under `truss` | same machine, plus a throwaway `d-audit` (2 vCPU / 2048 MiB) | same | 2026-08-21 |
 | Head-to-head against podman machine 6.1.0 and Docker Desktop 29.6.2 | `d-bench` (4 vCPU / 4096 MiB / 64 GiB) | Mac14,5 (M2 Max, 12 cores, 32 GiB), macOS 26.5.2 (25F84) | 2026-08-21, 18:13–21:10 UTC |
 | Spot re-checks for this page | the author's machine, unchanged | same | 2026-08-21 |
+| Idle memory after 12 days | the author's own machine, 0 containers, 0 jails, guest FreeBSD 15.1 arm64 | the author's Mac, Activity Monitor and `top` | 2026-09-13 |
+| Balloon experiment | a 2048 MiB guest, FreeBSD 15.1 arm64, `virtio-balloon` | same Mac, QEMU 11.1.1 + HVF | 2026-09-13 |
 
 Two caveats that apply to every number below. The benchmark Mac was **loaded
 throughout** — Docker Desktop with 15 containers, two or three VMs — so
@@ -387,14 +389,16 @@ resource boundary and size the machine accordingly.
 > **The short version.** The VM is heavier and slower to start than the
 > alternatives, and one of those numbers is a **bug of ours**: `jm init`
 > writes about **47 GiB of real disk for an image with 3.17 GiB of content**,
-> which is also why `init` is slow.
+> which is also why `init` is slow. Left uncapped, the guest's ZFS cache also
+> grows until the VM holds nearly all of its memory on the Mac; the ARC cap
+> (512 MiB by default) exists for that.
 
 | Limitation | What you see | Whose | Workaround | Tracking |
 |---|---|---|---|---|
 | `jm init` allocates ~47 GiB | Settled free-space delta for one fresh booted machine: **46.87 GiB**; `st_blocks` agrees at 46.79 GiB; sampling 4000 random 4 KiB blocks of `disk.raw` finds **4.95 % non-zero (~3.17 GiB)**. One run in four landed at 12.87 GiB, the other three at 46–52 GiB | **ours** — the sparse writer in `internal/image/sparse.go` is not punching holes reliably | None today. Budget the disk, and `jm rm` machines you are not using | Should be tracked — the highest-value open bug on this page |
 | `jm init` is disk-bound, not download-bound | From a locally cached `.zst` with no network at all: **59.1 / 63.3 / 113.0 s**. The 802 MiB download by itself is **31 s** by `curl` on this link | **ours**, same root cause as the row above | None | Should be tracked |
 | Start and stop are slow | Warm start **36.7 s** on a loaded Mac against **10.4 s** for podman machine; stop **11.5 s** against 1.06 s. Almost all of it is guest boot | **ours** and **upstream tooling** (QEMU + FreeBSD boot, no fast-resume path) | None. The README's 12–25 s is a quiet Mac; 36.7 s is a busy one | — |
-| The VM's RAM shows up in `ps` | Total host RSS at idle **196 MiB** (142 MiB of it QEMU); the QEMU process' `phys_footprint` ranges 1191–2902 MB for a 4096 MiB guest | **upstream tooling** — QEMU maps guest RAM as ordinary anonymous memory. Apple's Virtualization.framework does not, which is why `vfkit` reports 14 MB for a 2048 MiB guest. That 14 MB is not a real number and neither stack should be read as "uses less RAM" | None; it is accounting, not consumption | — |
+| The VM keeps every page the guest has touched | On a **fresh** machine: total host RSS at idle **196 MiB** (142 MiB of it QEMU), and the QEMU process' `phys_footprint` ranges 1191–2902 MB for a 4096 MiB guest (2026-08-21). **After 12 days idle**, with 0 containers and 0 jails, the author's machine reached **6.92 GB** in Activity Monitor. Inside the guest the ZFS ARC was **3.18 GB** (`vfs.zfs.arc.max` unset, so its ceiling was about the guest's RAM less 1 GiB), wired memory 3.4 GiB, and the largest process 47 MiB (2026-09-13). Ballooning does **not** give the memory back: a `virtio-balloon` inflated from 2048 to 512 MiB dropped QEMU's RSS from about 3.1 GB to 54 MB, but its footprint stayed at 1855–1900 MB and `top`'s compressed-memory column rose from about 0.6 GB to about 3.8 GB (QEMU 11.1.1, HVF, 2048 MiB guest, 2026-09-13) | **upstream tooling** and **Apple/macOS** — QEMU maps guest RAM as ordinary anonymous memory and never hands a page back once the guest touched it, and on macOS the balloon's `madvise(MADV_DONTNEED)` only moves pages into the compressor. Apple's Virtualization.framework accounts differently, which is why `vfkit` reports 14 MB for a 2048 MiB guest; that 14 MB is not a real number either. **ours**, for leaving the ARC uncapped until 2026-09-13 | `jm init --arc` / `jm set --arc` caps the ARC (512 MiB by default, applied at every `jm start`); `jm set --memory` shrinks the guest. That the cap holds a long-idle machine's footprint near the guest's working set **is inferred, not yet measured** | — |
 | Disk grows only | `jm set --disk` extends; nothing shrinks | **ours** | `jm rm && jm init --disk` | — |
 | One SSH port per machine | Running several machines means `jm init --ssh-port 2223 dev` and `JM_MACHINE=dev jpodman ps` | **ours** | As above | — |
 
@@ -505,6 +509,7 @@ or upstream — that would remove the limitation, in rough order of value.
 | To remove | Work needed | Where |
 |---|---|---|
 | ~47 GiB written for 3.17 GiB of content, and the slow `init` that follows from it | Fix hole-punching in `internal/image/sparse.go`, then re-measure the free-space delta and the `init` time. Both numbers should collapse together, and the README's timing claim becomes true again | **Us** — the highest-value bug on this page |
+| The idle footprint growing towards the guest's memory size | Re-measure a capped machine after days idle to confirm the ARC cap bounds it. A real return of memory to macOS needs a balloon or free-page-reporting path that releases pages instead of compressing them, which QEMU on macOS does not have today | **Us** (the measurement), then upstream QEMU |
 | Slow warm start | Profile the guest boot; there is no fast-resume path under QEMU today, and `jm start` deliberately holds no daemon | **Us**, then upstream QEMU/FreeBSD |
 | No fast machine suspend | QEMU savevm against a running FreeBSD guest, plus state-model work in ADR 0005 | **Us**, post-MVP |
 | Other host platforms | A Linux backend (QEMU + KVM, same argv) and a Windows one (Hyper-V) behind ADR 0002's backend interface | **Us**, post-MVP |

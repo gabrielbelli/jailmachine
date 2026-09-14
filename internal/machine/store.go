@@ -73,6 +73,14 @@ func (s *Store) Load(name string) (*Machine, error) {
 	if m.Name == "" {
 		m.Name = name
 	}
+	// A record written before arc_mib existed gets the cap a new machine of
+	// its memory size would get; an explicit 0 is kept.
+	var probe struct {
+		ArcMiB *int `json:"arc_mib"`
+	}
+	if json.Unmarshal(data, &probe) == nil && probe.ArcMiB == nil {
+		m.ArcMiB = DefaultArcFor(m.MemoryMiB)
+	}
 	m.Dir = s.Dir(name)
 	return &m, nil
 }
