@@ -88,6 +88,9 @@ func ensureRunning(ctx context.Context, name string, autostart bool) error {
 	if err != nil {
 		return err
 	}
+	// However short the command, it is use: the sleeper's idle monitor
+	// reads the activity file's mtime (ADR 0009).
+	bumpActivity(m)
 	st, err := currentState(m)
 	if err == nil && ready(m, st) && engineReachable(m) {
 		return nil

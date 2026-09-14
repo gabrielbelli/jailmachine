@@ -27,6 +27,7 @@ import (
 
 	"github.com/gabrielbelli/jailmachine/internal/backend"
 	"github.com/gabrielbelli/jailmachine/internal/forwarder"
+	"github.com/gabrielbelli/jailmachine/internal/idle"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
 	"github.com/gabrielbelli/jailmachine/internal/netprov"
 )
@@ -90,11 +91,19 @@ type guestReply struct {
 	code  int
 }
 
+// idleGuest is the idle probe's output for a guest with nothing running.
+const idleGuest = "v=1\njails=0\nengine=0\nsessions=0\nsshd=1\ninhibit=0\n"
+
+// busyGuest is idleGuest with one key changed.
+func busyGuest(key string, n int) string {
+	return strings.Replace(idleGuest, key+"=0", key+"="+strconv.Itoa(n), 1)
+}
+
 // defaultGuest answers every command jm sends a provisioned, idle guest.
 func defaultGuest(cmd string) guestReply {
 	switch {
 	case strings.Contains(cmd, "printf 'jails="):
-		return guestReply{"probe", "jails=0\nengine=0\nsessions=0\ninhibit=0\n", 0}
+		return guestReply{"probe", idleGuest, 0}
 	case strings.Contains(cmd, "umount"):
 		return guestReply{"quiesce", "ok\n", 0}
 	case strings.Contains(cmd, "date -u -f %s"):
@@ -550,7 +559,7 @@ func TestSuspendRollbackOnActive(t *testing.T) {
 	seedRunningForSuspend(t, root, "sl")
 
 	// Found by the probe under the lock: nothing changes at all.
-	startFakeGuest(t, root, "sl", suspendGuest(&guestReply{"probe", "jails=1\nengine=0\nsessions=0\ninhibit=0\n", 0}, nil, nil))
+	startFakeGuest(t, root, "sl", suspendGuest(&guestReply{"probe", busyGuest("jails", 1), 0}, nil, nil))
 	_, err := run(t, root, "suspend", "sl")
 	if err == nil || !strings.Contains(err.Error(), "busy: 1 jail or container running") {
 		t.Fatalf("suspend with a container = %v", err)
@@ -579,7 +588,7 @@ func TestSuspendForceAndSuccess(t *testing.T) {
 	root := t.TempDir()
 	m := seedRunningForSuspend(t, root, "sl")
 	var quiesced []string
-	startFakeGuest(t, root, "sl", suspendGuest(&guestReply{"probe", "jails=2\nengine=0\nsessions=0\ninhibit=0\n", 0}, nil, &quiesced))
+	startFakeGuest(t, root, "sl", suspendGuest(&guestReply{"probe", busyGuest("jails", 2), 0}, nil, &quiesced))
 
 	out, err := run(t, root, "suspend", "--force", "sl")
 	if err != nil {
@@ -703,31 +712,13 @@ func TestQuiesceScriptGolden(t *testing.T) {
 	if err != nil || string(out) != "/Users/me/My Files" {
 		t.Errorf("printf %%b = %q, %v", out, err)
 	}
-	for _, s := range []string{remountScript(), activityProbe} {
+	for _, s := range []string{remountScript(), idle.ProbeScript} {
 		if out, err := exec.Command("/bin/sh", "-n", "-c", s).CombinedOutput(); err != nil {
 			t.Errorf("sh -n: %v: %s\n%s", err, out, s)
 		}
 	}
 	if strings.Contains(jmRemountFn, "umount") || !strings.Contains(jmRemountFn, "service jm_shares start") {
 		t.Errorf("jm_remount must use the boot-time service and never unmount:\n%s", jmRemountFn)
-	}
-}
-
-func TestParseGuestActivity(t *testing.T) {
-	a, err := parseGuestActivity("jails=0\nengine=1\nsessions=2\ninhibit=1\n")
-	if err != nil || a.jails != 0 || a.engine != 1 || a.sessions != 2 || !a.inhibit {
-		t.Fatalf("parse = %+v, %v", a, err)
-	}
-	if got := a.blockers(1); !slices.Equal(got, []string{"2 command sessions open", machine.GuestNoSleep + " exists"}) {
-		t.Errorf("blockers with the forwarder's stream = %q", got)
-	}
-	if got := a.blockers(0); len(got) != 3 || got[0] != "1 engine client connected" {
-		t.Errorf("blockers without it = %q", got)
-	}
-	for _, bad := range []string{"", "jails=0\nengine=0\nsessions=0\n", "jails=x\nengine=0\nsessions=0\ninhibit=0\n"} {
-		if _, err := parseGuestActivity(bad); err == nil {
-			t.Errorf("parse(%q) should fail", bad)
-		}
 	}
 }
 

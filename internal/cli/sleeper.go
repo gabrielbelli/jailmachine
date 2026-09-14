@@ -8,6 +8,9 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,11 +20,14 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/gabrielbelli/jailmachine/internal/backend"
+	"github.com/gabrielbelli/jailmachine/internal/backend/qemu"
+	"github.com/gabrielbelli/jailmachine/internal/idle"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
 	"github.com/gabrielbelli/jailmachine/internal/netprov"
 	"github.com/gabrielbelli/jailmachine/internal/netprov/gvproxy"
 	"github.com/gabrielbelli/jailmachine/internal/procx"
 	"github.com/gabrielbelli/jailmachine/internal/sleeper"
+	"github.com/gabrielbelli/jailmachine/internal/sshx"
 )
 
 // The sleeper (ADR 0009) is one detached helper per machine, alive whenever
@@ -33,10 +39,8 @@ import (
 // and the release-tcp request.
 const (
 	// sleeperHoldTick is how often the mode is re-evaluated while holding.
+	// A monitoring sleeper re-evaluates on every idle probe tick instead.
 	sleeperHoldTick = 250 * time.Millisecond
-	// sleeperMonitorTick is how often a monitoring sleeper re-evaluates
-	// its mode; the idle probe replaces it with its own ticker.
-	sleeperMonitorTick = 5 * time.Second
 	// wakeSpawnBackoff is how long the sleeper waits before spawning
 	// another "_wake" after one that left the machine suspended.
 	wakeSpawnBackoff = 10 * time.Second
@@ -54,11 +58,58 @@ const (
 // A variable so tests can shorten it.
 var takeTCPTimeout = 5 * time.Second
 
+// The idle monitor (ADR 0009). Variables so tests run it in milliseconds.
+var (
+	// idleProbeInterval is how often a monitoring sleeper samples.
+	idleProbeInterval = idle.ProbeInterval
+	// idleProbeTimeout bounds one guest probe, keepalive included.
+	idleProbeTimeout = 10 * time.Second
+	// idleMinute is the unit of idle_suspend_min.
+	idleMinute = time.Minute
+)
+
+const (
+	// idleProbeFailures is how many probes in a row may fail on the
+	// persistent control connection before it is dialled again.
+	idleProbeFailures = 3
+	// idleSuspendFailures is how many automatic suspends in a row may fail
+	// before automatic suspend is off until the sleeper restarts.
+	idleSuspendFailures = 3
+)
+
+// hypervisorCPUTime is the cumulative CPU time of m's hypervisor process, from
+// ps. A variable so tests can script it.
+var hypervisorCPUTime = func(m *machine.Machine, b backend.Backend) (time.Duration, error) {
+	if b.Name() != qemu.Name || m.Dir == "" {
+		return 0, fmt.Errorf("no hypervisor CPU time for backend %q", b.Name())
+	}
+	data, err := os.ReadFile(filepath.Join(m.Dir, qemu.PIDFile))
+	if err != nil {
+		return 0, err
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		return 0, fmt.Errorf("bad pid file %s", qemu.PIDFile)
+	}
+	out, err := exec.Command("ps", "-o", "time=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return 0, fmt.Errorf("ps -p %d: %w", pid, err)
+	}
+	return idle.ParseCPUTime(string(out))
+}
+
 // sleeperProcess locates m's sleeper. The sleeper and its wakers keep the
 // variable that locates the network provider's program: a wake starts it as
 // a start does.
 func sleeperProcess(m *machine.Machine) sleeper.Process {
 	return sleeper.Process{Dir: m.Dir, Name: m.Name, Root: StateRoot(), KeepEnv: []string{gvproxy.BinaryEnv}}
+}
+
+// sleeperAlive reports whether m's sleeper runs; a variable so tests can
+// pretend.
+var sleeperAlive = func(m *machine.Machine) bool {
+	_, ok := sleeperProcess(m).Alive()
+	return ok
 }
 
 // sleeperSupported reports whether m's components can suspend at all; a
@@ -281,6 +332,54 @@ type sleeperDaemon struct {
 	trigger       sleeper.Kind // the endpoint the first held connection used
 	stoppedBefore bool
 	takeWarned    map[string]bool
+	// triggerAt is when the first connection arrived for a wake, and wokeAt
+	// when a waker's "woke" says its wake began; the flap guard reads the
+	// earlier. Both are cleared when a suspend starts.
+	triggerAt, wokeAt time.Time
+
+	// mon is the idle monitor; only the mode loop's goroutine uses it.
+	mon idleMonitor
+	// probeMu guards client, the persistent control connection the idle
+	// probe runs on. A suspend closes it before its own probe, so the two
+	// never count each other as a session.
+	probeMu        sync.Mutex
+	client         *sshx.Client
+	clientFailures int
+}
+
+// idleMonitor is the state of the idle monitor between ticks.
+type idleMonitor struct {
+	// now is the clock, a variable for tests; its readings carry the
+	// monotonic clock, so a sample's elapsed time never follows the wall
+	// clock.
+	now func() time.Time
+	// active is whether the sleeper is monitoring; entering monitor mode
+	// restarts the tracker.
+	active  bool
+	tracker idle.Tracker
+	// lastProbe is when the last probe ran, lastSample when the last sample
+	// (or monitoring) began: a sample's elapsed time is measured from it.
+	lastProbe, lastSample time.Time
+	// activity is the activity file's mtime at the last sample, and
+	// activityKnown whether there was a last sample to compare with.
+	activity      time.Time
+	activityKnown bool
+	// cpu is the hypervisor's CPU time at cpuAt, when cpuKnown.
+	cpu      time.Duration
+	cpuAt    time.Time
+	cpuKnown bool
+	// failures counts automatic suspends that failed in a row; disabled
+	// is set once there were too many, and holds until the sleeper exits.
+	failures int
+	disabled string
+	// refusal explains why the last automatic suspend was refused when no
+	// probe can see it (a share the guest would not unmount, the
+	// hypervisor's own reasons). It is shown with the blockers until the
+	// next attempt, a probe that finds blockers of its own, or a restart.
+	refusal string
+	// suspendedAt is when this sleeper's last automatic suspend committed;
+	// zero once the flap guard has seen its wake.
+	suspendedAt time.Time
 }
 
 func newSleeperDaemon(m *machine.Machine, b backend.Backend, p netprov.Provider, logger *log.Logger) *sleeperDaemon {
@@ -291,6 +390,7 @@ func newSleeperDaemon(m *machine.Machine, b backend.Backend, p netprov.Provider,
 		takeWarned: map[string]bool{},
 	}
 	d.status = sleeper.Status{Mode: sleeper.ModeMonitor, SSHWake: true}
+	d.mon.now = time.Now
 	d.sl.OnAccept = d.accepted
 	d.waker = &sleeper.Waker{Alive: procx.Alive, Backoff: wakeSpawnBackoff}
 	return d
@@ -311,6 +411,9 @@ func (d *sleeperDaemon) accepted(k sleeper.Kind) {
 	d.mu.Lock()
 	if d.trigger == "" {
 		d.trigger = k
+	}
+	if d.triggerAt.IsZero() {
+		d.triggerAt = time.Now()
 	}
 	d.mu.Unlock()
 	d.wake()
@@ -347,9 +450,11 @@ func (d *sleeperDaemon) loop(ctx context.Context) {
 			d.log.Printf("%s is stopped; exiting", d.m.Name)
 			return
 		}
-		tick := sleeperMonitorTick
-		if mode == sleeper.ModeHold {
-			tick = sleeperHoldTick
+		tick := sleeperHoldTick
+		if mode == sleeper.ModeMonitor {
+			tick = d.monitor(ctx)
+		} else {
+			d.leaveMonitor()
 		}
 		select {
 		case <-ctx.Done():
@@ -638,6 +743,9 @@ func (d *sleeperDaemon) handle(ctx context.Context, line string) string {
 		if by == "" && d.trigger != "" {
 			by = wakeByKind(d.trigger)
 		}
+		if d.wokeAt.IsZero() {
+			d.wokeAt = time.Now().Add(-time.Duration(ms) * time.Millisecond)
+		}
 		d.mu.Unlock()
 		d.update(func(s *sleeper.Status) {
 			s.LastWakeBy = by
@@ -662,42 +770,70 @@ func (d *sleeperDaemon) handle(ctx context.Context, line string) string {
 	return "err unknown request"
 }
 
+// Why a suspend did not start in this sleeper at all.
+var (
+	errSleeperStopping = errors.New("the sleeper is stopping")
+	errSuspendRunning  = errors.New("a suspend is already running")
+)
+
 // suspend runs "jm suspend" for the command that asked, and replies with the
 // outcome. It is never cancelled by the requester going away: a suspend that
 // has started runs to its commit or its rollback.
 func (d *sleeperDaemon) suspend(ctx context.Context, force bool) string {
+	ms, alloc, err := d.runSuspend(ctx, suspendOpts{Reason: "jm suspend", Manual: true, Force: force})
+	switch {
+	case errors.Is(err, errSleeperStopping):
+		return "err the sleeper of " + d.m.Name + " is stopping"
+	case errors.Is(err, errSuspendRunning):
+		return "busy a suspend of " + d.m.Name + " is already running"
+	case err != nil:
+		return suspendReply(err)
+	}
+	return fmt.Sprintf("ok %d %d", ms, alloc)
+}
+
+// runSuspend runs one suspend in this sleeper, for "jm suspend" or the idle
+// monitor: only one at a time, and none once the sleeper is stopping. It
+// returns how long it took and the image's allocated size.
+func (d *sleeperDaemon) runSuspend(ctx context.Context, opts suspendOpts) (ms, alloc int64, err error) {
 	d.mu.Lock()
 	if d.closing {
 		d.mu.Unlock()
-		return "err the sleeper of " + d.m.Name + " is stopping"
+		return 0, 0, errSleeperStopping
 	}
 	if !d.suspending.CompareAndSwap(false, true) {
 		d.mu.Unlock()
-		return "busy a suspend of " + d.m.Name + " is already running"
+		return 0, 0, errSuspendRunning
 	}
 	d.suspendWG.Add(1)
+	// A wake is measured from triggers that arrive from here on.
+	d.triggerAt, d.wokeAt = time.Time{}, time.Time{}
 	d.mu.Unlock()
 	defer func() {
 		d.suspendWG.Done()
 		d.suspending.Store(false)
 		d.wake()
 	}()
+	// The idle probe's session would count as a command session in the
+	// suspend's own probe: it waits for one in flight and closes the
+	// connection, which is never dialled again until the sleeper monitors.
+	d.closeProbeClient()
 	ctx = context.WithoutCancel(ctx)
 	m, err := store().Load(d.m.Name)
 	if err != nil {
-		return "err " + err.Error()
+		return 0, 0, err
 	}
 	began := time.Now()
 	if err := suspendPreflight(m, d.b, d.p); err != nil {
-		return suspendReply(err)
+		return 0, 0, err
 	}
-	opts := suspendOpts{Reason: "jm suspend", Manual: true, Force: force}
 	if err := suspendMachine(ctx, m, d.b, d.p, d.sl, opts); err != nil {
-		d.update(func(s *sleeper.Status) { s.LastSuspendError = err.Error() })
-		return suspendReply(err)
+		if !errors.Is(err, machine.ErrLocked) {
+			d.update(func(s *sleeper.Status) { s.LastSuspendError = err.Error() })
+		}
+		return 0, 0, err
 	}
-	ms := time.Since(began).Milliseconds()
-	var alloc int64
+	ms = time.Since(began).Milliseconds()
 	var savedAt time.Time
 	if s, ok := d.b.(backend.Suspender); ok {
 		if status, err := s.SuspendStatus(m); err == nil {
@@ -714,7 +850,284 @@ func (d *sleeperDaemon) suspend(ctx context.Context, force bool) string {
 		// get connection refused rather than a wake.
 		s.SSHWake = d.sl.TCPListening()
 	})
-	return fmt.Sprintf("ok %d %d", ms, alloc)
+	return ms, alloc, nil
+}
+
+// monitor is one pass of monitor mode: an idle sample when one is due, and
+// an automatic suspend when the machine has been idle long enough. It
+// returns how long to wait for the next pass.
+func (d *sleeperDaemon) monitor(ctx context.Context) time.Duration {
+	mon := &d.mon
+	now := mon.now()
+	if !mon.active {
+		d.enterMonitor(now)
+	}
+	// A control request re-evaluates the mode early; the probe keeps its
+	// own interval, so consecutive samples stay about an interval apart.
+	if !mon.lastProbe.IsZero() {
+		if wait := idleProbeInterval - now.Sub(mon.lastProbe); wait > idleProbeInterval/10 {
+			return wait
+		}
+	}
+	mon.lastProbe = now
+	d.idleTick(ctx, now)
+	return idleProbeInterval
+}
+
+// enterMonitor starts monitoring: the idle time starts from zero (after a
+// boot, a wake or a rollback), and a wake that follows this sleeper's
+// automatic suspend is shown to the flap guard.
+func (d *sleeperDaemon) enterMonitor(now time.Time) {
+	mon := &d.mon
+	mon.active = true
+	mon.tracker.Interval = idleProbeInterval
+	mon.tracker.Restart()
+	mon.lastProbe, mon.lastSample = time.Time{}, now
+	mon.activityKnown, mon.cpuKnown = false, false
+	mon.refusal = ""
+	if mon.suspendedAt.IsZero() {
+		return
+	}
+	d.mu.Lock()
+	trigger := d.triggerAt
+	if trigger.IsZero() || (!d.wokeAt.IsZero() && d.wokeAt.Before(trigger)) {
+		trigger = d.wokeAt
+	}
+	d.triggerAt, d.wokeAt = time.Time{}, time.Time{}
+	d.mu.Unlock()
+	if trigger.IsZero() {
+		trigger = time.Now()
+	}
+	// Wall clock: a Mac asleep with the machine suspended counts as asleep.
+	asleep := trigger.Round(0).Sub(mon.suspendedAt.Round(0))
+	before := mon.tracker.Penalty()
+	mon.tracker.Woke(asleep)
+	mon.suspendedAt = time.Time{}
+	if after := mon.tracker.Penalty(); after != before {
+		d.log.Printf("%s woke %s after its idle suspend; idle period is now %d× the setting", d.m.Name, asleep.Round(time.Second), after)
+	}
+}
+
+// leaveMonitor stops monitoring: the control connection closes (it is never
+// dialled while the sleeper holds endpoints or the machine is suspended), and
+// the idle fields leave sleeper.json.
+func (d *sleeperDaemon) leaveMonitor() {
+	if !d.mon.active {
+		return
+	}
+	d.mon.active = false
+	d.closeProbeClient()
+	d.update(func(s *sleeper.Status) {
+		s.IdleSeconds, s.IdleSuspendAfterSeconds, s.Blockers = 0, 0, nil
+		s.IdleUnavailable, s.CPUPercent = "", 0
+	})
+}
+
+// idleTick takes one sample, records it in sleeper.json and suspends the
+// machine when it is due. The record is read on every tick, so "jm set
+// --idle-suspend" applies at once.
+func (d *sleeperDaemon) idleTick(ctx context.Context, now time.Time) {
+	mon := &d.mon
+	m, err := store().Load(d.m.Name)
+	if err != nil {
+		return
+	}
+	sample, perr := d.probeGuest(ctx, m)
+	sample.EngineBaseline = engineBaseline(m)
+	d.hostSignals(m, &sample)
+	elapsed := now.Sub(mon.lastSample)
+	mon.lastSample = now
+	before := mon.tracker.Blockers()
+	mon.tracker.Observe(sample, perr, elapsed)
+	if perr == nil && len(mon.tracker.Blockers()) > 0 {
+		mon.refusal = ""
+	}
+	if after := mon.tracker.Blockers(); !slices.Equal(before, after) {
+		if len(after) == 0 {
+			d.log.Printf("%s is idle", m.Name)
+		} else {
+			d.log.Printf("%s is held awake by: %s", m.Name, strings.Join(after, ", "))
+		}
+	}
+
+	period := time.Duration(m.IdleSuspendMin) * idleMinute
+	if period <= 0 {
+		mon.refusal = ""
+	}
+	unavailable := ""
+	if err := suspendPreflight(m, d.b, d.p); err != nil {
+		unavailable = strings.TrimPrefix(err.Error(), "cannot suspend "+m.Name+": ")
+	}
+	due := mon.tracker.Due(period) && unavailable == "" && mon.disabled == ""
+	d.writeIdleStatus(m, period, unavailable, sample)
+	if due {
+		d.autoSuspend(ctx, m)
+		d.writeIdleStatus(m, period, unavailable, sample)
+	}
+}
+
+// writeIdleStatus puts the idle monitor's view into sleeper.json.
+func (d *sleeperDaemon) writeIdleStatus(m *machine.Machine, period time.Duration, unavailable string, sample idle.Sample) {
+	mon := &d.mon
+	d.update(func(s *sleeper.Status) {
+		s.IdleSeconds = int64(mon.tracker.Idle() / time.Second)
+		s.IdleSuspendAfterSeconds = int64(mon.tracker.Threshold(period) / time.Second)
+		s.Blockers = mon.tracker.Blockers()
+		if mon.refusal != "" {
+			s.Blockers = append(s.Blockers, mon.refusal)
+		}
+		s.LastActivity = nil
+		if !mon.activity.IsZero() {
+			at := mon.activity
+			s.LastActivity = &at
+		}
+		s.IdleUnavailable, s.DisabledReason = unavailable, mon.disabled
+		s.Penalty = mon.tracker.Penalty()
+		s.CPUPercent = 0
+		if sample.CPUKnown {
+			s.CPUPercent = float64(int(sample.CPUPercent*10+0.5)) / 10
+		}
+	})
+}
+
+// autoSuspend is the idle timer firing. A lock held by another command skips
+// this tick with the idle time kept; guest activity or a client found on the
+// way resets it; any other failure backs off a full idle period, and
+// idleSuspendFailures of them in a row turn automatic suspend off until the
+// sleeper restarts.
+func (d *sleeperDaemon) autoSuspend(ctx context.Context, m *machine.Machine) {
+	mon := &d.mon
+	idleFor := mon.tracker.Idle().Round(time.Second)
+	reason := "idle " + idleSuspendWord(m.IdleSuspendMin)
+	d.log.Printf("%s has been idle for %s; suspending it", m.Name, idleFor)
+	mon.refusal = ""
+	_, _, err := d.runSuspend(ctx, suspendOpts{Reason: reason})
+	switch {
+	case err == nil:
+		mon.failures = 0
+		mon.suspendedAt = time.Now()
+		mon.tracker.Reset()
+	case errors.Is(err, machine.ErrLocked), errors.Is(err, errSuspendRunning), errors.Is(err, errSleeperStopping):
+		d.log.Printf("idle suspend of %s skipped (%v); trying again on the next tick", m.Name, err)
+	case errors.Is(err, backend.ErrSuspendBlocked), errors.Is(err, backend.ErrSuspendAborted):
+		d.log.Printf("idle suspend of %s did not go ahead: %v", m.Name, err)
+		mon.tracker.Reset()
+		mon.refusal = refusalBlocker(m, err)
+	default:
+		mon.failures++
+		mon.tracker.Reset()
+		d.log.Printf("idle suspend of %s failed (%d in a row): %v", m.Name, mon.failures, err)
+		if mon.failures >= idleSuspendFailures {
+			mon.disabled = fmt.Sprintf("automatic suspend failed %d times in a row; it is off until the sleeper restarts ('jm stop%s' and 'jm start%s')",
+				mon.failures, nameHint(m.Name), nameHint(m.Name))
+			d.log.Printf("%s", mon.disabled)
+		}
+	}
+}
+
+// refusalBlocker is the blocker an automatic suspend's refusal leaves in
+// sleeper.json: the busy share, or the reason for a blocked suspend a probe
+// cannot see. Guest activity shows in the next probe, and an arriving
+// client needs no explanation.
+func refusalBlocker(m *machine.Machine, err error) string {
+	var r *suspendRefusal
+	switch {
+	case errors.As(err, &r) && r.share != "":
+		return "share " + r.share + " in use"
+	case errors.Is(err, backend.ErrSuspendBlocked):
+		msg := err.Error()
+		if first, _, ok := strings.Cut(msg, "\n"); ok {
+			msg = first
+		}
+		for _, p := range []string{m.Name + " is busy: ", "cannot suspend " + m.Name + ": "} {
+			msg = strings.TrimPrefix(msg, p)
+		}
+		return "suspend refused: " + msg
+	}
+	return ""
+}
+
+// probeGuest takes the guest half of a sample on the persistent control
+// connection, dialling it when there is none. A keepalive goes first; after
+// idleProbeFailures failures in a row the connection is dropped and the next
+// tick dials again. It never dials while a suspend runs.
+func (d *sleeperDaemon) probeGuest(ctx context.Context, m *machine.Machine) (idle.Sample, error) {
+	d.probeMu.Lock()
+	defer d.probeMu.Unlock()
+	if d.suspending.Load() {
+		return idle.Sample{}, errSuspendRunning
+	}
+	ctx, cancel := context.WithTimeout(ctx, idleProbeTimeout)
+	defer cancel()
+	if d.client == nil {
+		ep, err := d.p.Endpoint(m)
+		if err != nil {
+			return idle.Sample{}, err
+		}
+		c, err := sshx.Dial(ctx, ep.SSHHost, ep.SSHPort, m.SSHUser, sshKey(m))
+		if err != nil {
+			return idle.Sample{}, err
+		}
+		d.client, d.clientFailures = c, 0
+	}
+	sample, err := func() (idle.Sample, error) {
+		if err := d.client.Keepalive(ctx); err != nil {
+			return idle.Sample{}, err
+		}
+		return probeGuestActivity(ctx, d.client)
+	}()
+	// Only a failure of the connection counts towards dropping it: a probe
+	// that ran and answered badly would fail on a fresh one too.
+	var bad *probeOutputError
+	if err != nil && !errors.As(err, &bad) {
+		d.clientFailures++
+		if d.clientFailures >= idleProbeFailures {
+			_ = d.client.Close()
+			d.client, d.clientFailures = nil, 0
+		}
+	} else {
+		d.clientFailures = 0
+	}
+	return sample, err
+}
+
+// closeProbeClient closes the control connection, waiting for a probe in
+// flight.
+func (d *sleeperDaemon) closeProbeClient() {
+	d.probeMu.Lock()
+	defer d.probeMu.Unlock()
+	if d.client != nil {
+		_ = d.client.Close()
+		d.client, d.clientFailures = nil, 0
+	}
+}
+
+// hostSignals adds the host half of a sample: whether a jm client touched the
+// activity file since the last sample, and the hypervisor's CPU use since
+// then.
+func (d *sleeperDaemon) hostSignals(m *machine.Machine, s *idle.Sample) {
+	mon := &d.mon
+	var mtime time.Time
+	if fi, err := os.Stat(filepath.Join(m.Dir, machine.ActivityFile)); err == nil {
+		mtime = fi.ModTime()
+	}
+	s.Activity = mon.activityKnown && !mtime.Equal(mon.activity)
+	mon.activity, mon.activityKnown = mtime, true
+
+	cpu, err := hypervisorCPUTime(m, d.b)
+	if err != nil {
+		mon.cpuKnown = false
+		return
+	}
+	// The reading is timed when it is taken, not when the tick began: the
+	// guest probe before it can take anything up to idleProbeTimeout.
+	at := mon.now()
+	if mon.cpuKnown && cpu >= mon.cpu {
+		if dt := at.Sub(mon.cpuAt); dt > 0 {
+			s.CPUPercent, s.CPUKnown = idle.CPUPercent(cpu-mon.cpu, dt), true
+		}
+	}
+	mon.cpu, mon.cpuAt, mon.cpuKnown = cpu, at, true
 }
 
 // suspendReply renders a suspend error as a control reply: busy for guest

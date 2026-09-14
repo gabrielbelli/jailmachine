@@ -14,6 +14,7 @@ import (
 	"github.com/gabrielbelli/jailmachine/internal/doctor"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
 	"github.com/gabrielbelli/jailmachine/internal/netprov"
+	"github.com/gabrielbelli/jailmachine/internal/sleeper"
 	"github.com/gabrielbelli/jailmachine/internal/version"
 )
 
@@ -96,6 +97,9 @@ func machineChecks(ctx context.Context) []doctor.Result {
 				out = append(out, res)
 			}
 			if res, ok := sleeperCheck(m); ok {
+				out = append(out, res)
+			}
+			if res, ok := idleCheck(m); ok {
 				out = append(out, res)
 			}
 		}
@@ -245,7 +249,7 @@ func sleeperCheck(m *machine.Machine) (doctor.Result, bool) {
 		return res, false
 	}
 	pr := sleeperProcess(m)
-	_, alive := pr.Alive()
+	alive := sleeperAlive(m)
 	switch {
 	case st == backend.Suspended && alive:
 		res.Status, res.Detail = doctor.OK, "holding the engine socket and the SSH port; a connection there wakes the machine"
@@ -261,6 +265,48 @@ func sleeperCheck(m *machine.Machine) (doctor.Result, bool) {
 		res.Fix = "jm start " + m.Name
 	default:
 		return res, false
+	}
+	return res, true
+}
+
+// idleCheck reports what the idle monitor of a running machine last saw
+// (ADR 0009): how long it has been idle, what holds it awake, or that
+// automatic suspend was turned off after repeated failures. It reads
+// sleeper.json only, and has no row while the sleeper is not monitoring
+// (sleeperCheck reports that) or suspend is unavailable
+// (suspendReadinessCheck reports that).
+func idleCheck(m *machine.Machine) (doctor.Result, bool) {
+	res := doctor.Result{Name: "idle suspend " + m.Name}
+	b, p, err := components(m)
+	if err != nil || m.Dir == "" || !sleeperSupported(b, p) {
+		return res, false
+	}
+	if st, err := stateOf(m, b, p); err != nil || !ready(m, st) || !sleeperAlive(m) {
+		return res, false
+	}
+	ss, err := sleeper.LoadStatus(sleeperProcess(m).StatusPath())
+	if err != nil || ss.Mode != sleeper.ModeMonitor {
+		return res, false
+	}
+	after := idleSuspendRow(m.IdleSuspendMin)
+	if secs := ss.IdleSuspendAfterSeconds; secs > int64(m.IdleSuspendMin)*60 {
+		after = "after " + idleSuspendWord(int(secs/60)) + " (lengthened after quick wakes)"
+	}
+	switch {
+	case m.IdleSuspendMin == 0:
+		res.Status, res.Detail = doctor.OK, "off ('jm set --idle-suspend 30m "+m.Name+"' turns it on)"
+	case ss.DisabledReason != "":
+		res.Status, res.Detail = doctor.Warn, ss.DisabledReason
+		if ss.LastSuspendError != "" {
+			res.Detail += "; last error: " + ss.LastSuspendError
+		}
+		res.Fix = "see " + sleeperProcess(m).LogPath() + "; 'jm stop " + m.Name + " && jm start " + m.Name + "' restarts the sleeper"
+	case ss.IdleUnavailable != "":
+		return res, false
+	case len(ss.Blockers) > 0:
+		res.Status, res.Detail = doctor.OK, after+"; held awake by: "+strings.Join(ss.Blockers, ", ")
+	default:
+		res.Status, res.Detail = doctor.OK, after+"; idle "+idleWord(ss.IdleSeconds)
 	}
 	return res, true
 }

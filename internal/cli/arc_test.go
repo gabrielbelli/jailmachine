@@ -514,12 +514,88 @@ func TestSetArcRunningMachine(t *testing.T) {
 
 func TestSSHDScript(t *testing.T) {
 	for _, want := range []string{
-		"grep -qx 'MaxAuthTries 20' \"$f\" && exit 0",
+		"grep -qx 'MaxAuthTries 20' \"$f\" && grep -qx 'ClientAliveInterval 30' \"$f\" && grep -qx 'ClientAliveCountMax 4' \"$f\" && exit 0",
+		"jm_set MaxAuthTries 20 &&",
+		"jm_set ClientAliveInterval 30 &&",
+		"jm_set ClientAliveCountMax 4 &&",
 		"sshd -t || { rc=$?; mv \"$f.jm\" \"$f\"; exit $rc; }",
 		"service sshd reload",
 	} {
-		if !strings.Contains(sshdMaxAuthTriesScript, want) {
-			t.Errorf("sshd script lacks %q", want)
+		if !strings.Contains(sshdSettingsScript, want) {
+			t.Errorf("sshd script lacks %q:\n%s", want, sshdSettingsScript)
 		}
+	}
+	if out, err := exec.Command("/bin/sh", "-n", "-c", sshdSettingsScript).CombinedOutput(); err != nil {
+		t.Errorf("sh -n: %v: %s", err, out)
+	}
+
+	// Run it against a scratch config with fake sshd and service: the
+	// commented default is replaced, a missing line appended, a second run
+	// changes nothing, and a config sshd -t rejects is put back.
+	dir := t.TempDir()
+	conf := filepath.Join(dir, "sshd_config")
+	orig := "#MaxAuthTries 6\nPermitRootLogin prohibit-password\n#ClientAliveInterval 0\n"
+	if err := os.WriteFile(conf, []byte(orig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The script is written for FreeBSD's sed, whose -i takes a separate
+	// (here empty) suffix; GNU sed would read '' as a file. This sed turns
+	// that into the attached-suffix form both accept.
+	sed := `#!/bin/sh
+if [ "$1" = -i ] && [ "$2" = "" ]; then
+  shift 2
+  for a; do last=$a; done
+  PATH=/usr/bin:/bin sed -i.jmsed "$@" || exit
+  rm -f "$last.jmsed"
+  exit 0
+fi
+PATH=/usr/bin:/bin exec sed "$@"
+`
+	for name, body := range map[string]string{
+		"sshd":    "#!/bin/sh\n[ ! -e \"" + filepath.Join(dir, "reject") + "\" ]\n",
+		"service": "#!/bin/sh\nexit 0\n",
+		"sed":     sed,
+	} {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	script := strings.Replace(sshdSettingsScript, "f=/etc/ssh/sshd_config", "f="+conf, 1)
+	runScript := func() (string, error) {
+		cmd := exec.Command("/bin/sh", "-c", script)
+		cmd.Env = append(os.Environ(), "PATH="+bin+":/usr/bin:/bin")
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+	if out, err := runScript(); err != nil || !strings.Contains(out, "changed") {
+		t.Fatalf("first run = %q, %v", out, err)
+	}
+	data, _ := os.ReadFile(conf)
+	for _, kv := range sshdSettings {
+		if strings.Count(string(data), kv+"\n") != 1 {
+			t.Errorf("config lacks exactly one %q:\n%s", kv, data)
+		}
+	}
+	if out, err := runScript(); err != nil || strings.Contains(out, "changed") {
+		t.Errorf("second run = %q, %v", out, err)
+	}
+	if err := os.WriteFile(conf, []byte(orig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "reject"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runScript(); err == nil {
+		t.Error("a config sshd -t rejects was accepted")
+	}
+	if data, _ := os.ReadFile(conf); string(data) != orig {
+		t.Errorf("rejected config not put back:\n%s", data)
+	}
+	if _, err := os.Stat(conf + ".jm"); !os.IsNotExist(err) {
+		t.Errorf("backup left behind: %v", err)
 	}
 }

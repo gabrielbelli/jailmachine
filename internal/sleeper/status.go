@@ -8,8 +8,8 @@ import (
 )
 
 // Status is sleeper.json: what the sleeper last reported. "jm inspect" and
-// "jm doctor" read it and never ask the sleeper. Fields a later step fills in
-// (the idle ones) are omitted while empty.
+// "jm doctor" read it and never ask the sleeper. The idle fields describe the
+// idle monitor while the machine runs, and are omitted while empty.
 type Status struct {
 	// PID is the sleeper that wrote the file.
 	PID int `json:"pid"`
@@ -31,6 +31,9 @@ type Status struct {
 	IdleUnavailable         string     `json:"idle_unavailable,omitempty"`
 	DisabledReason          string     `json:"disabled_reason,omitempty"`
 	Penalty                 int        `json:"penalty,omitempty"`
+	// CPUPercent is the hypervisor's CPU use over the last sample, in
+	// percent of one core, for calibrating the busy threshold.
+	CPUPercent float64 `json:"cpu_percent,omitempty"`
 
 	LastSuspendError string `json:"last_suspend_error,omitempty"`
 	LastSuspendMS    int64  `json:"last_suspend_ms,omitempty"`

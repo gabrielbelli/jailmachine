@@ -146,6 +146,29 @@ func (c *Client) Succeeds(ctx context.Context, cmd string) (bool, error) {
 	return false, err
 }
 
+// Keepalive sends an OpenSSH keepalive request and waits for the answer, so
+// a long-lived connection whose peer has gone is noticed. Any answer, a
+// refusal included, means the peer is there. When ctx ends first the
+// connection is closed and ctx.Err() is returned.
+func (c *Client) Keepalive(ctx context.Context) error {
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := c.conn.SendRequest("keepalive@openssh.com", true, nil)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("sshx: keepalive: %w", err)
+		}
+		return nil
+	case <-ctx.Done():
+		c.conn.Close()
+		<-done
+		return ctx.Err()
+	}
+}
+
 // Close tears down the underlying connection.
 func (c *Client) Close() error {
 	if c == nil || c.conn == nil {

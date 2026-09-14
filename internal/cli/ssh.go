@@ -33,6 +33,8 @@ func newSSHCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// A command too short for the idle probe to see is still use.
+			bumpActivity(m)
 			st, err := currentState(m)
 			if err != nil {
 				return err

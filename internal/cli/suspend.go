@@ -14,6 +14,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/gabrielbelli/jailmachine/internal/backend"
+	"github.com/gabrielbelli/jailmachine/internal/idle"
 	"github.com/gabrielbelli/jailmachine/internal/machine"
 	"github.com/gabrielbelli/jailmachine/internal/netprov"
 	"github.com/gabrielbelli/jailmachine/internal/sleeper"
@@ -97,6 +98,9 @@ type suspendOpts struct {
 type suspendRefusal struct {
 	kind error
 	msg  string
+	// share is the shared directory the guest would not unmount, when that
+	// is the reason.
+	share string
 }
 
 func (e *suspendRefusal) Error() string { return e.msg }
@@ -287,11 +291,8 @@ func suspendMachine(ctx context.Context, m *machine.Machine, b backend.Backend, 
 		if perr != nil {
 			return refuse(backend.ErrSuspendUnavailable, "cannot suspend %s: reading guest activity: %v", m.Name, perr)
 		}
-		baseline := 0
-		if _, alive := forwarderProcess(m).Alive(); alive {
-			baseline = 1 // the forwarder's own events stream
-		}
-		if blockers := act.blockers(baseline); len(blockers) > 0 {
+		act.EngineBaseline = engineBaseline(m)
+		if blockers := act.Blockers(); len(blockers) > 0 {
 			return withHint(refuse(backend.ErrSuspendBlocked, "%s is busy: %s", m.Name, strings.Join(blockers, ", ")),
 				"'jm suspend --force"+nameHint(m.Name)+"' suspends it anyway")
 		}
@@ -304,7 +305,7 @@ func suspendMachine(ctx context.Context, m *machine.Machine, b backend.Backend, 
 		"mtu":           strconv.Itoa(m.MTU),
 	}
 	if perr == nil {
-		meta["containers"] = strconv.Itoa(act.jails)
+		meta["containers"] = strconv.Itoa(act.Jails)
 	}
 	if sl.Aborted() {
 		return refuse(backend.ErrSuspendAborted, "suspend of %s cancelled: a client arrived", m.Name)
@@ -346,7 +347,10 @@ func suspendMachine(ctx context.Context, m *machine.Machine, b backend.Backend, 
 		return rb.guestRunning(ctx, withHint(refuse(backend.ErrSuspendBlocked, "%s is busy: %s", m.Name, quiesceReason(out, "active")),
 			"'jm suspend --force"+nameHint(m.Name)+"' suspends it anyway"))
 	case code == quiesceBusy:
-		return rb.guestRunning(ctx, refuse(backend.ErrSuspendBlocked, "%s is busy: a shared directory is in use in the guest: %s", m.Name, quiesceReason(out, "busy")))
+		share := quiesceReason(out, "busy")
+		r := refuse(backend.ErrSuspendBlocked, "%s is busy: a shared directory is in use in the guest: %s", m.Name, share)
+		r.(*suspendRefusal).share = share
+		return rb.guestRunning(ctx, r)
 	case code != 0 || !strings.Contains(out, "ok"):
 		return rb.guestRunning(ctx, fmt.Errorf("cannot suspend %s: quiescing the guest exited %d: %s", m.Name, code, lastLine(out)))
 	}
@@ -608,72 +612,39 @@ echo ok
 `
 }
 
-// activityProbe is the one-exec guest activity sample S2 takes.
-const activityProbe = jmSessionsFn + `printf 'jails=%s\n' "$(jls jid | wc -l | tr -d ' ')"
-printf 'engine=%s\n' "$(` + guestEngineClients + `)"
-printf 'sessions=%s\n' "$(jm_sessions)"
-printf 'inhibit=%s\n' "$([ -e ` + machine.GuestNoSleep + ` ] && echo 1 || echo 0)"
-`
-
-// guestActivity is one activityProbe sample.
-type guestActivity struct {
-	jails, engine, sessions int
-	inhibit                 bool
+// engineBaseline is the number of guest engine clients jm itself holds: the
+// forwarder's events stream, while the forwarder runs.
+func engineBaseline(m *machine.Machine) int {
+	if _, alive := forwarderProcess(m).Alive(); alive {
+		return 1
+	}
+	return 0
 }
 
-// parseGuestActivity reads activityProbe's output; a missing or garbled key
-// is an error, so a guest that cannot be read never looks idle.
-func parseGuestActivity(out string) (guestActivity, error) {
-	vals := map[string]int{}
-	for _, l := range strings.Split(out, "\n") {
-		k, v, ok := strings.Cut(strings.TrimSpace(l), "=")
-		if !ok {
-			continue
-		}
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			return guestActivity{}, fmt.Errorf("unexpected %q in the activity probe", l)
-		}
-		vals[k] = n
-	}
-	for _, k := range []string{"jails", "engine", "sessions", "inhibit"} {
-		if _, ok := vals[k]; !ok {
-			return guestActivity{}, fmt.Errorf("the activity probe did not report %s: %q", k, strings.TrimSpace(out))
-		}
-	}
-	return guestActivity{jails: vals["jails"], engine: vals["engine"], sessions: vals["sessions"], inhibit: vals["inhibit"] != 0}, nil
-}
-
-// probeGuestActivity runs activityProbe.
-func probeGuestActivity(ctx context.Context, client *sshx.Client) (guestActivity, error) {
+// probeGuestActivity takes the guest half of an idle sample (idle.ProbeScript)
+// on client. S2 applies its strict single-sample rules; the sleeper feeds it
+// to its idle tracker.
+func probeGuestActivity(ctx context.Context, client *sshx.Client) (idle.Sample, error) {
 	ctx, cancel := context.WithTimeout(ctx, suspendGuestTimeout)
 	defer cancel()
-	out, code, err := runGuestScript(ctx, client, activityProbe)
+	out, code, err := runGuestScript(ctx, client, idle.ProbeScript)
 	if err != nil {
-		return guestActivity{}, err
+		return idle.Sample{}, err
 	}
 	if code != 0 {
-		return guestActivity{}, fmt.Errorf("the activity probe exited %d: %s", code, lastLine(out))
+		return idle.Sample{}, &probeOutputError{fmt.Errorf("the idle probe exited %d: %s", code, lastLine(out))}
 	}
-	return parseGuestActivity(out)
+	s, err := idle.ParseProbe(out)
+	if err != nil {
+		return idle.Sample{}, &probeOutputError{err}
+	}
+	return s, nil
 }
 
-// blockers lists what keeps the guest from being suspended, under the strict
-// single-sample rules of a suspend that is about to happen. baseline is the
-// number of engine clients jm itself holds.
-func (a guestActivity) blockers(baseline int) []string {
-	var out []string
-	if a.jails > 0 {
-		out = append(out, plural(a.jails, "1 jail or container running", strconv.Itoa(a.jails)+" jails or containers running"))
-	}
-	if n := a.engine - baseline; n > 0 {
-		out = append(out, plural(n, "1 engine client connected", strconv.Itoa(n)+" engine clients connected"))
-	}
-	if a.sessions > 0 {
-		out = append(out, plural(a.sessions, "1 command session open", strconv.Itoa(a.sessions)+" command sessions open"))
-	}
-	if a.inhibit {
-		out = append(out, machine.GuestNoSleep+" exists")
-	}
-	return out
-}
+// probeOutputError is an idle probe that ran but whose answer is unusable:
+// a non-zero exit or output ParseProbe rejects. The connection that carried
+// it works.
+type probeOutputError struct{ err error }
+
+func (e *probeOutputError) Error() string { return e.err.Error() }
+func (e *probeOutputError) Unwrap() error { return e.err }
