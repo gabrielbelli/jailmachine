@@ -73,9 +73,15 @@ _jm_tab=$_jm_conf_dir/shares.tab
 _jm_begin="# BEGIN jm shares (generated, do not edit)"
 _jm_end="# END jm shares"
 
+# _jm_mounted reports whether a p9fs file system is mounted at $1. It reads
+# "mount -p", which spells a space in a path as \040 and a tab as \011,
+# and escapes $1 the same way: plain "mount" output splits such a path
+# into several fields. The path reaches awk through the environment, never
+# awk -v, which would decode the escapes again.
 _jm_mounted()
 {
-	mount -t p9fs | awk -v p="$1" '$3 == p { found = 1 } END { exit !found }'
+	_p=$(printf '%s' "$1" | sed -e 's/ /\\040/g' -e "s/$(printf '\t')/\\\\011/g")
+	mount -p -t p9fs | JM_D="$_p" awk '$2 == ENVIRON["JM_D"] { f = 1 } END { exit !f }'
 }
 
 # _jm_fstab rewrites the jm-managed block of /etc/fstab from the table, so

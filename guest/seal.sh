@@ -6,9 +6,32 @@
 # See docs/guest-contract.md.
 set -x
 # Host shares belong to the machine this image was built on, not to the
-# image: unmount them so nothing of the builder's host is captured.
+# image: unmount them, then remove the mountpoints jm_shares created and
+# its block in /etc/fstab, so nothing of the builder's host is captured.
+# The next machine's jm_shares writes its own at boot.
+_jm_dirs=$(awk -F '	' '$1 != "" && $1 !~ /^#/ { print $2 }' /var/db/jm/conf/shares.tab 2>/dev/null)
 service jm_shares stop || true
+printf '%s\n' "$_jm_dirs" | tail -r | while IFS= read -r _dir; do
+	[ -n "$_dir" ] && rmdir -p "$_dir" 2>/dev/null
+done
 rm -rf /var/db/jm
+if [ -f /etc/fstab ]; then
+	awk '
+		$0 == "# BEGIN jm shares (generated, do not edit)" { skip = 1 }
+		!skip { print }
+		$0 == "# END jm shares" { skip = 0 }
+	' /etc/fstab > /etc/fstab.seal && chmod 644 /etc/fstab.seal &&
+	    mv -f /etc/fstab.seal /etc/fstab
+fi
+# Name resolution: the dns stage of the build machine's "jm start" pointed
+# the guest at that host's resolver port and search domains (ADR 0008).
+# Undo it, so the next machine boots on DHCP's resolv.conf until its own
+# dns stage takes over, and a first start whose dns stage fails is a
+# warning rather than a failure.
+rm -f /etc/resolv.conf /var/unbound/unbound.conf
+rm -f /usr/local/etc/containers/containers.conf.d/50-jailmachine-dns.conf
+[ -f /etc/resolvconf.conf ] && sed -i '' -e '/# jailmachine owns /d' /etc/resolvconf.conf || true
+sysrc -x local_unbound_enable || true
 # Per-machine identity: the next machine's seed brings its own key and
 # hostname; sshd regenerates host keys on start (sshd_keygen precmd).
 rm -f /root/.ssh/authorized_keys
