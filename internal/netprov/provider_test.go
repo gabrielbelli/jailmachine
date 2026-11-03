@@ -26,6 +26,7 @@ func (fake) Unexpose(context.Context, *machine.Machine, Mapping) error { return 
 func (fake) List(context.Context, *machine.Machine) ([]Mapping, error) { return nil, ErrUnsupported }
 
 func TestRegistry(t *testing.T) {
+	t.Cleanup(func() { unregister("fake") })
 	Register(fake{"fake"})
 	p, err := Get("fake")
 	if err != nil || p.Name() != "fake" {

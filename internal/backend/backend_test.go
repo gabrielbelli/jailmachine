@@ -22,6 +22,7 @@ func (fake) Logs(*machine.Machine) []string                               { retu
 func (fake) Capabilities() Capabilities                                   { return Capabilities{} }
 
 func TestRegistry(t *testing.T) {
+	t.Cleanup(func() { unregister("fake") })
 	Register(fake{})
 	if _, err := Get("fake"); err != nil {
 		t.Fatal(err)

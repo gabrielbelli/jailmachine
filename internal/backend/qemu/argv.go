@@ -23,7 +23,7 @@ const (
 )
 
 // FallbackFirmwareDir is tried when the share dir cannot be derived from the
-// binary location (matches the PoC's /opt/homebrew/share/qemu).
+// binary location (Homebrew's share dir on Apple Silicon).
 const FallbackFirmwareDir = "/opt/homebrew/share/qemu"
 
 // Files this backend keeps in the machine directory, besides the
@@ -101,8 +101,10 @@ func CPUModel(accel string) string {
 	return "host"
 }
 
-// Args builds the qemu-system-aarch64 argument vector, mirroring bin/jm
-// cmd_start exactly.
+// Args builds the qemu-system-aarch64 argument vector: the virt machine
+// with UEFI pflash, the disk and seed drives, the network netdev, one 9p
+// device per share at its pinned PCI address, the serial console to a file,
+// QMP and the pidfile.
 func Args(m *machine.Machine, net backend.NetAttachment, p Paths) []string {
 	mac := net.MAC
 	if mac == "" {

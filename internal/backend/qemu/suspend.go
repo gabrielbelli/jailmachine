@@ -814,7 +814,10 @@ func (r *resume) waitLoaded(ctx context.Context, mon *Monitor) (*Monitor, error)
 				return nil, r.transient("%v", ctx.Err())
 			}
 			if mon, err = DialMonitor(ctx, r.p.QMP); err != nil {
-				if !procx.Alive(r.pid) {
+				// A QEMU that rejects the state closes its QMP socket a
+				// moment before it exits: give it that moment, so the
+				// refused redial is not mistaken for a transient failure.
+				if procx.WaitExit(ctx, r.pid, 500*time.Millisecond) {
 					return nil, r.rejected("QEMU exited while loading: %s", tailOf(r.p.Log))
 				}
 				return nil, r.transient("%v", err)
