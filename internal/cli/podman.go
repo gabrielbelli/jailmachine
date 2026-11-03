@@ -73,7 +73,11 @@ func execPodman(ctx context.Context, args []string) error {
 			}
 		}
 	}
-	argv := append([]string{bin, "--connection", conn}, rest...)
+	argv := []string{bin}
+	if conn != "" {
+		argv = append(argv, "--connection", conn)
+	}
+	argv = append(argv, rest...)
 	return syscall.Exec(bin, argv, env)
 }
 
@@ -89,13 +93,20 @@ func wrapperTarget(ctx context.Context, args []string) (name string, rest []stri
 		nameArgs = []string{n}
 	}
 	name, err = resolveName(nameArgs)
+	if clientOnly(rest) {
+		// "--version", "--help" and the like need no machine, so they work
+		// before "jm init" too: an unresolvable name is no error here, and
+		// the caller runs the client without a connection.
+		if err != nil {
+			return "", rest, nil
+		}
+		return name, rest, nil
+	}
 	if err != nil {
 		return "", nil, err
 	}
-	if !clientOnly(rest) {
-		if err := ensureRunning(ctx, name, autostartEnabled() && !noAutostart); err != nil {
-			return "", nil, err
-		}
+	if err := ensureRunning(ctx, name, autostartEnabled() && !noAutostart); err != nil {
+		return "", nil, err
 	}
 	return name, rest, nil
 }
@@ -146,18 +157,36 @@ func namesInternalCommand(root *cobra.Command, args []string) bool {
 	return false
 }
 
-// jmBinary is the path detached helpers are launched from: the running
-// executable with any symlink resolved, so a helper started from a
-// "jpodman" or "jdocker" invocation still runs as jm.
+// jmBinary is the path detached helpers are launched from. A helper
+// started from a "jpodman" or "jdocker" invocation runs as the "jm" next
+// to the wrapper. Symlinks are not resolved otherwise: Homebrew's
+// /opt/homebrew/bin/jm points into a versioned Caskroom directory that an
+// upgrade deletes, and a long-lived helper (the sleeper spawns "_wake")
+// must still find its binary after that.
 func jmBinary() (string, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return "", err
 	}
-	if real, err := filepath.EvalSymlinks(exe); err == nil {
-		return real, nil
+	return helperPath(exe), nil
+}
+
+// helperPath is jmBinary for a given executable path.
+func helperPath(exe string) string {
+	switch filepath.Base(exe) {
+	case WrapperName, DockerWrapperName:
+		if jm := filepath.Join(filepath.Dir(exe), "jm"); isFile(jm) {
+			return jm
+		}
+		// No jm beside the wrapper: wrapperArgs still sends a hidden
+		// subcommand to jm, so the wrapper path itself works.
 	}
-	return exe, nil
+	return exe
+}
+
+func isFile(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && !fi.IsDir()
 }
 
 // isComposeCall reports whether these wrapper arguments invoke the compose

@@ -34,9 +34,14 @@ func resolveDefault(existing []string) (name, note string, err error) {
 	sort.Strings(names)
 	// The passthrough commands take no machine argument; they select with
 	// $JM_MACHINE instead, so suggesting "jm podman <name>" would loop.
-	if activeCommand == "podman" {
+	switch activeCommand {
+	case "podman", "docker":
+		wrapper := WrapperName
+		if activeCommand == "docker" {
+			wrapper = DockerWrapperName
+		}
 		return "", "", usagef("no machine named %q and several exist: %s (choose one, e.g. 'JM_MACHINE=%s %s')",
-			machine.DefaultName, strings.Join(names, ", "), names[0], WrapperName)
+			machine.DefaultName, strings.Join(names, ", "), names[0], wrapper)
 	}
 	return "", "", usagef("no machine named %q and several exist: %s (name one, e.g. 'jm %s %s')",
 		machine.DefaultName, strings.Join(names, ", "), activeCommand, names[0])
@@ -59,9 +64,22 @@ func resolveName(args []string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	found := false
 	names := make([]string, 0, len(ms))
 	for _, m := range ms {
 		names = append(names, m.Name)
+		if m.Name == machine.DefaultName {
+			found = true
+		}
+	}
+	// List skips records it cannot read. A default machine whose record is
+	// unreadable would otherwise vanish, with "jm init" refusing to create
+	// it again, so its load error is the answer here.
+	if !found && store().Exists(machine.DefaultName) {
+		if _, lerr := store().Load(machine.DefaultName); lerr != nil {
+			activeMachine = machine.DefaultName
+			return "", withHint(lerr, "run 'jm rm --force "+machine.DefaultName+"' to remove it, then 'jm init'")
+		}
 	}
 	name, note, err := resolveDefault(names)
 	if err != nil {
@@ -69,7 +87,7 @@ func resolveName(args []string) (string, error) {
 	}
 	activeMachine = name
 	if note != "" {
-		logf(stdout, "%s", note)
+		logf(stderr, "%s", note)
 	}
 	return name, nil
 }

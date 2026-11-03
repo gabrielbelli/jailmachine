@@ -25,7 +25,7 @@ func newInitCmd() *cobra.Command {
 	var (
 		imageRef string
 		cpus     int
-		memory   int
+		memory   string
 		disk     int
 		sshPort  int
 		mounts   []string
@@ -46,8 +46,8 @@ func newInitCmd() *cobra.Command {
 			"https URL to a .raw, .raw.xz or .raw.zst is used as is, verified against a\n" +
 			"sibling .sha256 when one exists and marked untrusted otherwise.",
 		Example: `  jm init
-  jm init --cpus 2 --memory 4096 dev
-  jm init --arc 1GiB --memory 8192   # a larger ZFS cache for a larger machine
+  jm init --cpus 2 --memory 4GiB dev
+  jm init --arc 1GiB --memory 8GiB   # a larger ZFS cache for a larger machine
   jm init --idle-suspend 2h          # or 0 to never suspend
   jm init --mount /work --mount /srv/data:ro
   jm init --no-mounts
@@ -56,8 +56,12 @@ func newInitCmd() *cobra.Command {
   jm init --image ~/Downloads/custom.raw.zst   # verified if custom.raw.zst.sha256 sits next to it`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			mib, err := ParseMemoryMiB(memory)
+			if err != nil {
+				return usagef("--memory: %v", err)
+			}
 			return runInit(cmd.Context(), args, initOpts{
-				image: imageRef, cpus: cpus, memory: memory, disk: disk, sshPort: sshPort,
+				image: imageRef, cpus: cpus, memory: mib, disk: disk, sshPort: sshPort,
 				mounts: mounts, noMounts: noMounts, publishAddr: pubAddr, arc: arc,
 				idleSuspend: idle,
 			})
@@ -66,7 +70,7 @@ func newInitCmd() *cobra.Command {
 	f := cmd.Flags()
 	f.StringVar(&imageRef, "image", machine.DefaultImage, "image source: prebaked[:<guest version>], official[:<release>], or a path/URL to a .raw[.xz|.zst]")
 	f.IntVar(&cpus, "cpus", d.CPUs, "number of virtual CPUs")
-	f.IntVar(&memory, "memory", d.MemoryMiB, "memory in MiB")
+	f.StringVar(&memory, "memory", strconv.Itoa(d.MemoryMiB), "memory: MiB, or with a unit (4096MiB, 4GiB, 4g)")
 	f.IntVar(&disk, "disk", d.DiskGiB, "disk size in GiB")
 	f.IntVar(&sshPort, "ssh-port", d.SSHPort, "host port forwarded to the guest's sshd")
 	f.StringArrayVar(&mounts, "mount", nil, mountFlagUsage)
@@ -219,6 +223,14 @@ func fetchHint(name string, ref machine.ImageRef, err error) string {
 	if ref.Source == "prebaked" && errors.Is(err, image.ErrNoChecksum) {
 		return fmt.Sprintf("guest release guest-%s is not published (or has no .sha256 sidecar); try 'jm init%s --image official' to provision the stock FreeBSD image on first boot", ref.Release, nameHint(name))
 	}
+	// A path or URL the user gave: re-running fixes nothing but a download
+	// cut short.
+	if ref.Source == "byo" && !strings.Contains(ref.Release, "://") {
+		return "check the path, or use --image prebaked"
+	}
+	if ref.Source == "byo" {
+		return fmt.Sprintf("check the URL, or use --image prebaked; re-run 'jm init%s' to resume a download cut short", nameHint(name))
+	}
 	return fmt.Sprintf("re-run 'jm init%s'; a partial download resumes where it stopped", nameHint(name))
 }
 
@@ -326,7 +338,11 @@ func runInit(ctx context.Context, args []string, o initOpts) error {
 	if _, err := os.Stat(diskPath); err != nil {
 		logf(stdout, "image: fetching %s", m.Image)
 		if err := src.Fetch(ctx, diskPath, progressOut()); err != nil {
-			return withHint(fmt.Errorf("image: %w", err), fetchHint(name, ref, err))
+			// The image package's errors already say "image:".
+			if !strings.HasPrefix(err.Error(), "image:") {
+				err = fmt.Errorf("image: %w", err)
+			}
+			return withHint(err, fetchHint(name, ref, err))
 		}
 		// Trust is a property of the source (ADR 0003): the checksummed
 		// sources fail rather than install an unverified image; BYO

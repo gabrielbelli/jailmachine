@@ -102,8 +102,6 @@ func ensureRunning(ctx context.Context, name string, autostart bool) error {
 			// rather than waited for.
 			abortSuspendInFlight(ctx, m)
 		}
-		ctx, cancel := context.WithTimeout(ctx, autostartLockWait)
-		defer cancel()
 		// With autostart off the wake must not turn into a boot: a "jm stop"
 		// that held the lock meanwhile has the last word.
 		return startQuietlyFn(ctx, name, !autostart)
@@ -113,8 +111,6 @@ func ensureRunning(ctx context.Context, name string, autostart bool) error {
 			"run 'jm start"+nameHint(name)+"'")
 	}
 	fmt.Fprintf(stderr, "starting jailmachine %q...\n", name)
-	ctx, cancel := context.WithTimeout(ctx, autostartLockWait)
-	defer cancel()
 	return startQuietlyFn(ctx, name, false)
 }
 
@@ -154,28 +150,34 @@ func engineReachable(m *machine.Machine) bool {
 // once or is not there.
 const engineDialTimeout = 500 * time.Millisecond
 
-// startQuietly runs the start stages without the stage lines and progress
+// runQuietly runs the start stages without the stage lines and progress
 // dots: the wrapper has already said what is happening, and everything the
 // command prints after this belongs to podman or docker. Errors are
-// untouched — a failed boot still reports its stage and log.
-func startQuietly(ctx context.Context, name string) error {
-	return runQuietly(ctx, name, false)
-}
-
-// runQuietly is startQuietly that, with wakeOnly, wakes or finishes a
-// machine but never boots one found stopped under the lock.
+// untouched — a failed boot still reports its stage and log. With
+// wakeOnly it wakes or finishes a machine but never boots one found
+// stopped under the lock.
+//
+// Only the wait for the lock is bounded by autostartLockWait; the stages
+// keep their own timeouts, so a first boot gets its full provisioning
+// budget.
 func runQuietly(ctx context.Context, name string, wakeOnly bool) error {
 	was := quiet
 	quiet = true
 	defer func() { quiet = was }()
-	return startMachine(ctx, []string{name}, startOpts{waitLock: true, skipIfReady: true, wakeOnly: wakeOnly, wakeBy: "wrapper"})
+	return startMachine(ctx, []string{name}, startOpts{waitLock: true, lockWait: autostartLockWait, skipIfReady: true, wakeOnly: wakeOnly, wakeBy: "wrapper"})
 }
 
 // lockMaybeWait takes the per-machine lock, waiting for it when wait is
 // set instead of failing with "another jm command is operating on ...".
-func lockMaybeWait(ctx context.Context, name string, wait bool) (func(), error) {
+// A non-zero bound limits that wait, and only that wait.
+func lockMaybeWait(ctx context.Context, name string, wait bool, bound time.Duration) (func(), error) {
 	if !wait {
 		return lock(name)
+	}
+	if bound > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, bound)
+		defer cancel()
 	}
 	unlock, err := store().LockWait(ctx, name)
 	if err != nil {

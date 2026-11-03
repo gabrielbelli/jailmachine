@@ -23,8 +23,12 @@ func TestFetchHintPrebakedMissingRelease(t *testing.T) {
 		t.Errorf("generic hint = %q", h)
 	}
 	h = fetchHint("dev", machine.ImageRef{Source: "byo", Release: "./x.raw"}, image.ErrNoChecksum)
-	if strings.Contains(h, "--image official") {
+	if strings.Contains(h, "--image official") || strings.Contains(h, "resumes") || !strings.Contains(h, "check the path") {
 		t.Errorf("byo hint = %q", h)
+	}
+	h = fetchHint("dev", machine.ImageRef{Source: "byo", Release: "https://example.org/x.raw.zst"}, errors.New("connection reset"))
+	if !strings.Contains(h, "check the URL") {
+		t.Errorf("byo URL hint = %q", h)
 	}
 }
 

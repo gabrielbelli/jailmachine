@@ -43,15 +43,14 @@ type fakeFrame struct {
 }
 
 type fakeVM struct {
-	mu              sync.Mutex
-	status          string
-	mig, migErr     string
-	dir             string
-	memMiB          int64
-	migrate, load   string
-	rec             *os.File
-	recMu           sync.Mutex
-	incomingStarted bool
+	mu            sync.Mutex
+	status        string
+	mig, migErr   string
+	dir           string
+	memMiB        int64
+	migrate, load string
+	rec           *os.File
+	recMu         sync.Mutex
 }
 
 func serveFakeQEMU(mode string, args []string, pidFile, qmp string) int {

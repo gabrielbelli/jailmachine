@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/gabrielbelli/jailmachine/internal/backend"
@@ -225,9 +227,10 @@ var setDefaultConnection bool
 
 // podmanConnectionAdd registers the SSH connection under the machine's
 // name and, when the provider proxies the guest API to a host socket, a
-// second "<name>-sock" connection for it. The default connection is only
-// changed with --set-default.
-func podmanConnectionAdd(ctx context.Context, m *machine.Machine, ep netprov.Endpoint) error {
+// second "<name>-sock" connection for it. The SSH connection is made the
+// default only when makeDefault is set: with --set-default, or when it was
+// the default before start removed it.
+func podmanConnectionAdd(ctx context.Context, m *machine.Machine, ep netprov.Endpoint, makeDefault bool) error {
 	add := func(args ...string) error {
 		out, err := podman(ctx, append([]string{"system", "connection", "add"}, args...)...)
 		if err != nil {
@@ -241,7 +244,7 @@ func podmanConnectionAdd(ctx context.Context, m *machine.Machine, ep netprov.End
 	if err := add("--identity", sshKey(m), m.Name, m.PodmanURI()); err != nil {
 		return err
 	}
-	if setDefaultConnection {
+	if makeDefault {
 		if out, err := podman(ctx, "system", "connection", "default", m.Name); err != nil {
 			return fmt.Errorf("podman system connection default: %w: %s", err, out)
 		}
@@ -282,6 +285,37 @@ func consoleHint(m *machine.Machine, b backend.Backend) string {
 // networkHint is consoleHint for the network provider.
 func networkHint(m *machine.Machine, p netprov.Provider) string {
 	return logsHint(p.Logs(m), p.Name())
+}
+
+// networkStartHint is networkHint for a provider that failed to start. A
+// port another process already holds (the SSH port is 2222 by default,
+// which Vagrant also uses) gets a hint that says how to find the holder
+// and how to move the machine off it.
+func networkStartHint(m *machine.Machine, p netprov.Provider, err error) string {
+	port, ok := portInUse(err)
+	if !ok {
+		return networkHint(m, p)
+	}
+	h := fmt.Sprintf("another process holds port %s (lsof -nP -iTCP:%s -sTCP:LISTEN)", port, port)
+	if port == strconv.Itoa(m.SSHPort) {
+		h += "; pick another SSH port: jm set " + m.Name + " --ssh-port <port>"
+	}
+	return h + "; " + networkHint(m, p)
+}
+
+// bindInUse matches the Go error text for a listen on a port that is taken.
+var bindInUse = regexp.MustCompile(`listen tcp [^ ]*:(\d+): bind: address already in use`)
+
+// portInUse reports the port of an "address already in use" error.
+func portInUse(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	mm := bindInUse.FindStringSubmatch(err.Error())
+	if mm == nil {
+		return "", false
+	}
+	return mm[1], true
 }
 
 func logsHint(logs []string, component string) string {

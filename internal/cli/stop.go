@@ -18,7 +18,8 @@ func newStopCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "stop [name]",
 		Short: "Shut a machine down",
-		Long: "Ask the guest to power off, stop the hypervisor, then the network provider. Stopping a stopped machine is a no-op.\n\n" +
+		Long: "Ask the guest to power off, stop the hypervisor, then the network provider.\n" +
+			"Stopping a stopped machine is a no-op.\n\n" +
 			"A suspended machine is restored first and then shut down cleanly; --force\n" +
 			"discards a suspended machine's saved state instead.",
 		Example: `  jm stop

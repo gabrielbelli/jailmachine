@@ -420,9 +420,8 @@ func TestHelpListsEnv(t *testing.T) {
 // optional netprov interfaces, scripted the same way, and both record what
 // they were asked to do in fakeEvents.
 type fakeBackend struct {
-	state    backend.State
-	stops    []bool
-	stopArgs *[]bool
+	state backend.State
+	stops []bool
 
 	// Suspender scripting.
 	suspendable string

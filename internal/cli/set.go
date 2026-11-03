@@ -274,6 +274,12 @@ func runSet(ctx context.Context, args []string, o setOpts) error {
 		return err
 	}
 	defer unlock()
+	if m, err = reloadLocked(m.Name); err != nil {
+		return err
+	}
+	if c, err = o.validate(m); err != nil {
+		return usage(err)
+	}
 
 	st, err := currentState(m)
 	if err != nil {

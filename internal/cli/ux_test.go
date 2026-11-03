@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"regexp"
@@ -40,9 +41,17 @@ func TestResolveDefault(t *testing.T) {
 func TestDefaultMachineFallback(t *testing.T) {
 	root := t.TempDir()
 	seedRecord(t, root, "dev")
+	var errBuf bytes.Buffer
+	oldErr := stderr
+	stderr = &errBuf
 	out, err := run(t, root, "inspect")
-	if err != nil || !strings.Contains(out, "==> using dev (the only machine)") || !strings.Contains(out, "Name:") {
+	stderr = oldErr
+	if err != nil || !strings.Contains(out, "Name:") {
 		t.Fatalf("inspect = %q, %v", out, err)
+	}
+	// The note is diagnostic: on stdout it would break 'eval "$(jm env)"'.
+	if strings.Contains(out, "using dev") || !strings.Contains(errBuf.String(), "==> using dev (the only machine)") {
+		t.Errorf("note: stdout %q, stderr %q", out, errBuf.String())
 	}
 	out, err = run(t, root, "--json", "inspect")
 	if err != nil {

@@ -45,12 +45,15 @@ func newStartCmd() *cobra.Command {
 		Use:   "start [name]",
 		Short: "Boot a machine and connect podman to it",
 		Long: "Boot a machine in stages: network provider, hypervisor, SSH, first-boot\n" +
-			"provisioning, podman connection, port forwarder, sleeper. Starting a running machine\n" +
-			"re-checks the ssh, provision, dns, connect and forwarder stages (so an interrupted start can be\n" +
-			"finished); a broken one (half of it running) is stopped and started again.\n\n" +
+			"provisioning, podman connection, port forwarder, sleeper. Starting a\n" +
+			"running machine re-checks the ssh, provision, dns, connect and forwarder\n" +
+			"stages (so an interrupted start can be finished); a broken one (half of\n" +
+			"it running) is stopped and started again. A suspended machine is restored\n" +
+			"from its saved state instead of booted.\n\n" +
 			"On failure the error names the stage and the log to read: qemu.log and\n" +
 			"console.log (hypervisor), gvproxy.log and forward.log (networking),\n" +
-			"forwarder.log (port publishing), or /var/log/jm-provision.log in the guest.",
+			"resolver.log (host DNS), forwarder.log (port publishing), sleeper.log\n" +
+			"(suspend), or /var/log/jm-provision.log in the guest.",
 		Example: `  jm start
   jm start dev
   jm -q start && jpodman run --rm --os=linux docker.io/alpine echo hi
@@ -91,6 +94,18 @@ type startOpts struct {
 	// wakeBy names the caller in the sleeper's status when this start wakes
 	// a suspended machine.
 	wakeBy string
+	// lockWait, when non-zero, bounds the wait for the lock (waitLock).
+	lockWait time.Duration
+}
+
+// reloadLocked reads the record again once the caller holds the lock, so a
+// change made by the previous holder is not undone.
+func reloadLocked(name string) (*machine.Machine, error) {
+	m, err := store().Load(name)
+	if errors.Is(err, machine.ErrNotFound) {
+		return nil, fmt.Errorf("machine %q was removed while this command waited for it", name)
+	}
+	return m, err
 }
 
 // startMachine is "jm start", with the variations autostart needs.
@@ -103,11 +118,16 @@ func startMachine(ctx context.Context, args []string, opts startOpts) error {
 	if err != nil {
 		return err
 	}
-	unlock, err := lockMaybeWait(ctx, m.Name, opts.waitLock)
+	unlock, err := lockMaybeWait(ctx, m.Name, opts.waitLock, opts.lockWait)
 	if err != nil {
 		return err
 	}
 	defer unlock()
+	// The record may have changed ("jm set") or gone ("jm rm") while this
+	// command waited for the lock.
+	if m, err = reloadLocked(m.Name); err != nil {
+		return err
+	}
 
 	// An interrupted suspend or wake is resolved before anything else, so
 	// the state below is running, suspended or stopped (ADR 0009).
@@ -189,7 +209,7 @@ func startMachine(ctx context.Context, args []string, opts startOpts) error {
 	}
 	att, ep, err := p.Start(ctx, m)
 	if err != nil {
-		return machine.NewStageError(machine.StageNetwork, networkHint(m, p), err)
+		return machine.NewStageError(machine.StageNetwork, networkStartHint(m, p, err), err)
 	}
 	if ep.GuestIP != m.GuestIP {
 		m.GuestIP = ep.GuestIP
@@ -225,6 +245,7 @@ func startMachine(ctx context.Context, args []string, opts startOpts) error {
 			// Do not leave a provider running for a hypervisor that never
 			// started; that would read as "broken" afterwards.
 			_ = p.Stop(ctx, m)
+			stopResolver(ctx, m)
 			return machine.NewStageError(machine.StageBackend, consoleHint(m, b), err)
 		}
 	}
@@ -291,8 +312,11 @@ func startMachine(ctx context.Context, args []string, opts startOpts) error {
 	}
 	logf(stdout, "%s: configuring podman connection %q", machine.StageConnect, m.Name)
 	forgetHostKey(m)
+	// Removing the connection also drops it as podman's default, so a
+	// default chosen earlier (--set-default) is put back after the add.
+	wasDefault := podmanDefaultConnection(ctx) == m.Name
 	podmanConnectionRemove(ctx, m)
-	if err := podmanConnectionAdd(ctx, m, ep); err != nil {
+	if err := podmanConnectionAdd(ctx, m, ep, wasDefault || setDefaultConnection); err != nil {
 		return machine.NewStageError(machine.StageConnect, "is podman installed? brew install podman; then re-run 'jm start"+nameHint(m.Name)+"'", err)
 	}
 	if ep.APISocket != "" {

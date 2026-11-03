@@ -16,7 +16,9 @@ func newRmCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "rm [name]",
 		Short: "Remove a machine and all its state",
-		Long:  "Stop the machine if needed, forget its podman connection and host key, and delete its directory. Always converges to \"gone\". A suspended machine's saved state is discarded, not restored.",
+		Long: "Stop the machine if needed, forget its podman connection and host key,\n" +
+			"and delete its directory. Always converges to \"gone\". A suspended\n" +
+			"machine's saved state is discarded, not restored.",
 		Example: `  jm rm
   jm rm --force dev`,
 		Args: cobra.MaximumNArgs(1),

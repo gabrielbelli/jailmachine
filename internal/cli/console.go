@@ -25,8 +25,9 @@ func newConsoleCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "console [name]",
 		Short: "Show the guest's serial console log",
-		Long:  "Print the last lines of the guest's serial console log, as written by the hypervisor. With -f keep printing new output until Ctrl-C.",
-		Args:  cobra.MaximumNArgs(1),
+		Long: "Print the last lines of the guest's serial console log, as written by the\n" +
+			"hypervisor. With -f keep printing new output until Ctrl-C.",
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			m, err := loadMachine(args)
 			if err != nil {
