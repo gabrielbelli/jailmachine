@@ -9,7 +9,7 @@ resolve**.
 
 | | |
 |---|---|
-| You need | A machine from [tutorial 1](01-first-container.md), started. For the compose half, the docker CLI (`brew install docker`) |
+| You need | A machine from [tutorial 1](01-first-container.md), started. For the compose half, the docker CLI and Compose (`brew install docker docker-compose`, plus one line in `~/.docker/config.json`: see [`jm docker`](../USAGE.md#jm-docker---no-autostart-docker-args-and-jdocker)), or Docker Desktop |
 | Time | About 15 minutes |
 | You end with | The same stack running two different ways, and torn down |
 

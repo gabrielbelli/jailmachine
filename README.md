@@ -7,13 +7,8 @@ client an endpoint pointing at it — so you can run **native FreeBSD OCI
 images**, **Linux images** through the Linuxulator, and **jails**, from a
 macOS terminal, without keeping a FreeBSD box around.
 
-> **Status: MVP / working demo.** This proves the idea end to end and is
-> usable for real work: `jm init && jm start`, then build and run FreeBSD and
-> Linux images, publish ports to the host, create jails in the guest. Since
-> v0.1.0 it also shares host directories at identical paths, resolves names
-> exactly as your Mac does, starts the machine on demand from `jpodman` /
-> `jdocker`, and ships a `jdocker` wrapper for the docker CLI. It is still not
-> a Docker Desktop replacement: see
+> **Status: working demo, v0.3.x.** It is usable for real work, but it is
+> not a Docker Desktop replacement: see
 > [what works, and what does not yet](#what-works-and-what-does-not-yet).
 
 ## Install
@@ -38,7 +33,7 @@ git clone https://github.com/gabrielbelli/jailmachine && cd jailmachine && make 
 `jm doctor` checks every tool and machine and prints a fix per failure.
 Details in [docs/INSTALL.md](docs/INSTALL.md).
 
-## 60-second quickstart
+## Quickstart
 
 ```bash
 jm init      # SSH key, download and verify the guest image, grow the disk, write the seed
@@ -47,8 +42,8 @@ jm start     # boot, provision, connect podman, share host paths, start the forw
 
 `jm init` takes **60–115 s**. It downloads roughly 800 MiB and checks its
 SHA256, but the download is the smaller half — about 31 s on this link,
-against 59–113 s for an `init` from an image already cached on disk. Writing
-`disk.raw` out is what dominates, and that is a bug of ours: see
+against 59–113 s for an `init` from an image already cached on disk.
+Decompressing the 64 GiB disk image is what dominates: see
 [the machine itself](docs/LIMITATIONS.md#the-machine-itself). On the prebaked
 image a cold first boot takes about 22 s (32 s was observed once with two
 other VMs already running on the host) and a warm start 12–25 s on an idle
@@ -90,6 +85,7 @@ Those two and `jpodman compose` are all covered in
 Build a native FreeBSD image:
 
 ```bash
+mkdir -p ~/jm-demo && cd ~/jm-demo
 cat > Containerfile <<'EOF'
 FROM ghcr.io/freebsd/freebsd-runtime:15.1
 RUN env ASSUME_ALWAYS_YES=yes pkg bootstrap -f && pkg install -y curl && pkg clean -ay
@@ -358,10 +354,11 @@ Hub **and** GHCR — need no flag at all.
 | Image | Flag | Result |
 |---|---|---|
 | `alpine`, `debian:trixie-slim`, `ubuntu:24.04`, `python:3-alpine`, `golang:alpine`, `hello-world` | `--os=linux` | Works |
-| `postgres:17-alpine`, `caddy:alpine` | `--os=linux` | Works |
+| `caddy:alpine` | `--os=linux` | Works |
+| `postgres:17-alpine` | `--os=linux` | **No** — `postgres --version` runs, but `initdb` needs `signalfd` (v14+) or SysV shared memory (v13 and earlier), [details](docs/LIMITATIONS.md#postgresql-is-the-one-genuine-casualty) |
 | `nginx:1.31-alpine` | `--os=linux` | Works with one config line: `accept_mutex on;` |
 | `redis:alpine` | `--os=linux` | Works with `redis-server --ignore-warnings ARM64-COW-BUG` |
-| `node:22-alpine` | `--os=linux` | **No** — the one known-bad image, [details](docs/USAGE.md#node-the-one-known-bad-image) |
+| `node:22-alpine` | `--os=linux` | **No** — every invocation but `--version` hangs, [details](docs/USAGE.md#node-the-one-known-bad-image) |
 | `dougrabson/freebsd15-minimal`, `dougrabson/freebsd14-minimal`, `ghcr.io/freebsd/freebsd-runtime:15.1` and `:14.3` | none | Work (native FreeBSD) |
 
 The full matrix, both workarounds, and the script that produced it
@@ -430,9 +427,6 @@ make test lint
 JM_E2E=1 make e2e     # full init -> start -> podman run -> stop -> rm, needs qemu + podman
 ```
 
-`bin/jm` is the original shell proof of concept, kept as legacy reference;
-the Go binary is the product.
-
 ## Documentation
 
 - [docs/tutorials/](docs/tutorials/) — four end-to-end walkthroughs: first container, shared-folder dev loop, a compose/kube stack, and native FreeBSD images and jails
@@ -457,7 +451,7 @@ Tracked, with measurements, in the issue tracker:
 | Issue | Effect | Workaround today |
 |---|---|---|
 | [#2 UDP datagrams larger than the link MTU are dropped](https://github.com/gabrielbelli/jailmachine/issues/2) | gvproxy does not fragment: the ceiling is 8972 bytes at the default MTU, where Linux delivers 65507. Native FreeBSD containers hit the same wall, so it is the link, not the Linuxulator | `JM_MTU` (576–16384) moves the ceiling; `jm doctor` states it per machine |
-| [#3 Healthchecks never run](https://github.com/gabrielbelli/jailmachine/issues/3) | A podman-on-FreeBSD gap: healthchecks are scheduled with systemd transient timers and there is no systemd, so `--health-interval` never fires and the status sits at `starting` with zero log entries. A bare-metal FreeBSD container host behaves the same. **Restart policies do work** — the issue's title still says otherwise and needs amending | `jm ssh -- podman healthcheck run <name>`, or a cron entry in the guest |
+| [#3 Healthchecks never run](https://github.com/gabrielbelli/jailmachine/issues/3) | A podman-on-FreeBSD gap: healthchecks are scheduled with systemd transient timers and there is no systemd, so `--health-interval` never fires and the status sits at `starting` with zero log entries. A bare-metal FreeBSD container host behaves the same. **Restart policies do work** | `jm ssh -- podman healthcheck run <name>`, or a cron entry in the guest |
 | [#4 an inotify watch cannot be created on a 9p share, which also runs at ~70 MB/s](https://github.com/gabrielbelli/jailmachine/issues/4) | Not missing events — `inotify_add_watch` on a shared path fails outright with `Bad file descriptor`, so the watch is never created; it works on an engine-managed volume and on the container's own filesystem. Reads are coherent immediately. Metadata is the bigger cost: 1000 small files take **3.6 s** on a share against **0.76 s** on the guest's own disk | Use polling watchers (`CHOKIDAR_USEPOLLING=1`, `nodemon --legacy-watch`, `--watch.usePolling`); keep build output in an engine-managed volume |
 | [#5 containers cannot resolve each other by name](https://github.com/gabrielbelli/jailmachine/issues/5) | A podman-on-FreeBSD gap: the guest runs podman's **CNI** backend because `netavark` is not packaged for FreeBSD, and the CNI `dnsname` plugin is not packaged either, so `podman network inspect podman` reports `dns_enabled: false` and a sibling lookup fails with `nc: bad address 'redis'`. `aardvark-dns` is in the repo but is useless without netavark. This breaks the default shape of most compose files | Put the containers in a **Pod** — they share a network namespace, so `localhost` works, which is what `kube play` gives you. (Podman also writes pod mates' *container* names into `/etc/hosts`, but under `kube play` that is `<pod>-<container>`, not the manifest's `name:` — so use `localhost`.) Otherwise `network_mode: "service:<name>"` in compose, or `extra_hosts`/`--add-host` with the container's bridge IP |
 

@@ -1,15 +1,7 @@
 # Installing jailmachine
 
-> **Still an MVP — a working demo**, but a wider one than v0.1.0. One command
-> brings up a FreeBSD VM, native FreeBSD OCI images and Linux images both run,
-> published ports reach the host, and bastille jails work inside the guest.
-> Since v0.1.0 it also shares host directories at identical paths, resolves
-> names exactly as the Mac does, starts a stopped machine on demand from
-> `jpodman`/`jdocker`, ships a `jdocker` wrapper for the docker CLI, and
-> publishes ports with docker-identical `-p` semantics, UDP included. The
-> one Linuxulator gap left is narrow: busybox's `nc -u -l` fails where every
-> other UDP server works — see
-> [TROUBLESHOOTING](TROUBLESHOOTING.md#udp-in-a-linux-container).
+> **Status: working demo, v0.3.x.** See
+> [what works, and what does not yet](../README.md#what-works-and-what-does-not-yet).
 
 See [USAGE.md](USAGE.md) for the command reference once jm is installed,
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md) when something misbehaves, and
@@ -25,7 +17,7 @@ See [USAGE.md](USAGE.md) for the command reference once jm is installed,
 | podman | 5.0 or newer (`brew install podman`) — the host client, and the `gvproxy` binary jm uses for networking ships inside the podman formula at `libexec/podman/gvproxy` |
 | OpenSSH | `ssh` and `ssh-keygen` from the base system (`xcode-select --install` if missing) |
 | RAM | About 2 GB free: the default machine is 4 vCPU / 2048 MiB, with the guest's ZFS cache capped at 512 MiB |
-| Disk | About 10 GB free. The image download is roughly 800 MiB compressed; `disk.raw` is created sparse at the `--disk` size (64 GiB by default) and only occupies what the guest actually writes |
+| Disk | About 10 GB free. The image download is roughly 800 MiB compressed; `disk.raw` is created sparse at the `--disk` size (64 GiB by default) and a fresh machine occupies about 3 GiB. A machine created by jm 0.3.0 or earlier can hold about 60 GiB of zeros; `jm ssh -- zpool trim -w zroot` gives them back in a second |
 | Optional | `xz` (`brew install xz`) makes decompression of the official image faster; without it jm falls back to a slower in-process decoder. `zstd` is needed only by maintainers running `jm image build` |
 
 ## Install
@@ -47,8 +39,9 @@ brew install --cask gabrielbelli/tap/jailmachine
 The cask declares `qemu` and `podman` as dependencies, so Homebrew installs
 them if they are missing. It also strips the quarantine flag from the binary
 and creates the `jpodman` and `jdocker` symlinks next to `jm`. The docker CLI
-itself is not a dependency — `brew install docker` if you want `jdocker` or
-`docker compose`.
+itself is not a dependency — see
+[the docker CLI and Compose](#the-docker-cli-and-compose) if you want
+`jdocker` or `jdocker compose`.
 
 `brew install gabrielbelli/tap/jailmachine` (without `--cask`) resolves to
 the same cask.
@@ -96,8 +89,37 @@ describe` and installs `jm` and both the `jpodman` and `jdocker` symlinks into
 make install PREFIX="$HOME/.local"
 ```
 
+> If you installed the cask, `make install` with the default `PREFIX`
+> replaces the cask's `/opt/homebrew/bin/jm` symlink with a file Homebrew does
+> not own, and a later `brew upgrade` or `brew uninstall` leaves it behind.
+> Run `brew uninstall jailmachine` first, or use `PREFIX="$HOME/.local"`.
+
 `make build` instead leaves `./jm` in the working tree, which is enough to
 try it out.
+
+### The docker CLI and Compose
+
+Optional, for `jdocker` and `jdocker compose`. Homebrew's `docker` formula is
+the client alone; Compose is the separate `docker-compose` formula, a docker
+CLI plugin:
+
+```bash
+brew install docker docker-compose
+```
+
+The docker CLI does not find the plugin until you tell it where Homebrew put
+it. Add this key to `~/.docker/config.json` (create the file if it does not
+exist, and keep any keys already in it):
+
+```json
+{
+  "cliPluginsExtraDirs": ["/opt/homebrew/lib/docker/cli-plugins"]
+}
+```
+
+`jdocker compose version` then prints a version instead of
+`docker: 'compose' is not a docker command`. Docker Desktop ships its own
+Compose plugin, so a Mac with Docker Desktop installed needs neither step.
 
 ## Verify the install
 
@@ -186,7 +208,7 @@ Measured on an Apple Silicon Mac (2026-08-21):
 
 | | Time |
 |---|---|
-| `jm init` from the published release | **60–115 s**. The roughly 800 MiB download is about 31 s of it; writing `disk.raw` out is the rest, and it is a bug of ours ([LIMITATIONS](LIMITATIONS.md#the-machine-itself)) |
+| `jm init` from the published release | **60–115 s**. The roughly 800 MiB download is about 31 s of it; decompressing the 64 GiB `disk.raw` is the rest ([LIMITATIONS](LIMITATIONS.md#the-machine-itself)) |
 | First boot, prebaked image (the default) | about 22 s (32 s measured once with two other VMs already running on the host) |
 | First boot, `--image official:<release>` | about 2 min (packages are installed inside the guest, including one kernel reboot) |
 | Later starts of an existing machine | 12–25 s on an idle Mac (36.7 s measured on a loaded one) |
@@ -197,7 +219,7 @@ separate: it fetches the `guest-<version>` release asset named by the binary,
 roughly 800 MiB, verifies its SHA256 and decompresses it to `disk.raw`. The
 decompression, not the download, is what dominates — an `init` from an image
 already cached on disk still took 59–113 s with no network at all, because
-the sparse writer is not punching holes reliably
+the whole 64 GiB image is decoded and scanned for zeros
 ([LIMITATIONS](LIMITATIONS.md#the-machine-itself)).
 
 The guest is FreeBSD, so podman pulls FreeBSD image variants by default.

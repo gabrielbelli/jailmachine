@@ -1,13 +1,7 @@
 # Guest contract (concrete)
 
-> **Still an MVP — a working demo**, but a wider one than v0.1.0: as well as
-> `jm init && jm start`, native FreeBSD and Linux OCI images, published ports
-> and bastille jails, the guest now mounts host directories at identical
-> paths (ADR 0007), resolves names through the Mac's own resolver (ADR 0008)
-> and keeps its clock in step with the host. This page pins the contract the
-> guest image satisfies; the image is published as a `guest-<version>` GitHub
-> release and verified by `jm init` against its `.sha256` sidecar. The image
-> `jm init` fetches by default is named by `image.GuestVersion` in the binary.
+> **Status: working demo, v0.3.x.** See
+> [what works, and what does not yet](../README.md#what-works-and-what-does-not-yet).
 
 ADR 0003 defines the contract abstractly; this page pins the paths and
 behaviour `jm` relies on. Everything here is implemented by
@@ -119,8 +113,9 @@ with nothing rewriting the argument.
   (an unplugged disk, an older `jm`) is logged and skipped; a guest with no
   `p9fs` mounts nothing at all and boots normally. `KEYWORD: shutdown`
   force-unmounts on the way down.
-- `seal.sh` stops the service and removes `/var/db/jm` so the builder's
-  host tree never reaches a published image.
+- `seal.sh` stops the service, removes `/var/db/jm`, the `jm shares` block
+  in `/etc/fstab` and the empty mountpoints, so the builder's host tree
+  never reaches a published image.
 - **A suspend detaches the shares without force** and a wake attaches them
   again with the same `jm_shares` service ([Suspend and wake](#suspend-and-wake-adr-0009)).
   A share in use cancels the suspend. The forced unmount above happens only
@@ -323,6 +318,10 @@ make image [RELEASE=15.1-RELEASE]   # = ./jm image build --release $(RELEASE) --
    - `/var/cache/nuageinit`, `/root/.history`, `/tmp/*`, `/var/tmp/*`
    - `/etc/hostid`, `/entropy`, `/var/db/entropy/*` (host identity and
      entropy seeds are regenerated on the next machine's first boot)
+   - the DNS takeover: `/etc/resolv.conf`, `/var/unbound/unbound.conf`,
+     `50-jailmachine-dns.conf`, the `jailmachine owns` line in
+     `/etc/resolvconf.conf` and `local_unbound_enable` (each machine's
+     `jm start` sets them up again)
    - `pkg clean -ay`
    - `touch /firstboot` and `firstboot_pkg_upgrade_enable=NO`
    - `zpool trim -w zroot` so freed blocks become holes in the host file

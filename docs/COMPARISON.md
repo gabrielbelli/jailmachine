@@ -99,6 +99,11 @@ other work running; treat it as a worst case, not a typical one.
 
 ### Idle footprint, after 60 s idle
 
+> Measured on 2026-08-21, before 0.3.0. Since then a machine also runs a
+> sleeper process, the default guest is 2048 MiB (this one was 4096 MiB), the
+> guest's ZFS cache is capped at 512 MiB, and an idle machine is suspended to
+> disk after 30 minutes. See [idle suspend](LIMITATIONS.md#idle-suspend).
+
 | | jailmachine | podman machine | Docker Desktop |
 |---|---|---|---|
 | Host processes | 6 (`qemu-system-aarch64`, `gvproxy`, forwarder, resolver, `ssh`, shell) | 2 (`vfkit`, `gvproxy`) | 12 (`com.docker.krun`, 3 × `com.docker.backend`, UI, agents, `vmnetd`) |
@@ -331,12 +336,12 @@ Three build-time limitations, jailmachine only:
 
 | Limitation | Measured | Whose |
 |---|---|---|
-| `jdocker build` fails out of the box on this Mac: `no image found in image index for architecture "arm64", variant "", OS "freebsd"` | buildx tries to boot `moby/buildkit` inside the FreeBSD engine. **`DOCKER_BUILDKIT=0 jdocker build` succeeds**, as does `jpodman build --os=linux` | **upstream tooling** (no FreeBSD buildkit image) plus **ours** (`jm` exports `DOCKER_DEFAULT_PLATFORM` for `jdocker` but not `DOCKER_BUILDKIT` — a one-line fix in `internal/cli/docker.go`). Severity is install-dependent — it turns on which buildx builder is active — but it reproduced here with the stock Docker Desktop arrangement |
+| No BuildKit: with it on, `docker build` fails with `no image found in image index for architecture "arm64", variant "", OS "freebsd"` | buildx tries to boot `moby/buildkit` inside the FreeBSD engine. `jdocker` now sets `DOCKER_BUILDKIT=0` unless you set it, so `jdocker build` uses the legacy builder and succeeds, as does `jpodman build --os=linux` | **upstream tooling** (no FreeBSD buildkit image). When this page was measured the wrapper did not set the variable, and `jdocker build` failed out of the box |
 | `RUN --mount=type=cache` | `Error: … cache mounts not supported on freebsd` | **podman-on-FreeBSD** (buildah) |
 | `RUN --mount=type=secret` | Works | — |
 
 > **Interpretation:** builds are 30–55 % slower than the alternatives, which is
-> tolerable; the `jdocker build` failure is not, and it is ours to fix.
+> tolerable. `jdocker build` works, but on the legacy builder, not BuildKit.
 
 ---
 
@@ -404,9 +409,9 @@ same job without jailmachine.
 | | jailmachine | podman machine | Docker Desktop |
 |---|---|---|---|
 | Shape | One Go binary, plus `jpodman` / `jdocker` symlinks to it | One binary, part of podman | Application bundle, GUI, background services |
-| Host daemon | None. `jm start` leaves QEMU, gvproxy, the forwarder and the resolver detached and exits | None | Yes (12 processes idle) |
+| Host daemon | No central daemon. `jm start` leaves QEMU, gvproxy, the forwarder, the resolver and a per-machine sleeper (`jm _sleeper`, which suspends an idle machine and holds its endpoints while it sleeps) detached, and exits | None | Yes (12 processes idle) |
 | Login agent | **Deliberately none.** `jpodman` and `jdocker` start a stopped machine on demand instead; `JM_AUTOSTART=0` opts out | None | Optional, on by default |
-| Diagnostics | `jm doctor` — 23 checks on the user's machine (tools, HVF, firmware, state root, share parity, resolver parity, per-machine); every failure prints a fix. `jm ports` explains each mapping; five named log files per machine | `podman machine inspect`, `podman info` | GUI dashboard, `docker desktop` CLI |
+| Diagnostics | `jm doctor` — 26 checks with one running machine (tools, HVF, firmware, state root, share parity, resolver parity, per-machine); every failure prints a fix. `jm ports` explains each mapping; seven named log files per machine | `podman machine inspect`, `podman info` | GUI dashboard, `docker desktop` CLI |
 | Uninstall | `rm -rf ~/.jailmachine` is a complete uninstall ([ADR 0005](adr/0005-state-and-lifecycle-model.md)) | `podman machine rm` — **but it kept 0.87 GiB of image cache afterwards** | Uninstaller |
 | Multiple machines | Yes, each with its own SSH port and podman connections | Yes | One VM |
 | Default-connection hygiene | `jm start` registers a connection and **leaves your default alone** (`--set-default` opts in) | `podman machine rm -f` silently promoted an unrelated connection to default during this benchmark, displacing `jailmachine` — **upstream tooling** | Owns its own context |
@@ -425,7 +430,7 @@ same job without jailmachine.
 |---|---|
 | **Native FreeBSD OCI images and jails on a Mac** | Six FreeBSD images ran, including builds; the other two cannot do this at any speed. This is the entire reason the project exists |
 | **DNS that matches the Mac** | The only one of the three that turns a host `127.0.0.1` answer into an address a container can reach, and the only one that refuses to echo a `0.0.0.0` sinkhole. Hosts entries and mDNS names all resolve inside a container |
-| **One binary, no daemon, no login agent** | 6 host processes and 196 MiB idle against Docker Desktop's 12 and 1695 MiB; `rm -rf ~/.jailmachine` is a complete uninstall |
+| **One binary, no central daemon, no login agent** | 6 host processes and 196 MiB idle (before 0.3.0 added the sleeper) against Docker Desktop's 12 and 1695 MiB; `rm -rf ~/.jailmachine` is a complete uninstall |
 | **Honest, inspectable plumbing** | `jm ports` reports a per-mapping error; `jm doctor` checks every host tool and every machine, with a fix per failure; `--publish-addr` is a machine property, so what binds your LAN is visible in `jm inspect` rather than implied by the shell that booted the machine |
 | **Bind mounts at the identity path** | `-v ~/code:/app` and `-v ~/code:"$HOME/code"` both work from any directory, with no `/host_mnt` prefix and no argument rewriting — slow, but correct |
 
@@ -442,7 +447,7 @@ same job without jailmachine.
 | **`node:22-alpine` hangs, and `apt-get` fails** | `node --version` is the only thing that works; APT dies with `Dynamic MMap ran out of room` | **FreeBSD** — one missing capability, `linux_mremap` cannot grow a mapping. Use `node:22-bookworm-slim`, and `-o APT::Cache-Start=200000000` for APT. **Not musl's fault**: alpine busybox, `python:3-alpine`, `apk add` and `pip install` all work |
 | **Slower at every engine round trip** | hello-world 1.87 s vs 0.21 / 0.30 s; pull 6.35 s vs 3.55 / 2.09 s; first curl after `-p` 2.29 s vs 0.20 / 0.24 s | Mostly **ours** by design: the hello-world gap is the registry check `--os=linux` forces, and the port gap is the reconciler's convergence lag |
 | **Slow to start, and enormous on disk** | Warm start 36.7 s vs 10.4 s; `init` writes 46.87 GiB for 3.17 GiB of content and takes 59–113 s from a cached image | **ours** — `internal/image/sparse.go` is not punching holes reliably; the boot time is QEMU plus a full FreeBSD boot |
-| **`jdocker build` fails out of the box on a Docker Desktop Mac** | `DOCKER_BUILDKIT=0` fixes it | **upstream tooling** (no FreeBSD buildkit image) plus **ours** (the wrapper does not set the variable) |
+| **No BuildKit for `jdocker build`** | The wrapper sets `DOCKER_BUILDKIT=0`, so builds use the docker CLI's legacy builder | **upstream tooling** (no FreeBSD buildkit image) |
 | **Container IPs are not routable from the Mac** | `curl` to `10.88.0.36` times out from the host | **ours** (gvproxy was chosen) and **upstream tooling** (it is a userspace NAT). Docker Desktop on macOS behaves the same way |
 | **macOS on Apple Silicon only** | No Intel, Linux or Windows host backend | **ours** (scope) |
 

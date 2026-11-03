@@ -1,12 +1,8 @@
 # Troubleshooting
 
-> **Still an MVP — a working demo**, but a wider one than v0.1.0: host
-> directory mounts at identical paths, name resolution 1:1 with the host,
-> autostart on demand, the `jdocker` wrapper and docker-identical `-p`
-> semantics are all here, and so is UDP — publishing included. Several
-> entries below are deliberate limits rather than faults; the one real
-> Linuxulator gap left is narrow enough to have its own section
-> ([UDP in a Linux container](#udp-in-a-linux-container)).
+> **Status: working demo, v0.3.x.** See
+> [what works, and what does not yet](../README.md#what-works-and-what-does-not-yet).
+> Several entries below are deliberate limits rather than faults.
 
 Everything here is on macOS/Apple Silicon, the only supported host. For how
 the pieces fit together, see [ARCHITECTURE.md](ARCHITECTURE.md); for the
@@ -71,13 +67,14 @@ machine; a running machine that can be suspended adds up to three more:
 | `jpodman ps` pauses and prints `waking jailmachine …` | The machine was suspended after sitting idle | Nothing. `jm set --idle-suspend 0` keeps it awake; `JM_AUTOSTART` does not apply to a suspended machine |
 | A machine never shows `suspended` in `jm list` | Something holds it awake, or suspend is unavailable for it | `jm inspect` (`Idle suspend:` row). See *it never sleeps* below |
 | `DOCKER_HOST`, VS Code or `podman --connection <name>` → `connection refused` while `jm list` says `suspended` | The sleeper that holds those endpoints is not running (a Mac restart, or it was killed) | `jm start`, or any `jpodman` command. See *it did not wake* below |
-| A published port refuses while `jm list` says `suspended` | Published ports do not wake a machine | `jpodman ps` wakes it |
+| A published port refuses while `jm list` says `suspended`, and `jm ports` shows an empty table | The port table is released at suspend and rebuilt on wake; connecting to a published port does not wake the machine | `jpodman ps` wakes it |
 | `jm: could not restore the suspended state of <name> (…); booting from disk` | QEMU or macOS changed, or the disk changed, between suspend and wake | Nothing: it booted. See *could not restore* below |
 | `could not wake <name> (…)` | A transient failure; the saved state is kept | Fix what it names (`jm doctor`) and retry; `jm stop --force` discards the saved state |
 | `jm set` → `<name> is suspended; cpus, memory, the ssh port and the shared directories change only on a stopped machine` | Virtual hardware is fixed while suspended | `jm stop` (restores and shuts down), then `jm set`, then `jm start` |
 | `jm suspend` → `<name> is busy: a shared directory is in use in the guest: <path>` | A guest process has a file open, or its working directory, in that share | `jm ssh -- fstat -f <path>` names the process; leave the directory |
 | `cannot suspend <name>: hypervisor was started by an older jm; restart it once: jm stop && jm start` | That QEMU was launched with `-daemonize`, and saving it would abort it | `jm stop && jm start`, once |
 | `jdocker: the docker CLI is not on PATH` | Only the engine is provided by jm | `brew install docker` (the client alone), or use `jpodman` |
+| `jdocker compose` → `docker: 'compose' is not a docker command` | Homebrew's `docker` formula has no Compose; it is the separate `docker-compose` plugin, and the docker CLI does not look where Homebrew installs it | `brew install docker-compose` and add `cliPluginsExtraDirs` to `~/.docker/config.json`, see [the docker CLI and Compose](INSTALL.md#the-docker-cli-and-compose) |
 | `no space left on device` in the guest | Guest disk full | `jm set --disk <bigger>` |
 | `jm doctor` warns on `socket paths` | `--state-root` so deep that sockets no longer fit in `sun_path` (103 bytes) and fall back to `$TMPDIR` | Harmless, but a shorter state root keeps every file in one directory |
 | `jm rm` refuses because the machine will not stop | The hypervisor is wedged | `jm rm --force <name>` |
@@ -172,10 +169,9 @@ Which path you are on decides what "slow" means:
 A busy host stretches all three: 32 s was measured for a prebaked first boot
 with two other VMs already running, and 36.7 s for a warm start on the same
 kind of load. `jm init` is separate and takes **60–115 s**: it fetches the
-roughly 800 MiB `guest-15.1.0` release asset and checks its SHA256, but the
-download is only about 31 s of that — writing `disk.raw` out dominates, which
-is a bug of ours
-([LIMITATIONS](LIMITATIONS.md#the-machine-itself)).
+roughly 800 MiB `guest-15.2.0` release asset and checks its SHA256, but the
+download is only about 31 s of that; decompressing the 64 GiB `disk.raw`
+dominates ([LIMITATIONS](LIMITATIONS.md#the-machine-itself)).
 
 The `provision` stage waits up to 15 minutes and fails fast if
 `/var/db/jm-provision-failed` appears. Watch or read the log in the guest:
@@ -766,8 +762,11 @@ report success while the pool is unchanged. On a **stopped** machine the
 grow is recorded and applied at the next `jm start`. `--cpus`, `--memory`
 and `--ssh-port` need the machine stopped.
 
-Host-side, the image stays sparse; `du -h ~/.jailmachine/machines/<name>/`
-shows what it really occupies. Removing images inside the guest
+Host-side, `disk.raw` is sparse: a fresh machine occupies about 3 GiB. A
+machine created by jm 0.3.0 or earlier was not, and can hold about 60 GiB of
+zeros; `jm ssh -- zpool trim -w zroot` returns them to the Mac in a second (QEMU passes the guest's
+trims through as holes).
+`du -h ~/.jailmachine/machines/<name>/` shows what it really occupies. Removing images inside the guest
 (`jpodman image prune -a`) frees guest space but does not shrink
 `disk.raw`.
 

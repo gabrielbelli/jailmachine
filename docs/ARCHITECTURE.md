@@ -1,14 +1,7 @@
 # Architecture
 
-> **Still an MVP — a working demo**, but a wider one than v0.1.0: host
-> directory mounts at identical paths ([ADR 0007](adr/0007-host-filesystem-sharing.md)),
-> name resolution 1:1 with the host ([ADR 0008](adr/0008-name-resolution-parity.md)),
-> autostart on demand from the client wrappers, a `jdocker` wrapper and
-> docker-identical `-p` semantics are all in the tree. UDP is in that list
-> too — binding, publishing and DNS-over-UDP all work from Linux containers.
-> The one Linuxulator gap left is narrow: a zero-length `recvmsg()` returns
-> at once on FreeBSD where Linux blocks, which breaks busybox's `nc -u -l`
-> and nothing else known.
+> **Status: working demo, v0.3.x.** See
+> [what works, and what does not yet](../README.md#what-works-and-what-does-not-yet).
 
 This page is for a contributor deciding *where* to make a change. The
 reasoning behind each decision is in the ADRs, which are linked rather than

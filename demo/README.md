@@ -79,8 +79,8 @@ jpodman run -d --name nginx-native -p 8081:80 \
 curl -s --retry 10 --retry-connrefused localhost:8081/whoami.txt
 open http://localhost:8081
 ```
-Two tabs, identical pages. One is an `x86`/`aarch64` **Linux** ELF binary, the
-other a **FreeBSD** ELF binary. Same kernel, same CPU, same 4 cores.
+Two tabs, identical pages. One is an aarch64 **Linux** ELF binary, the
+other an aarch64 **FreeBSD** ELF binary. Same kernel, same CPU, same 4 cores.
 
 ```bash
 # 5. The same image again, this time from a Kubernetes manifest.
@@ -217,7 +217,9 @@ the two workarounds and one known-bad image documented in
 `nginx` needs `accept_mutex on;`, `redis-server` needs
 `--ignore-warnings ARM64-COW-BUG`, and `node:22-alpine` runs only
 `node --version` — every other invocation hangs. Each container is run under
-`timeout 120`.
+`timeout 120`. The `postgres` check runs only `postgres --version`; the
+server itself cannot start (see
+[LIMITATIONS](../docs/LIMITATIONS.md#postgresql-is-the-one-genuine-casualty)).
 
 ## Known limits
 

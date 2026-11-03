@@ -374,12 +374,12 @@ resource boundary and size the machine accordingly.
 ## Tooling and clients
 
 > **The short version.** `jpodman` is the well-trodden path. The docker CLI
-> works, but `jdocker build` fails out of the box on a Mac with Docker
-> Desktop installed, for a reason that is one environment variable wide.
+> works; `jdocker build` uses the docker CLI's legacy builder, because
+> BuildKit cannot run in a FreeBSD engine.
 
 | Limitation | What you see | Whose | Workaround | Tracking |
 |---|---|---|---|---|
-| `jdocker build` fails | `ERROR: failed to build: Error response from daemon: no image found in image index for architecture "arm64", variant "", OS "freebsd"`. The docker CLI routes `build` through buildx, which tries to boot `moby/buildkit` **inside the FreeBSD engine** | **upstream tooling** (no FreeBSD buildkit image) and **ours** — `jm` exports `DOCKER_DEFAULT_PLATFORM` for `jdocker` but not `DOCKER_BUILDKIT` | `DOCKER_BUILDKIT=0 jdocker build -t x .` succeeds; `jpodman build --os=linux -t x .` also succeeds | Should be tracked; one line in `internal/cli/docker.go` |
+| No BuildKit | With BuildKit on, `docker build` fails: `ERROR: failed to build: Error response from daemon: no image found in image index for architecture "arm64", variant "", OS "freebsd"`. The docker CLI routes `build` through buildx, which tries to boot `moby/buildkit` **inside the FreeBSD engine**. `jdocker` therefore sets `DOCKER_BUILDKIT=0` unless you set it yourself, and `jdocker build -t x .` uses the legacy builder. BuildKit-only Containerfile features are not available | **upstream tooling** (no FreeBSD buildkit image) | `jpodman build --os=linux -t x .` (buildah) also works. Setting `DOCKER_BUILDKIT=1` brings the error back | — |
 | `--os=linux` costs a registry round trip | Every `podman run` against a registry name: **1.87 s**, against 0.39 s for a `localhost/` tag and 0.38 s with no flag. Under a Docker Hub rate limit the same command took **33.8 s** | **podman on the host**, but jailmachine's documented workflow requires the flag | Tag locally, pre-pull, or use `jdocker` | Should be tracked |
 | podman used to print an architecture error on every guest-side call | `level=error msg="Couldn't get cpu architecture: getCPUInfo for OS freebsd not implemented"` on stderr. **Not reproducible on guest podman 5.8.4** (the 15.1.0 prebaked image): `podman ps`, `info`, `version`, `images` and `system info` each produced 0 bytes of stderr, re-checked 2026-08-21. Recorded because an older guest may still show it | **podman-on-FreeBSD**, cosmetic | Ignore, or redirect stderr | — |
 | No jail management from the host | There is no `jm jail`; jails are reached with `jm ssh -- bastille …` | **ours** (ADR 0006 scope) | `jm ssh -- bastille bootstrap 15.1-RELEASE`, etc. | — |
@@ -391,16 +391,16 @@ resource boundary and size the machine accordingly.
 ## The machine itself
 
 > **The short version.** The VM is heavier and slower to start than the
-> alternatives, and one of those numbers is a **bug of ours**: `jm init`
-> writes about **47 GiB of real disk for an image with 3.17 GiB of content**,
-> which is also why `init` is slow. Left uncapped, the guest's ZFS cache also
+> alternatives. Until 0.3.0, `jm init` also wrote about **47–62 GiB of real
+> disk for an image with about 3 GiB of content** (fixed; see the first row).
+> Left uncapped, the guest's ZFS cache also
 > grows until the VM holds nearly all of its memory on the Mac; the ARC cap
 > (512 MiB by default) exists for that.
 
 | Limitation | What you see | Whose | Workaround | Tracking |
 |---|---|---|---|---|
-| `jm init` allocates ~47 GiB | Settled free-space delta for one fresh booted machine: **46.87 GiB**; `st_blocks` agrees at 46.79 GiB; sampling 4000 random 4 KiB blocks of `disk.raw` finds **4.95 % non-zero (~3.17 GiB)**. One run in four landed at 12.87 GiB, the other three at 46–52 GiB | **ours** — the sparse writer in `internal/image/sparse.go` is not punching holes reliably | None today. Budget the disk, and `jm rm` machines you are not using | Should be tracked — the highest-value open bug on this page |
-| `jm init` is disk-bound, not download-bound | From a locally cached `.zst` with no network at all: **59.1 / 63.3 / 113.0 s**. The 802 MiB download by itself is **31 s** by `curl` on this link | **ours**, same root cause as the row above | None | Should be tracked |
+| `jm init` allocated ~47–62 GiB (fixed after 0.3.0) | A fresh machine held 47–62 GiB of real disk for about 3 GiB of content. Cause: APFS zero-fills a gap left by seeking past end of file when the gap is shorter than a few MiB, so the sparse writer's holes became real zero blocks. The writer now punches them out with `F_PUNCHHOLE`; a fresh machine is **3.0 GiB** (2026-11-03) | **ours** (fixed) | For a machine created by 0.3.0 or earlier: `jm ssh -- zpool trim -w zroot` (62 GiB to 4.0 GiB in about a second, measured 2026-11-03) | — |
+| `jm init` is disk-bound, not download-bound | From a locally cached `.zst` with no network at all: **59.1 / 63.3 / 113.0 s**. The 802 MiB download by itself is **31 s** by `curl` on this link | **ours**: the 64 GiB image is decompressed and scanned for zeros in full, which is CPU time (84 s, 55 s of it user time, from a cached `.zst` after the disk fix, 2026-11-03) | Run `jm init` before the session that needs it | — |
 | Start and stop are slow | Warm start **36.7 s** on a loaded Mac against **10.4 s** for podman machine; stop **11.5 s** against 1.06 s. Almost all of it is guest boot | **ours** and **upstream tooling** (QEMU + FreeBSD boot) | A machine left to [idle suspend](#idle-suspend) wakes in seconds instead of booting. The README's 12–25 s is a quiet Mac; 36.7 s is a busy one | — |
 | The VM keeps every page the guest has touched | On a **fresh** machine: total host RSS at idle **196 MiB** (142 MiB of it QEMU), and the QEMU process' `phys_footprint` ranges 1191–2902 MB for a 4096 MiB guest (2026-08-21). **After 12 days idle**, with 0 containers and 0 jails, the author's machine reached **6.92 GB** in Activity Monitor. Inside the guest the ZFS ARC was **3.18 GB** (`vfs.zfs.arc.max` unset, so its ceiling was about the guest's RAM less 1 GiB), wired memory 3.4 GiB, and the largest process 47 MiB (2026-09-13). Ballooning does **not** give the memory back: a `virtio-balloon` inflated from 2048 to 512 MiB dropped QEMU's RSS from about 3.1 GB to 54 MB, but its footprint stayed at 1855–1900 MB and `top`'s compressed-memory column rose from about 0.6 GB to about 3.8 GB (QEMU 11.1.1, HVF, 2048 MiB guest, 2026-09-13) | **upstream tooling** and **Apple/macOS** — QEMU maps guest RAM as ordinary anonymous memory and never hands a page back once the guest touched it, and on macOS the balloon's `madvise(MADV_DONTNEED)` only moves pages into the compressor. Apple's Virtualization.framework accounts differently, which is why `vfkit` reports 14 MB for a 2048 MiB guest; that 14 MB is not a real number either. **ours**, for leaving the ARC uncapped until 2026-09-13 | `jm init --arc` / `jm set --arc` caps the ARC (512 MiB by default, applied at every `jm start`); `jm set --memory` shrinks the guest. That the cap holds a long-idle machine's footprint near the guest's working set **is inferred, not yet measured**. [Idle suspend](#idle-suspend) returns all of it while the machine is asleep: after 30 idle minutes by default, or at once with `jm suspend` | — |
 | Disk grows only | `jm set --disk` extends; nothing shrinks | **ours** | `jm rm && jm init --disk` | — |
@@ -553,7 +553,7 @@ or upstream — that would remove the limitation, in rough order of value.
 
 | To remove | Work needed | Where |
 |---|---|---|
-| `jdocker build` failing | Export `DOCKER_BUILDKIT=0` alongside `DOCKER_DEFAULT_PLATFORM` in `internal/cli/docker.go`. One line. Severity is install-dependent — it depends on which buildx builder is active — but it reproduced on this Mac with the stock Docker Desktop arrangement | **Us** |
+| `jdocker build` failing | `jdocker` sets `DOCKER_BUILDKIT=0` unless the caller sets it | **Us**, done |
 | BuildKit builds properly | A FreeBSD `moby/buildkit` image | upstream tooling |
 | The `getCPUInfo` stderr noise | `getCPUInfo` for FreeBSD in podman | podman-on-FreeBSD upstream |
 | Host-side jail management | A `jm jail` surface, which ADR 0006 deliberately deferred as a second product | **Us**, post-MVP |
@@ -562,7 +562,6 @@ or upstream — that would remove the limitation, in rough order of value.
 
 | To remove | Work needed | Where |
 |---|---|---|
-| ~47 GiB written for 3.17 GiB of content, and the slow `init` that follows from it | Fix hole-punching in `internal/image/sparse.go`, then re-measure the free-space delta and the `init` time. Both numbers should collapse together, and the README's timing claim becomes true again | **Us** — the highest-value bug on this page |
 | The idle footprint growing towards the guest's memory size | Re-measure a capped machine after days idle to confirm the ARC cap bounds it. Suspend (ADR 0009) returns it entirely while asleep; returning memory from a machine that is *running* needs a balloon or free-page-reporting path that releases pages instead of compressing them, which QEMU on macOS does not have today | **Us** (the measurement), then upstream QEMU |
 | Slow warm start | Profile the guest boot. Idle suspend avoids it for a machine that was left running; a stopped machine, or a saved state that cannot be restored, still boots cold | **Us**, then upstream QEMU/FreeBSD |
 | Unmeasured wake under memory pressure, and an uncalibrated idle CPU threshold | Wakes take 0.7–4.2 s on this Mac (2026-09-14); measure one with most of the guest's memory in use and the Mac swapping; calibrate the idle CPU threshold (25 % of one core today) from an hour of samples of an idle guest | **Us** |

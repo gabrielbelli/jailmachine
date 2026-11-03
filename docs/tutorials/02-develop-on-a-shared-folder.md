@@ -83,12 +83,18 @@ jm: set jailmachine: jailmachine is running; cpus, memory, the ssh port and the 
   hint: stop the machine first: jm stop jailmachine
 ```
 
+For example, to keep only two directories:
+
 ```bash
 jm stop
 jm set --no-mounts                                  # drop every share
 jm set --mount ~/code --mount "/srv/data:ro"        # add back only these
 jm start
 ```
+
+> **This drops your home directory share**, which the rest of this tutorial
+> and [tutorial 3](03-a-stack-with-compose-and-kube.md) rely on. If you run
+> it, restore the defaults afterwards as shown under [Cleanup](#cleanup).
 
 `--no-mounts` cannot be combined with `--mount` or `--unmount` in one call,
 hence the two commands:
@@ -212,11 +218,14 @@ jpodman run --rm --os=linux -u 1000:1000 -v "$PWD:$PWD" -w "$PWD" docker.io/alpi
 ```
 
 ```text
--rwxr-xr-x    1 501      root            18 Aug 21 21:27 app.js
+-rwxr-xr-x    1 501      dialout         18 Aug 21 21:27 app.js
 console.log("hi")
 ```
 
-Your Mac uid (`501`) shows through unchanged.
+Your Mac uid (`501`) shows through unchanged. The group is the Mac's gid,
+also unchanged: under your home directory that is `20` (`staff`), which
+Alpine names `dialout`. `mapped-xattr` records the owner uid and the mode,
+not the group.
 
 **Container → Mac.** A file a container creates as root appears on the Mac as
 `0600`, with its real mode and owner in `user.virtfs.*` xattrs:
@@ -230,7 +239,7 @@ cat out.txt
 ```
 
 ```text
--rw-r--r--    1 root     root            18 Aug 21 21:27 out.txt
+-rw-r--r--    1 root     dialout         18 Aug 21 21:27 out.txt
 -rw-------@ 1 you  staff  18 21 Aug 18:27 out.txt
 	user.virtfs.mode	 2
 	user.virtfs.uid	 4
@@ -414,16 +423,29 @@ jpodman rm -f poller 2>/dev/null
 jpodman volume rm build-cache myvol 2>/dev/null
 rm -f out.txt f.txt
 
-# if you narrowed or widened the share set while reading this:
+# if you widened the share set while reading this:
 jm stop
 jm set --unmount ~/code           # drop whatever you added
 jm start
 jm inspect | grep '^Share'
 ```
 
-There is no "restore the defaults" command — the default set is chosen at
-`jm init`, so if you have lost track of it, `jm rm && jm init` is the reliable
-way back. Nothing in a shared host directory is touched by either.
+There is no "restore the defaults" command. The default set is chosen at
+`jm init`: your home directory, `/Volumes`, `/private/tmp` and the
+`/var/folders/...` directory that holds `$TMPDIR`. To put it back after
+`--no-mounts`:
+
+```bash
+jm stop
+jm set --no-mounts
+jm set --mount "$HOME" --mount /Volumes --mount /private/tmp \
+  --mount "$(dirname "$TMPDIR")"
+jm start
+jm inspect | grep '^Share'        # the four lines from the start of this page
+```
+
+If you have lost track of it, `jm rm && jm init` is the other way back.
+Nothing in a shared host directory is touched by either.
 
 Removing the machine entirely (`jm rm`) never touches a shared host
 directory — shares are exports, not copies.

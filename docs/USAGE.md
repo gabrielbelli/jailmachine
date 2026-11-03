@@ -1,13 +1,7 @@
 # Using jailmachine
 
-> **Still an MVP — a working demo**, but a wider one than v0.1.0. Everything
-> documented on this page is implemented and verified against the binary,
-> including host directory mounts at identical paths, name resolution 1:1
-> with the host, autostart on demand, the `jdocker` wrapper and
-> docker-identical `-p` semantics — a host address in the flag binds that
-> address on the **Mac**, as it does under Docker Desktop. UDP works from
-> Linux containers as well, publishing included; the one narrow Linuxulator
-> gap left is called out where it bites.
+> **Status: working demo, v0.3.x.** See
+> [what works, and what does not yet](../README.md#what-works-and-what-does-not-yet).
 
 Install first: [INSTALL.md](INSTALL.md). When something misbehaves, see
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md); for how the pieces fit together,
@@ -74,7 +68,7 @@ finished steps are skipped and a partial download resumes.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--cpus <n>` | `4` | Virtual CPUs (at least 1) |
-| `--memory <MiB>` | `2048` | Memory in MiB (at least 256; a bare number, no units here) |
+| `--memory <MiB>` | `2048` | Memory: a bare number is MiB, or use a unit (`4GiB`). At least 256 MiB |
 | `--arc <size>` | `512`, or half of a `--memory` below 1024 MiB | Cap on the guest's ZFS ARC: a bare number is MiB, or use a unit (`1GiB`). `0` is the guest's own default. Otherwise at least 64 MiB and below `--memory`. See [Memory and the ZFS ARC](#memory-and-the-zfs-arc) |
 | `--idle-suspend <time>` | `30m` | How long a running machine may sit idle before it is suspended to disk; it wakes on first use. `30m`, `2h`, or a bare number of minutes; `0`, `off` or `never` turns it off. Otherwise between 5 minutes and 168 hours. See [Idle suspend](#idle-suspend) |
 | `--disk <GiB>` | `64` | Disk size in GiB. `disk.raw` is sparse, so this is a ceiling, not an allocation |
@@ -202,17 +196,18 @@ usage error.
 
 ## `jm stop [name]`
 
-Stop the port forwarder first (so it can unexpose the mappings it owns
-while the network provider is still up), ask the guest to power off over
-SSH, then drive the hypervisor down (QMP `system_powerdown`, then SIGTERM
-and SIGKILL), then stop the network provider. Stopping a stopped machine is
+Stop the sleeper first, then the port forwarder and the host resolver (so
+the forwarder can unexpose the mappings it owns while the network provider
+is still up), ask the guest to power off over SSH, then drive the
+hypervisor down (QMP `system_powerdown`, then SIGTERM and SIGKILL), then
+stop the network provider. Stopping a stopped machine is
 a no-op. It also repairs a "broken" machine (a pid file with no process).
 
 | Flag | Effect |
 |---|---|
 | `-f`, `--force` | Terminate the hypervisor without asking the guest to shut down; discards a suspended machine's saved state |
 
-The sleeper is stopped first. A **suspended** machine is restored and then
+A **suspended** machine is restored and then
 shut down cleanly, so nothing in the guest dies uncleanly; `--force`
 discards the saved state instead. If the restore fails for a transient
 reason (a busy port, a timeout), the machine stays suspended and the hint
@@ -324,7 +319,7 @@ Name:              jailmachine
 State:             running
 Backend:           qemu
 Network:           gvproxy
-Image:             prebaked:15.1.0
+Image:             prebaked:15.2.0
 Image trusted:     true
 CPUs:              4
 Memory:            2048 MiB
@@ -514,9 +509,10 @@ guest-side redirect not yet in place. Failed mappings are retried on every
 resync, so the error is a live status, not a permanent verdict.
 
 If the forwarder is not running, a `#` comment line says so above the table.
-The exit code is still `0`. On a suspended machine the table is kept and a
-`#` line says the ports answer after the machine wakes: connecting to a
-published port does **not** wake it.
+The exit code is still `0`. On a suspended machine the table is empty and
+nothing answers on the ports; a `#` line says so. The forwarder rebuilds the
+table when the machine wakes, and connecting to a published port does
+**not** wake it.
 
 `--json` prints the entries as an array of `{proto, local, remote, since,
 error}` (an empty array when there are none).
@@ -636,8 +632,8 @@ It provisions a throwaway machine `jm-image-build` from the official FreeBSD
 image under `<out>/.work` (using host SSH port `2229`), seals it over SSH
 with `guest/seal.sh` (drops keys, host keys, logs and the pkg cache,
 restores `/firstboot`, trims free space), powers it off, compresses
-`disk.raw` with `zstd -19` and writes a `.sha256` sidecar. The 15.1 build
-shipped as `guest-15.1.0` is a sealed **802 MiB** `.zst` (841,246,026
+`disk.raw` with `zstd -19` and writes a `.sha256` sidecar. The build
+shipped as `guest-15.2.0` is a sealed **808 MiB** `.zst` (847,242,895
 bytes); `jm init` checks that sidecar before it writes anything.
 
 | Flag | Default | Meaning |
@@ -741,7 +737,19 @@ compose and anything else speaking `DOCKER_HOST` work unchanged.
 
 Needs the docker CLI on the host (`brew install docker` — the client only;
 jm is the engine) and a network provider that proxies the engine API onto a
-host socket (gvproxy, the default).
+host socket (gvproxy, the default). `docker compose` is a separate formula,
+`brew install docker-compose`, and the docker CLI finds it only after you
+add its plugin directory to `~/.docker/config.json` (Docker Desktop's own
+Compose plugin needs nothing):
+
+```json
+{
+  "cliPluginsExtraDirs": ["/opt/homebrew/lib/docker/cli-plugins"]
+}
+```
+
+Without it, `jdocker compose` fails with `docker: 'compose' is not a docker
+command`.
 
 ```bash
 jdocker run --rm docker.io/alpine echo hi
@@ -761,6 +769,12 @@ yourself wins, as does an explicit `--platform`:
 DOCKER_DEFAULT_PLATFORM= jdocker run --rm ghcr.io/freebsd/freebsd-runtime:15.1 uname -srm
 export DOCKER_DEFAULT_PLATFORM=freebsd/arm64   # or pin it for the shell
 ```
+
+**Build.** BuildKit cannot run in the guest: buildx would start a
+`moby/buildkit` container in the FreeBSD engine, and there is no FreeBSD
+image of it. The wrapper therefore sets `DOCKER_BUILDKIT=0`, and `jdocker
+build` uses the classic builder, which the engine serves. A value you set
+yourself wins. `jpodman build --os=linux` works as well.
 
 **Compose.** Because `DOCKER_HOST` is all the Compose plugin needs,
 `jdocker compose` drives the guest's podman with nothing else to configure —
@@ -1371,8 +1385,9 @@ and boots from disk in the same command, printing
   Files the Mac changed meanwhile are seen (measured). A shared directory
   that a guest process is using refuses the suspend.
 - **The clock** is stepped to the Mac's time as the guest resumes.
-- **Published ports** go away with gvproxy and come back when the forwarder
-  resyncs after the wake; `forwards.json` is kept meanwhile.
+- **Published ports** go away with gvproxy: the forwarder releases its
+  mappings at the suspend, so `jm ports` is empty and nothing answers. The
+  forwarder rebuilds the table when it resyncs after the wake.
 - **The DNS search list** is pushed again at wake, so a VPN joined while the
   machine slept applies.
 
@@ -1982,7 +1997,7 @@ Two rules cover every row:
 | `docker.io/library/golang:alpine` | `go version` → `go1.27.0 linux/arm64` | Works |
 | `docker.io/library/hello-world:latest` | its own banner | Works |
 | `docker.io/library/caddy:alpine` | `caddy version` → 2.11.4 | Works |
-| `docker.io/library/postgres:17-alpine` | `postgres --version` → 17.11 | Works |
+| `docker.io/library/postgres:17-alpine` | `postgres --version` → 17.11; starting the server | **Broken**: `initdb` needs `signalfd` (v14 and later) or SysV shared memory (v13 and earlier), see [PostgreSQL](LIMITATIONS.md#postgresql-is-the-one-genuine-casualty) |
 | `docker.io/library/redis:alpine` | `redis-server --version` → 8.10.1 | Works — but `redis-server` needs one flag to start, see [redis](#redis-one-flag) |
 | `docker.io/library/nginx:1.31-alpine` | HTTP 200 through a published port | Works — with one config line, see [nginx](#nginx-one-config-line) |
 | `docker.io/library/node:22-alpine` | `node --version` → `v22.23.2` | **Broken** past `--version`; `node:22-bookworm-slim` works, see [node](#node-the-one-known-bad-image) |
@@ -2075,7 +2090,13 @@ printf 'PING\r\n' | nc 127.0.0.1 6379      # +PONG, from the Mac
 
 Verified end to end, including the published port.
 
-## node: the one known-bad image
+<a id="node-the-one-known-bad-image"></a>
+
+## node: a known-bad image
+
+`node:22-alpine` and the `postgres` server are the known-bad images in the
+table above; the PostgreSQL causes are in
+[LIMITATIONS](LIMITATIONS.md#postgresql-is-the-one-genuine-casualty).
 
 `docker.io/library/node:22-alpine` runs exactly one thing. **`node --version`
 is the only invocation that works**; everything else hangs before it reaches
@@ -2139,6 +2160,7 @@ and podman machine, in numbers, is [docs/COMPARISON.md](COMPARISON.md).
 | Full POSIX semantics on a share | 9p, not virtiofs: `utimes` is a no-op, guest ownership and modes live in host xattrs, an `inotify` watch cannot be created at all, and it is far slower than ZFS (~70 MB/s). See [What 9p does not do](#what-9p-does-not-do) |
 | `--os=linux` per service under compose | Compose cannot ask for a platform. Under `jdocker` the wrapper's default platform covers it; under a plain `eval "$(jm env)"` shell, pre-pull with `jpodman pull --os=linux <image>` plus `pull_policy: missing` |
 | `docker.io/node` on alpine | Only `node --version` works; everything else hangs on `linux_mremap`. Use `node:22-bookworm-slim`. See [node](#node-the-one-known-bad-image) |
+| `docker.io/library/postgres` (Linux) | The server cannot start: `initdb` fails on `signalfd()` (v14 and later) or SysV shared memory (v13 and earlier). See [LIMITATIONS](LIMITATIONS.md#postgresql-is-the-one-genuine-casualty) |
 | A routable VM IP | gvproxy is NAT; vmnet/bridged networking is a later step |
 | vsock | The podman socket is forwarded over SSH instead |
 | Host-side jail management | Jails are reached through `jm ssh -- bastille ...` |

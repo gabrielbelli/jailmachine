@@ -51,6 +51,11 @@ cd jailmachine
 make install            # or: make install PREFIX="$HOME/.local"
 ```
 
+> If you installed the cask, run `brew uninstall --cask jailmachine` first,
+> or use `PREFIX="$HOME/.local"`. With the default `PREFIX`, `make install`
+> replaces the cask's `/opt/homebrew/bin/jm` symlink with a file Homebrew does
+> not own.
+
 > `jm` decides it is being run as a wrapper from the **name of the binary**,
 > so the two symlinks must be called exactly `jpodman` and `jdocker`.
 
@@ -80,8 +85,8 @@ jm init
 ==> share: /private/tmp (rw)
 ==> share: /var/folders/5l/x_34hg657n93c50c02sbjb040000gn (rw)
 ==> ssh-key: generating /Users/you/.jailmachine/machines/jailmachine/ssh/id_ed25519
-==> image: fetching prebaked:15.1.0
-downloading https://github.com/gabrielbelli/jailmachine/releases/download/guest-15.1.0/jailmachine-guest-15.1.0-freebsd15.1-arm64-zfs.raw.zst
+==> image: fetching prebaked:15.2.0
+downloading https://github.com/gabrielbelli/jailmachine/releases/download/guest-15.2.0/jailmachine-guest-15.2.0-freebsd15.1-arm64-zfs.raw.zst
 verifying SHA256
 decompressing (sparse)
 image ready: /Users/you/.jailmachine/machines/jailmachine/disk.raw
@@ -97,7 +102,7 @@ Two things worth noticing in that output before you move on:
 - The four `share:` lines are host directories that will appear **inside the
   guest at the same absolute path**. That is [tutorial 2](02-develop-on-a-shared-folder.md).
 - `disk.raw` is created sparse at 64 GiB and only occupies what the guest
-  actually writes — a fresh machine is about 4 GiB on disk.
+  actually writes: a fresh machine is about 3 GiB on disk.
 
 Everything lives under `~/.jailmachine/machines/jailmachine/`. Nothing is
 written anywhere else, so deleting that directory is a complete uninstall of
@@ -123,10 +128,11 @@ jm start
 ==> ssh: capping the guest's ZFS ARC at 512 MiB
 ==> provision: waiting for /var/db/jm-provisioned
 ==> dns: pointing the guest at the host resolver on 192.168.127.254:53984 (search mygateway)
-==> connect: forwarding /var/folders/.../jm-c3771d1ab4c4.sock to the guest podman socket
+==> connect: forwarding /Users/you/.jailmachine/machines/jailmachine/podman.sock to the guest podman socket
 ==> connect: configuring podman connection "jailmachine"
-==> connect: podman connection "jailmachine-sock" -> unix:///var/folders/.../jm-c3771d1ab4c4.sock
+==> connect: podman connection "jailmachine-sock" -> unix:///Users/you/.jailmachine/machines/jailmachine/podman.sock
 ==> forwarder: starting the port forwarder, publishing on 0.0.0.0 (log: /Users/you/.jailmachine/machines/jailmachine/forwarder.log)
+==> sleeper: starting the sleeper, which holds the machine's endpoints while it is suspended (log: /Users/you/.jailmachine/machines/jailmachine/sleeper.log)
 ==> ready: try 'jpodman run --rm --os=linux docker.io/alpine echo hi'
 ```
 
@@ -222,7 +228,8 @@ Three consequences worth knowing:
 
 Almost everything on Docker Hub works under `--os=linux`. The verified matrix,
 the two images that need one flag or one config line (`redis`, `nginx`) and
-the one that does not work at all (`node:22-alpine`) are in
+the known-bad images that do not work at all (`node:22-alpine`, and the
+`postgres` server) are in
 [docs/USAGE.md](../USAGE.md#docker-hub-compatibility-verified) and
 [docs/LIMITATIONS.md](../LIMITATIONS.md#the-linuxulator).
 
@@ -337,17 +344,17 @@ jm doctor
 ```
 
 ```text
-jm 0.1.2 (8a20dda, 2026-08-21T18:12:58Z)
+jm 0.3.0 (2136be1, 2026-09-14T16:21:24Z)
 
 STATUS  CHECK                        DETAIL
 [ ok ]  host                         darwin/arm64
 [ ok ]  host resolver                queries go through the host resolver (getaddrinfo)
 [ ok ]  backend qemu                 preflight passed
-[ ok ]  qemu-system-aarch64 version  11.1.0 at /opt/homebrew/bin/qemu-system-aarch64
+[ ok ]  qemu-system-aarch64 version  11.1.2 at /opt/homebrew/bin/qemu-system-aarch64
 [ ok ]  qemu-system-aarch64 hvf      Hypervisor.framework accelerator available
 [ ok ]  edk2 firmware                /opt/homebrew/share/qemu
-[ ok ]  gvproxy                      0.8.9 at /opt/homebrew/opt/podman/libexec/podman/gvproxy
-[ ok ]  podman version               6.1.0 at /opt/homebrew/bin/podman
+[ ok ]  gvproxy                      0.9.0 at /opt/homebrew/opt/podman/libexec/podman/gvproxy
+[ ok ]  podman version               6.1.4 at /opt/homebrew/bin/podman
 [ ok ]  ssh                          /usr/bin/ssh
 [ ok ]  ssh-keygen                   /usr/bin/ssh-keygen
 [ ok ]  xz                           /opt/homebrew/bin/xz
@@ -359,22 +366,28 @@ STATUS  CHECK                        DETAIL
 [ ok ]  shares jailmachine           4 share(s) at their host path: /Users/you (rw), /Volumes (rw), /private/tmp (rw), /var/folders/5l/x_34hg657n93c50c02sbjb040000gn (rw)
 [ ok ]  share parity jailmachine     a file written in /Users/you is in the guest at the same path
 [ ok ]  datagram limit jailmachine   published udp carries payloads up to 8972 bytes (gvproxy MTU 9000); larger datagrams are dropped, not fragmented. $JM_MTU changes the link size (576..16384; JM_MTU=1500 matches Docker)
+[ ok ]  suspend jailmachine          can be suspended ('jm suspend jailmachine')
+[ ok ]  sleeper jailmachine          running (log: /Users/you/.jailmachine/machines/jailmachine/sleeper.log)
+[ ok ]  idle suspend jailmachine     after 30 min; idle 3 min
 [ ok ]  jpodman                      /opt/homebrew/bin/jpodman
 [ ok ]  jdocker                      /opt/homebrew/bin/jdocker
 [ ok ]  autostart                    on: jpodman/jdocker boot a stopped machine
 [ ok ]  clock jailmachine            in step with the host (jm_rtcsync running)
 
-23 ok, 0 warning(s), 0 failure(s)
+26 ok, 0 warning(s), 0 failure(s)
 ```
 
-Twenty-three checks on a machine that exists; the `machine …` rows only
-appear once you have created one. Two of them do real work rather than
-reading a version string:
+Twenty-six checks on a machine that exists; the `machine …` rows and the
+other rows named after the machine only appear once you have created one.
+Two of them do real work rather than reading a version string:
 
 - **`share parity`** writes a file on the Mac and asserts a container sees it
   at the same absolute path.
 - **`guest resolver`** asks the running guest to resolve a name, over the
   wire, and compares the answer with the host's.
+
+The `suspend`, `sleeper` and `idle suspend` rows are about idle suspend,
+described under [Step 8](#step-8--jm-stop).
 
 `jm doctor` exits `1` if any check failed; warnings alone still exit `0`.
 `--json` prints the same report as one object.
@@ -397,10 +410,19 @@ jm stop
 ==> done: jailmachine stopped
 ```
 
-That is a clean guest shutdown, then the hypervisor, then the network
-provider, then the forwarder and resolver. It took **13 s** here. `jm stop
---force` skips the guest shutdown, and `jm stop` on a stopped machine is a
-no-op — it also repairs a machine left `broken` by a crash or a reboot.
+That stops the sleeper, then the forwarder and resolver, then does a clean
+guest shutdown, then stops the hypervisor and the network provider. It took
+**13 s** here. `jm stop --force` skips the guest shutdown, and `jm stop` on a
+stopped machine is a no-op — it also repairs a machine left `broken` by a
+crash or a reboot.
+
+> **An idle machine suspends itself.** After 30 minutes with no running
+> container or jail and no use (a talk, a break), the machine is saved to
+> disk and `jm list` shows it as `suspended`. `jpodman`, `jdocker`, `jm ssh`
+> and `jm start` wake it in seconds. A connection to a published port does
+> **not** wake it: while it is suspended, `jm ports` is empty and nothing
+> answers on those ports. For a demo machine, `jm set --idle-suspend 0` turns
+> idle suspend off. See [Idle suspend](../USAGE.md#idle-suspend).
 
 ---
 
@@ -439,7 +461,8 @@ Neither `qemu` nor `podman` is removed for you.
 ---
 
 *Output on this page was captured on 2026-08-21 against a machine built from
-commit `8a20dda` — macOS 26.5 on Apple Silicon, guest FreeBSD 15.1-RELEASE-p2
-arm64, guest podman 5.8.4, host podman 6.1.0. Paths and the machine name have
+commit `8a20dda`; the `jm init`, `jm start` and `jm doctor` output was updated
+for jm 0.3.0 (guest image 15.2.0) on 2026-11-03 — macOS 26.5 on Apple
+Silicon, guest FreeBSD 15.1-RELEASE-p2 arm64, guest podman 5.8.4, host podman 6.1.0. Paths and the machine name have
 been shortened to the defaults; the text of every command and every message is
 verbatim.*

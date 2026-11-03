@@ -313,6 +313,10 @@ Note: jail console logs archived.
  JID  Boot  Prio  State  IP Address  Published Ports  Hostname  Release  Path
 ```
 
+> If destroy reports `pool or dataset is busy`, the jail is still dying
+> (`jm ssh -- jls -d` lists it) because of its recent network connections.
+> Wait about a minute and run it again.
+
 ### They are the same primitive
 
 Run `jls` in the guest with both kinds of thing running, and the point makes
@@ -368,12 +372,12 @@ both, on the same kernel, at the same time.
 ## Cleanup
 
 ```bash
-# jails
+# jails (if destroy says the dataset is busy, wait a minute and run it again)
 jm ssh -- bastille destroy -a -y demo
 jm ssh -- bastille list all
 
-# the registry, the images and the build directory
-jpodman rm -f registry
+# the registry, its volume, the images and the build directory
+jpodman rm -f -v registry
 jpodman rmi freebsd-hello:1.0 "$REG:5000/freebsd-hello:1.0"
 jpodman rmi docker.io/library/registry:2 ghcr.io/freebsd/freebsd-runtime:15.1
 rm -rf ~/jm-freebsd
@@ -385,7 +389,8 @@ jm rm
 
 Removing the bootstrapped release as well — 360 MiB in
 `zroot/bastille/releases` — is `jm ssh -- bastille destroy -y 15.1-RELEASE`,
-and it refuses until every jail cloned from it is gone:
+and it refuses until every jail cloned from it is gone, including one that
+is still dying:
 
 ```text
 [ERROR]: (demo) depends on 15.1-RELEASE base.

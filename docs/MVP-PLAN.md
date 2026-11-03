@@ -14,7 +14,7 @@ default podman connection alone unless you pass `jm start --set-default`, and
 its `events` block — FreeBSD's `linux_epoll` has no `EPOLLEXCLUSIVE`; see
 `docs/USAGE.md` for the verified Docker Hub matrix.)
 
-Architecture: `docs/adr/`. Tools: `docs/tech-choices.md`. Proof of concept: `bin/jm` (shell, works today).
+Architecture: `docs/adr/`. Tools: `docs/tech-choices.md`. Proof of concept: `bin/jm` (shell; since removed, and kept in git history).
 
 ## Repo layout (target)
 
