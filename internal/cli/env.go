@@ -17,9 +17,11 @@ func newEnvCmd() *cobra.Command {
 		Use:   "env [name]",
 		Short: "Print shell exports pointing podman/docker clients at a machine",
 		Long: "Print the environment a podman or docker client needs to talk to the machine's\n" +
-			"engine through the network provider's host-side unix socket. Requires a\n" +
-			"provider that proxies the API socket (gvproxy); the slirp \"user\" provider\n" +
-			"only offers the ssh:// connection.\n\n" +
+			"engine through the machine's podman.sock, a host-side unix socket that jm\n" +
+			"forwards to the guest's engine over ssh. Requires a provider that offers\n" +
+			"the API socket (gvproxy); the slirp \"user\" provider only offers the\n" +
+			"ssh:// connection. While the machine is suspended its sleeper holds the\n" +
+			"socket, and the first client to connect wakes the machine.\n\n" +
 			"  eval \"$(jm env)\"",
 		Example: `  eval "$(jm env)"
   eval (jm env dev --shell fish)`,
@@ -39,10 +41,7 @@ func newEnvCmd() *cobra.Command {
 				switch st, serr := stateOf(m, b, prov); {
 				case serr != nil, st == backend.Running:
 				case st == backend.Suspended:
-					// Nothing holds the socket while the machine sleeps yet,
-					// so a client using these exports is refused until a jm
-					// command wakes it.
-					fmt.Fprintf(stderr, "jm: warning: %s is suspended; the socket answers once jpodman, jdocker, 'jm start%s' or 'jm ssh%s' wakes it\n", m.Name, nameHint(m.Name), nameHint(m.Name))
+					fmt.Fprintf(stderr, "jm: warning: %s is suspended; the first client of the socket wakes it\n", m.Name)
 				default:
 					fmt.Fprintf(stderr, "jm: warning: %s is %s; the socket appears once you run 'jm start%s'\n", m.Name, st, nameHint(m.Name))
 				}

@@ -15,7 +15,11 @@ import (
 type Result struct {
 	Exposed   []netprov.Mapping
 	Unexposed []netprov.Mapping
-	Failed    []netprov.Mapping
+	// Failed are mappings whose expose or unexpose failed with an error
+	// they did not already have. A mapping that keeps failing the same way
+	// is recorded in the state and retried on every resync, but reported
+	// here only once, so the log does not grow by a line per resync.
+	Failed []netprov.Mapping
 	// External are desired mappings that already exist in the provider but
 	// were not created by us; they are left alone and not adopted.
 	External []netprov.Mapping
@@ -118,10 +122,12 @@ func ConvergeWith(ctx context.Context, p netprov.Provider, m *machine.Machine, p
 		}
 		if liveSet[k] {
 			if err := p.Unexpose(ctx, m, e.Mapping()); err != nil {
-				e.Error = "unexpose: " + err.Error()
-				e.Since = now
+				if msg := "unexpose: " + err.Error(); e.Error != msg {
+					e.Error = msg
+					e.Since = now
+					res.Failed = append(res.Failed, e.Mapping())
+				}
 				keep = append(keep, e)
-				res.Failed = append(res.Failed, e.Mapping())
 				continue
 			}
 		}
@@ -178,8 +184,8 @@ func ConvergeWith(ctx context.Context, p netprov.Provider, m *machine.Machine, p
 				e.Error = msg
 				e.Since = now
 				dirty = true
+				res.Failed = append(res.Failed, mp)
 			}
-			res.Failed = append(res.Failed, mp)
 			continue
 		}
 		if want := pl.Pending[key(mp)]; e.Error != want {

@@ -158,7 +158,7 @@ func runSuspend(ctx context.Context, m *machine.Machine, force bool) error {
 	if force {
 		line += " force"
 	}
-	logf(stdout, "suspending %s; its sleeper holds the engine socket meanwhile (log: %s)", m.Name, logPath)
+	logf(stdout, "asking the sleeper to suspend %s; it holds the engine socket meanwhile (log: %s)", m.Name, logPath)
 	began := time.Now()
 	reply, err := sleeperRequest(ctx, m, line)
 	if err != nil {

@@ -92,20 +92,23 @@ func TestDockerEnv(t *testing.T) {
 	got := dockerEnv(env, "unix:///tmp/jm.sock")
 	// The guest engine is FreeBSD and the docker CLI has no --os flag, so
 	// the wrapper defaults the platform to linux/<arch>; without it a fresh
-	// pull asks the registry for OS "freebsd" and fails.
+	// pull asks the registry for OS "freebsd" and fails. BuildKit cannot
+	// run against the guest either, so it is off unless the user asks.
 	want := []string{"PATH=/bin", "HOME=/u", DockerHostEnv + "=unix:///tmp/jm.sock",
-		DockerPlatformEnv + "=linux/" + runtime.GOARCH}
+		DockerPlatformEnv + "=linux/" + runtime.GOARCH, DockerBuildkitEnv + "=0"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("dockerEnv = %v, want %v", got, want)
 	}
 }
 
-// Anyone building native FreeBSD images sets the platform themselves; the
-// wrapper must not overrule them.
+// Anyone building native FreeBSD images sets the platform themselves, and
+// anyone who wants BuildKit back sets DOCKER_BUILDKIT; the wrapper must not
+// overrule either.
 func TestDockerEnvKeepsAChosenPlatform(t *testing.T) {
-	env := []string{"PATH=/bin", DockerPlatformEnv + "=freebsd/arm64"}
+	env := []string{"PATH=/bin", DockerPlatformEnv + "=freebsd/arm64", DockerBuildkitEnv + "=1"}
 	got := dockerEnv(env, "unix:///tmp/jm.sock")
-	want := []string{"PATH=/bin", DockerPlatformEnv + "=freebsd/arm64", DockerHostEnv + "=unix:///tmp/jm.sock"}
+	want := []string{"PATH=/bin", DockerPlatformEnv + "=freebsd/arm64", DockerBuildkitEnv + "=1",
+		DockerHostEnv + "=unix:///tmp/jm.sock"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("dockerEnv = %v, want %v", got, want)
 	}

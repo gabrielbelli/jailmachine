@@ -270,6 +270,3 @@ func forwardState(m *machine.Machine) *forwarder.State {
 	}
 	return st
 }
-
-// forwards is forwardState's mapping table alone.
-func forwards(m *machine.Machine) []forwarder.Entry { return forwardState(m).Owned }

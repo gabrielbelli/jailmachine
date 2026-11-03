@@ -75,8 +75,10 @@ func (p Process) Start(exe string) error {
 	}
 	_ = os.Remove(p.pidFile())
 	// Detached through procx: the forwarder must outlive this jm invocation
-	// and must not become a zombie of a wrapper that execs podman.
-	pid, err := procx.StartDetached(exe, p.Args(), nil, p.LogPath(), false)
+	// and must not become a zombie of a wrapper that execs podman. The log
+	// starts afresh each time, as gvproxy's does, so it cannot grow without
+	// bound across a long-lived machine.
+	pid, err := procx.StartDetached(exe, p.Args(), nil, p.LogPath(), true)
 	if err != nil {
 		return fmt.Errorf("forwarder: failed to start: %w", err)
 	}

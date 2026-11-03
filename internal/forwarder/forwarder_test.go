@@ -266,6 +266,12 @@ func TestConvergeRecordsAndRetriesErrors(t *testing.T) {
 	if err != nil || len(on.Errors()) != 1 || on.Owned[0].Status() != "error: "+st.Owned[0].Error {
 		t.Errorf("persisted %+v, %v", on, err)
 	}
+	// The same failure on the next resync is retried but not reported
+	// again, so the forwarder does not log it every time.
+	res, err = Converge(ctx, p, m, []netprov.Mapping{web}, st, path)
+	if err != nil || res.changed() || len(st.Errors()) != 1 {
+		t.Errorf("repeat failure: %s, %v; owned %+v", res, err, st.Owned)
+	}
 	// The port frees up: the next resync retries and clears the error.
 	delete(p.failLocal, "127.0.0.1:8080")
 	res, err = Converge(ctx, p, m, []netprov.Mapping{web}, st, path)
@@ -273,8 +279,8 @@ func TestConvergeRecordsAndRetriesErrors(t *testing.T) {
 		t.Errorf("retry: %s, %v; owned %+v", res, err, st.Owned)
 	}
 	exposed, _ := p.calls()
-	if len(exposed) != 2 {
-		t.Errorf("expose called %d times, want 2", len(exposed))
+	if len(exposed) != 3 {
+		t.Errorf("expose called %d times, want 3", len(exposed))
 	}
 }
 

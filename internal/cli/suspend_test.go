@@ -881,7 +881,7 @@ func listenUnix(t *testing.T) string {
 // lastWakeOnly is the wakeOnly argument of the last stubbed wake.
 var lastWakeOnly bool
 
-// stubWake replaces startQuietly and returns how many times it ran.
+// stubWake replaces startQuietlyFn and returns how many times it ran.
 func stubWake(t *testing.T, then func()) *int {
 	t.Helper()
 	n := new(int)
@@ -991,7 +991,7 @@ func TestEnvWarnsSuspended(t *testing.T) {
 	if err != nil || !strings.Contains(out, "DOCKER_HOST=") {
 		t.Fatalf("env = %q, %v", out, err)
 	}
-	if !strings.Contains(errOut.String(), "sl is suspended") || strings.Contains(errOut.String(), "appears once") {
+	if !strings.Contains(errOut.String(), "sl is suspended; the first client of the socket wakes it") || strings.Contains(errOut.String(), "appears once") {
 		t.Errorf("stderr = %q", errOut.String())
 	}
 	if slices.Contains(takeFakeEvents(), "resume") {
@@ -1004,7 +1004,7 @@ func TestPortsNoteSuspended(t *testing.T) {
 	root := t.TempDir()
 	seedSuspended(t, root, "sl")
 	out, err := run(t, root, "ports", "sl")
-	if err != nil || !strings.Contains(out, "these ports answer after the machine wakes; connecting to them does not wake it") {
+	if err != nil || !strings.Contains(out, "the table is rebuilt when the machine wakes; connecting to a port does not wake it") {
 		t.Errorf("ports = %q, %v", out, err)
 	}
 	if strings.Contains(out, "is not running") {

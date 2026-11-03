@@ -109,6 +109,9 @@ func runResolver(ctx context.Context, m *machine.Machine, ep netprov.Endpoint) e
 // with, a documented limitation.
 func watchHost(ctx context.Context, m *machine.Machine, ep netprov.Endpoint, h *resolver.Handler, port int, logger *log.Logger) {
 	search := resolver.SearchDomains(ctx)
+	// pushed is the list the guest last accepted. It lags search after a
+	// failed push, so the next poll retries until the guest takes it.
+	pushed := search
 	names := resolver.HostNames(ctx)
 	hostAlias, _ := netip.ParseAddr(ep.HostAlias)
 	gateway, _ := netip.ParseAddr(ep.Gateway)
@@ -123,12 +126,13 @@ func watchHost(ctx context.Context, m *machine.Machine, ep netprov.Endpoint, h *
 			h.SetAliases(resolver.DefaultAliases(hostAlias, gateway, names))
 			logger.Printf("host names changed: %s", strings.Join(names, " "))
 		}
-		now := resolver.SearchDomains(ctx)
-		if reflect.DeepEqual(now, search) {
+		if now := resolver.SearchDomains(ctx); !reflect.DeepEqual(now, search) {
+			search = now
+			logger.Printf("host search list changed: %s", strings.Join(search, " "))
+		}
+		if reflect.DeepEqual(search, pushed) {
 			continue
 		}
-		search = now
-		logger.Printf("host search list changed: %s", strings.Join(search, " "))
 		cctx, cancel := context.WithTimeout(ctx, guestDNSTimeout)
 		client, err := sshx.Dial(cctx, ep.SSHHost, ep.SSHPort, m.SSHUser, sshKey(m))
 		if err == nil {
@@ -138,7 +142,9 @@ func watchHost(ctx context.Context, m *machine.Machine, ep netprov.Endpoint, h *
 		cancel()
 		if err != nil {
 			logger.Printf("pushing the search list into the guest: %v", err)
+			continue
 		}
+		pushed = search
 	}
 }
 

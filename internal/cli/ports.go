@@ -29,9 +29,9 @@ func newPortsCmd() *cobra.Command {
 			"The first \"#\" line is the default the running forwarder was started with; a\n" +
 			"second one appears when the record has been changed since and is waiting for\n" +
 			"a restart.\n\n" +
-			"While the machine is suspended the table is kept, but nothing answers on the\n" +
-			"ports: they come back when the machine wakes, and connecting to one does not\n" +
-			"wake it.",
+			"While the machine is suspended the table is empty and nothing answers on the\n" +
+			"ports; the forwarder rebuilds it when the machine wakes, and connecting to a\n" +
+			"port does not wake it.",
 		Example: `  jm ports
   jm ports --json dev`,
 		Args: cobra.MaximumNArgs(1),
@@ -52,7 +52,7 @@ func newPortsCmd() *cobra.Command {
 			}
 			_, running := forwarderProcess(m).Alive()
 			if st, err := currentState(m); err == nil && st == backend.Suspended {
-				fmt.Fprintf(stdout, "# %s is suspended: these ports answer after the machine wakes; connecting to them does not wake it\n", m.Name)
+				fmt.Fprintf(stdout, "# %s is suspended: the table is rebuilt when the machine wakes; connecting to a port does not wake it\n", m.Name)
 			} else if !running {
 				fmt.Fprintf(stdout, "# port forwarder for %s is not running (jm start%s)\n", m.Name, nameHint(m.Name))
 			}

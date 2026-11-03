@@ -33,6 +33,11 @@ const (
 	// wrapper answers it here instead. A value the user already set wins,
 	// as does an explicit --platform on the command line.
 	DockerPlatformEnv = "DOCKER_DEFAULT_PLATFORM"
+	// DockerBuildkitEnv selects the docker CLI's builder. BuildKit cannot
+	// run against the guest engine (it asks for a builder of OS "freebsd"
+	// and fails), so the wrapper turns it off and "jdocker build" uses the
+	// classic builder, which podman serves. A value the user set wins.
+	DockerBuildkitEnv = "DOCKER_BUILDKIT"
 )
 
 // newDockerCmd runs the real docker client against a machine's engine.
@@ -67,6 +72,17 @@ func execDocker(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	bin, err := exec.LookPath("docker")
+	if err != nil {
+		return withHint(errors.New("the docker CLI is not on PATH"),
+			"brew install docker (the client alone; jm provides the engine), or use 'jpodman'")
+	}
+	argv := append([]string{bin}, rest...)
+	if name == "" {
+		// A client-only call ("--version", "--help") with no machine to
+		// point at: run docker as it is.
+		return syscall.Exec(bin, argv, os.Environ())
+	}
 	m, err := store().Load(name)
 	if err != nil {
 		return err
@@ -75,12 +91,6 @@ func execDocker(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	bin, err := exec.LookPath("docker")
-	if err != nil {
-		return withHint(errors.New("the docker CLI is not on PATH"),
-			"brew install docker (the client alone; jm provides the engine), or use 'jpodman'")
-	}
-	argv := append([]string{bin}, rest...)
 	return syscall.Exec(bin, argv, dockerEnv(os.Environ(), host))
 }
 
@@ -103,23 +113,29 @@ func dockerHost(m *machine.Machine) (string, error) {
 // dockerEnv returns env with DOCKER_HOST set to host and DOCKER_CONTEXT
 // removed, so the wrapper is unaffected by whatever context the user's
 // docker CLI is pointing at, plus a default platform of linux/<arch> unless
-// the caller chose one (see DockerPlatformEnv). Someone building native
+// the caller chose one (see DockerPlatformEnv), and DOCKER_BUILDKIT=0 unless
+// the caller set it (see DockerBuildkitEnv). Someone building native
 // FreeBSD images opts out by exporting DOCKER_DEFAULT_PLATFORM themselves.
 func dockerEnv(env []string, host string) []string {
-	out := make([]string, 0, len(env)+2)
-	platform := false
+	out := make([]string, 0, len(env)+3)
+	platform, buildkit := false, false
 	for _, kv := range env {
 		switch {
 		case strings.HasPrefix(kv, DockerHostEnv+"="), strings.HasPrefix(kv, DockerContextEnv+"="):
 			continue
 		case strings.HasPrefix(kv, DockerPlatformEnv+"="):
 			platform = true
+		case strings.HasPrefix(kv, DockerBuildkitEnv+"="):
+			buildkit = true
 		}
 		out = append(out, kv)
 	}
 	out = append(out, DockerHostEnv+"="+host)
 	if !platform {
 		out = append(out, DockerPlatformEnv+"=linux/"+runtime.GOARCH)
+	}
+	if !buildkit {
+		out = append(out, DockerBuildkitEnv+"=0")
 	}
 	return out
 }
