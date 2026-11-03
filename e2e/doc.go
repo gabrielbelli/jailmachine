@@ -22,10 +22,9 @@
 // Run them with "make build && JM_E2E=1 make e2e". The environment:
 //
 //	JM_E2E=1          required; without it every test skips
-//	JM_E2E_DISK=12    disk size in GiB for each machine (default 12). jm init
-//	                  writes far more real disk than the image holds
-//	                  (docs/LIMITATIONS.md), so keep it small on a full volume;
-//	                  the live grow step grows to this plus 4
+//	JM_E2E_DISK=12    disk size in GiB for each machine (default 12); the
+//	                  live grow step grows to this plus 4. A prebaked image
+//	                  is already 64 GiB, so with JM_E2E_IMAGE=prebaked use 64
 //	JM_E2E_IMAGE=...  image for jm init (default official:15.1-RELEASE)
 //	JM_E2E_SLOW=1     also run the idle-timer subtest, which takes about
 //	                  15 minutes

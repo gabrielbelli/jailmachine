@@ -364,6 +364,17 @@ func runInit(ctx context.Context, args []string, o initOpts) error {
 		}
 	}
 
+	// The image never shrinks to --disk: a prebaked image is already 64 GiB.
+	// Record what disk.raw really is, or "jm list" shows the requested size
+	// and a later "jm set --disk" between the two waits for a grow that
+	// never happens.
+	if st, err := os.Stat(diskPath); err == nil {
+		if got := int((st.Size() + 1<<30 - 1) >> 30); got > m.DiskGiB {
+			fmt.Fprintf(stderr, "jm: note: the image is %d GiB, more than the %d GiB asked for; the disk stays at %d GiB\n", got, m.DiskGiB, got)
+			m.DiskGiB = got
+		}
+	}
+
 	// Stage: first-boot seed.
 	logf(stdout, "seed: writing first-boot seed %s", s.Path(name, machine.SeedFile))
 	err = seed.Build(s.Path(name, machine.SeedFile), seed.Params{

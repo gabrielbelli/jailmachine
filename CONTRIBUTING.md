@@ -30,7 +30,7 @@ takes well over go test's default ten minutes. These variables tune it:
 | Variable | Default | Effect |
 |---|---|---|
 | `JM_E2E=1` | unset | Required; without it every e2e test skips |
-| `JM_E2E_DISK` | `12` | Disk size in GiB for each test machine. The live grow step grows the disk to this plus 4 GiB |
+| `JM_E2E_DISK` | `12` | Disk size in GiB for each test machine. The live grow step grows the disk to this plus 4 GiB. A prebaked image is already 64 GiB, so use `64` with `JM_E2E_IMAGE=prebaked` |
 | `JM_E2E_IMAGE` | `official:15.1-RELEASE` | Image passed to `jm init` |
 | `JM_E2E_SLOW=1` | unset | Also run the idle-timer subtest: a command session must hold off the idle monitor, which must then suspend the machine. It adds about 15 minutes |
 
