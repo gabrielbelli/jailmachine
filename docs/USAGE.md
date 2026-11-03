@@ -319,7 +319,7 @@ Name:              jailmachine
 State:             running
 Backend:           qemu
 Network:           gvproxy
-Image:             prebaked:15.2.0
+Image:             prebaked:15.2.1
 Image trusted:     true
 CPUs:              4
 Memory:            2048 MiB
@@ -633,7 +633,7 @@ image under `<out>/.work` (using host SSH port `2229`), seals it over SSH
 with `guest/seal.sh` (drops keys, host keys, logs and the pkg cache,
 restores `/firstboot`, trims free space), powers it off, compresses
 `disk.raw` with `zstd -19` and writes a `.sha256` sidecar. The build
-shipped as `guest-15.2.0` is a sealed **808 MiB** `.zst` (847,242,895
+shipped as `guest-15.2.1` is a sealed **834 MiB** `.zst` (874,811,605
 bytes); `jm init` checks that sidecar before it writes anything.
 
 | Flag | Default | Meaning |

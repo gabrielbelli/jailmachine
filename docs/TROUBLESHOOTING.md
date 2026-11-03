@@ -169,7 +169,7 @@ Which path you are on decides what "slow" means:
 A busy host stretches all three: 32 s was measured for a prebaked first boot
 with two other VMs already running, and 36.7 s for a warm start on the same
 kind of load. `jm init` is separate and takes **60–115 s**: it fetches the
-roughly 800 MiB `guest-15.2.0` release asset and checks its SHA256, but the
+roughly 800 MiB `guest-15.2.1` release asset and checks its SHA256, but the
 download is only about 31 s of that; decompressing the 64 GiB `disk.raw`
 dominates ([LIMITATIONS](LIMITATIONS.md#the-machine-itself)).
 

@@ -17,7 +17,7 @@ import (
 // GuestVersion is the prebaked guest image version "jm init" fetches by
 // default. Bump it manually when a new guest image is published with
 // "jm image build" (the release tag is "guest-<GuestVersion>").
-const GuestVersion = "15.2.0"
+const GuestVersion = "15.2.1"
 
 // guestReleases maps a published guest image version to the FreeBSD
 // release it was built from (part of the file name). Add a row when a guest
@@ -26,6 +26,7 @@ const GuestVersion = "15.2.0"
 var guestReleases = map[string]string{
 	"15.1.0": "15.1-RELEASE",
 	"15.2.0": "15.1-RELEASE",
+	"15.2.1": "15.1-RELEASE",
 }
 
 // GuestRelease returns the FreeBSD release baked into guest image version.
