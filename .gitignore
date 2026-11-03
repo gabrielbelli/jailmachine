@@ -10,3 +10,4 @@ efistore
 
 # Personal Claude Code instructions, not part of the project
 CLAUDE.md
+/.claude/worktrees/

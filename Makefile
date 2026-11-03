@@ -21,7 +21,8 @@ lint:
 	@out=$$(gofmt -l . ); if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi
 	$(GO) vet ./...
 
-e2e:
+# e2e: tests ./jm, so build it first rather than test a stale binary.
+e2e: build
 	$(GO) test -v -timeout 120m -tags e2e ./e2e/...
 
 # release-snapshot: what the release workflow does, minus publishing.
@@ -42,6 +43,6 @@ clean:
 
 PREFIX ?= /opt/homebrew
 install: ## build and install jm, jpodman and jdocker into $(PREFIX)/bin
-	go build -ldflags "$(LDFLAGS)" -o $(PREFIX)/bin/jm ./cmd/jm
+	$(GO) build -ldflags "$(LDFLAGS)" -o $(PREFIX)/bin/jm ./cmd/jm
 	ln -sf jm $(PREFIX)/bin/jpodman
 	ln -sf jm $(PREFIX)/bin/jdocker

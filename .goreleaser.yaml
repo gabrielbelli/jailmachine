@@ -159,21 +159,21 @@ homebrew_casks:
       - formula: qemu
       - formula: podman
     # The binary is not notarised: strip the quarantine flag so Gatekeeper
-    # does not refuse to run it.
+    # does not refuse to run it. install_steps is Homebrew's declarative
+    # postflight_steps DSL, not Ruby (the Ruby "install" hook is deprecated).
     hooks:
       post:
-        install: |
-          if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
-            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/jm"]
+        install_steps: |
+          on_macos do
+            run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ .StagedPath }}/jm"], must_succeed: false
           end
           # jpodman / jdocker: the podman and docker clients pointed at the
           # machine, without touching the default podman connection or the
-          # user's docker contexts.
-          FileUtils.ln_sf "#{HOMEBREW_PREFIX}/bin/jm", "#{HOMEBREW_PREFIX}/bin/jpodman"
-          FileUtils.ln_sf "#{HOMEBREW_PREFIX}/bin/jm", "#{HOMEBREW_PREFIX}/bin/jdocker"
-    # goreleaser's cask hooks have no uninstall phase, so the two symlinks
-    # the post-install hook makes are removed by brew's own uninstall
-    # stanza: zap alone would not do it, being opt-in ("brew uninstall
+          # user's docker contexts. Relative links next to brew's own bin/jm.
+          symlink "jm", "bin/jpodman", source_base: :relative, target_base: :homebrew_prefix, overwrite: true
+          symlink "jm", "bin/jdocker", source_base: :relative, target_base: :homebrew_prefix, overwrite: true
+    # The two symlinks the post-install steps make are removed by brew's
+    # own uninstall stanza: zap alone would not do it, being opt-in ("brew uninstall
     # --zap"), and a plain "brew uninstall" would leave them dangling at a
     # binary that is no longer there. zap lists them too, for a zap of a
     # cask whose files were removed by hand.

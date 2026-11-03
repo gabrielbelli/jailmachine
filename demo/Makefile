@@ -71,31 +71,31 @@ test:
 	$(PODMAN) volume rm -f jm-demo-selftest >/dev/null 2>&1 || true; \
 	echo '    ok (data survived the container)'; \
 	echo '--- nginx-linuxulator'; \
-	$(MAKE) --no-print-directory serve-test \
-	    NAME=jm-selftest-nginx-linux PORT=$(PORT_NGINX_LINUX) \
-	    IMG=$(REGISTRY)/jm-demo-nginx-linuxulator:latest OSFLAG=--os=linux; \
+	$(call serve_test,jm-selftest-nginx-linux,$(PORT_NGINX_LINUX),$(REGISTRY)/jm-demo-nginx-linuxulator:latest,--os=linux); \
 	echo '--- nginx-native'; \
-	$(MAKE) --no-print-directory serve-test \
-	    NAME=jm-selftest-nginx-native PORT=$(PORT_NGINX_NATIVE) \
-	    IMG=$(REGISTRY)/jm-demo-nginx-native:latest OSFLAG=; \
+	$(call serve_test,jm-selftest-nginx-native,$(PORT_NGINX_NATIVE),$(REGISTRY)/jm-demo-nginx-native:latest,); \
 	echo; echo 'all demo images pass'
 
-.PHONY: serve-test
-serve-test:
-	@$(PODMAN) rm -f $(NAME) >/dev/null 2>&1 || true; \
-	$(PODMAN) run -d --name $(NAME) $(OSFLAG) -p $(PORT):80 $(IMG) >/dev/null; \
+# serve_test NAME,PORT,IMAGE,OSFLAG: run a server image with PORT published,
+# wait for /healthz to answer "ok", then fetch /. A canned recipe, not a
+# target run through $(MAKE): make executes any recipe line that mentions
+# $(MAKE) even under -n, and a dry run must not start containers.
+define serve_test
+$(PODMAN) rm -f $(1) >/dev/null 2>&1 || true; \
+	$(PODMAN) run -d --name $(1) $(4) -p $(2):80 $(3) >/dev/null; \
 	ok=0; \
 	for i in 1 2 3 4 5 6 7 8 9 10; do \
 	    sleep 1; \
-	    if [ "$$(curl -fsS -m 3 http://127.0.0.1:$(PORT)/healthz 2>/dev/null)" = 'ok' ]; then ok=1; break; fi; \
+	    if [ "$$(curl -fsS -m 3 http://127.0.0.1:$(2)/healthz 2>/dev/null)" = 'ok' ]; then ok=1; break; fi; \
 	done; \
 	if [ $$ok -eq 1 ]; then \
-	    curl -fsS -m 3 -o /dev/null http://127.0.0.1:$(PORT)/ && echo '    ok (/ and /healthz answered)'; \
+	    curl -fsS -m 3 -o /dev/null http://127.0.0.1:$(2)/ && echo '    ok (/ and /healthz answered)'; \
 	else \
-	    echo '    FAILED -- logs follow:'; $(PODMAN) logs $(NAME) 2>&1 | tail -20; \
-	    $(PODMAN) rm -f $(NAME) >/dev/null 2>&1; exit 1; \
+	    echo '    FAILED -- logs follow:'; $(PODMAN) logs $(1) 2>&1 | tail -20; \
+	    $(PODMAN) rm -f $(1) >/dev/null 2>&1; exit 1; \
 	fi; \
-	$(PODMAN) rm -f $(NAME) >/dev/null 2>&1
+	$(PODMAN) rm -f $(1) >/dev/null 2>&1
+endef
 
 # ----------------------------------------------------------------- push -----
 # NOTE ON ARCHITECTURE. `push` publishes whatever the running machine is,
