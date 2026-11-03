@@ -33,8 +33,9 @@ type Source interface {
 // starts from scratch.
 var ErrChecksum = errors.New("image: checksum mismatch")
 
-// ErrNoChecksum is returned when CHECKSUM.SHA256 has no entry for the file.
-var ErrNoChecksum = errors.New("image: file not listed in CHECKSUM.SHA256")
+// ErrNoChecksum is returned when no published checksum covers the file:
+// no entry in the release's CHECKSUM file, or no .sha256 sidecar.
+var ErrNoChecksum = errors.New("image: no published checksum for the file")
 
 // GiB is one gibibyte in bytes.
 const GiB = int64(1) << 30

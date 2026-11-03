@@ -44,10 +44,12 @@ func (w *sparseWriter) Write(p []byte) (int, error) {
 			w.pending += int64(len(chunk))
 			continue
 		}
+		var holeOff, holeLen int64
 		if w.pending > 0 {
 			if _, err := w.f.Seek(w.off+w.pending, io.SeekStart); err != nil {
 				return 0, err
 			}
+			holeOff, holeLen = w.off, w.pending
 			w.off += w.pending
 			w.pending = 0
 		}
@@ -55,6 +57,10 @@ func (w *sparseWriter) Write(p []byte) (int, error) {
 		w.off += int64(m)
 		if err != nil {
 			return 0, err
+		}
+		if holeLen > 0 {
+			// The write may have zero-filled the gap (APFS); give it back.
+			punchHole(w.f, holeOff, holeLen)
 		}
 	}
 	return n, nil
